@@ -1,0 +1,16 @@
+results/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+__pycache__/
+*.pyc
+*.pyo
+.codex/
