@@ -11,6 +11,7 @@ import gzip
 import random
 import argparse
 import itertools
+import time
 import quaternion
 import transformers
 import numpy as np
@@ -228,6 +229,20 @@ class VLNEvaluator:
         self.image_processor = model.processor
         self.model = model
         self.tokenizer = model.tokenizer
+        self.visual_prune_profile_path = None
+        self.visual_prune_profile_summary = {
+            "profiled_calls": 0,
+            "forward_time_ms_total": 0.0,
+            "generate_time_ms_total": 0.0,
+            "peak_memory_allocated_mb_max": 0.0,
+            "visual_before_total": 0,
+            "visual_after_total": 0,
+        }
+        if not getattr(args, "disable_visual_prune_eval_profile", False):
+            self.visual_prune_profile_path = os.path.join(
+                self.output_path,
+                f"visual_prune_eval_profile_rank{get_rank()}.jsonl",
+            )
         
         self.actions2idx = OrderedDict({
             'STOP': [0],
@@ -421,6 +436,54 @@ class VLNEvaluator:
         env = Env(config=self.config)
         return env
 
+    def _log_visual_prune_profile(
+        self,
+        scene_id: str,
+        episode_id: str,
+        step_id: int,
+        episode_instruction: str,
+        profile: Optional[Dict[str, Any]],
+    ) -> None:
+        if profile is None or self.visual_prune_profile_path is None:
+            return
+
+        prune_info = profile.get("prune", {})
+        sample_stats = prune_info.get("samples", [])
+        visual_before = sum(sample.get("visual_before", 0) for sample in sample_stats)
+        visual_after = sum(sample.get("visual_after", 0) for sample in sample_stats)
+        peak_memory_mb = profile.get("peak_memory_allocated_mb")
+
+        self.visual_prune_profile_summary["profiled_calls"] += 1
+        self.visual_prune_profile_summary["forward_time_ms_total"] += float(profile.get("forward_time_ms", 0.0))
+        self.visual_prune_profile_summary["generate_time_ms_total"] += float(profile.get("generate_time_ms", 0.0))
+        self.visual_prune_profile_summary["visual_before_total"] += int(visual_before)
+        self.visual_prune_profile_summary["visual_after_total"] += int(visual_after)
+        if peak_memory_mb is not None:
+            self.visual_prune_profile_summary["peak_memory_allocated_mb_max"] = max(
+                self.visual_prune_profile_summary["peak_memory_allocated_mb_max"],
+                float(peak_memory_mb),
+            )
+
+        record = {
+            "scene_id": scene_id,
+            "episode_id": str(episode_id),
+            "step_id": int(step_id),
+            "episode_instruction": episode_instruction,
+            "profile": profile,
+        }
+        with open(self.visual_prune_profile_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        print(
+            "visual_prune_profile",
+            f"scene_episode={scene_id}_{episode_id}",
+            f"step={step_id}",
+            f"visual={visual_before}->{visual_after}",
+            f"forward_ms={profile.get('forward_time_ms')}",
+            f"generate_ms={profile.get('generate_time_ms')}",
+            f"peak_mem_mb={peak_memory_mb}",
+        )
+
     
 
     def eval_action(self, idx) -> None:
@@ -531,6 +594,13 @@ class VLNEvaluator:
                         images = [rgb_list[i] for i in indices]
 
                     action = self.model.call_model(images, episode_instruction, step_id)[0]
+                    self._log_visual_prune_profile(
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        step_id=step_id,
+                        episode_instruction=episode_instruction,
+                        profile=self.model.consume_last_visual_prune_profile(),
+                    )
                     action_text = action
                     
                     if action not in self.actions2idx:
@@ -620,6 +690,15 @@ class VLNEvaluator:
                         qualitative_record,
                     )
 
+        if self.visual_prune_profile_path is not None:
+            summary_record = {
+                "summary": True,
+                **self.visual_prune_profile_summary,
+            }
+            with open(self.visual_prune_profile_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary_record) + "\n")
+            print("visual_prune_profile_summary", summary_record)
+
         env.close()
         return torch.tensor(sucs).to(self.device), torch.tensor(spls).to(self.device), torch.tensor(oss).to(self.device), torch.tensor(ones).to(self.device), torch.tensor(len(sucs)).to(self.device)     
 
@@ -632,6 +711,8 @@ class JanusVLN_Inference:
         
         config.kv_start_size = kv_start_size
         config.kv_recent_size = kv_recent_size
+        config.enable_visual_prune_eval_profile = True
+        config.allow_cache_prefill_visual_prune = False
         
         
         self.model = Qwen2_5_VLForConditionalGenerationForJanusVLN.from_pretrained(
@@ -651,6 +732,12 @@ class JanusVLN_Inference:
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels, padding_side="left")
         
         self.device = device
+        self.last_visual_prune_profile = None
+
+    def consume_last_visual_prune_profile(self):
+        profile = self.last_visual_prune_profile
+        self.last_visual_prune_profile = None
+        return profile
 
     @torch.no_grad()
     def call_model(
@@ -762,6 +849,19 @@ class JanusVLN_Inference:
 
         inputs["images_vggt"] = [feat.to(device) for feat in images_vggt]
         inputs = inputs.to(device)
+        if getattr(self.model.config, "use_llm_visual_prune", False) and getattr(
+            self.model.config, "enable_visual_prune_eval_profile", False
+        ):
+            _ = self.model(
+                **inputs,
+                use_cache=False,
+                return_dict=True,
+                output_hidden_states=False,
+                output_attentions=False,
+            )
+            self.last_visual_prune_profile = self.model.consume_visual_prune_profile()
+        else:
+            self.last_visual_prune_profile = None
     
         if "max_new_tokens" not in gen_kwargs:
             gen_kwargs["max_new_tokens"] = 24
@@ -774,6 +874,7 @@ class JanusVLN_Inference:
         
         
         pad_token_id = self.tokenizer.pad_token_id
+        generate_start_time = time.perf_counter()
         cont = self.model.generate(
             **inputs,
             eos_token_id=self.tokenizer.eos_token_id,
@@ -784,6 +885,9 @@ class JanusVLN_Inference:
             num_beams=gen_kwargs["num_beams"],
             max_new_tokens=gen_kwargs["max_new_tokens"],
         )
+        generate_time_ms = round((time.perf_counter() - generate_start_time) * 1000.0, 3)
+        if self.last_visual_prune_profile is not None:
+            self.last_visual_prune_profile["generate_time_ms"] = generate_time_ms
 
         generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, cont)]
         answers = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
@@ -845,6 +949,7 @@ def eval():
                         help="VGGT KV cache start size (keep first N frames)")
     parser.add_argument("--kv_recent_size", type=int, default=24,
                         help="VGGT KV cache recent size (keep last N frames)")
+    parser.add_argument("--disable_visual_prune_eval_profile", action="store_true", default=False)
     
     args = parser.parse_args()
     set_seed(args.seed)
@@ -863,6 +968,7 @@ def eval():
         device=f"cuda:{local_rank}",
         kv_start_size=args.kv_start_size,
         kv_recent_size=args.kv_recent_size)
+    model.model.config.enable_visual_prune_eval_profile = not args.disable_visual_prune_eval_profile
 
     evaluate(model, args)
 

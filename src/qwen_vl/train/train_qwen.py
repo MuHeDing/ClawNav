@@ -113,7 +113,17 @@ def train(attn_implementation="flash_attention_2"):
     if "qwen2.5" in model_args.model_name_or_path.lower():
         from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationForJanusVLN
         config = AutoConfig.from_pretrained(model_args.model_name_or_path)
-        setattr(config, "lam", model_args.lam)
+        for attr_name in [
+            "lam",
+            "reference_frame",
+            "use_llm_visual_prune",
+            "visual_prune_layer",
+            "sem_keep_ratio",
+            "spa_keep_ratio",
+            "mix_keep_ratio",
+            "visual_prune_debug",
+        ]:
+            setattr(config, attr_name, getattr(model_args, attr_name))
         model = Qwen2_5_VLForConditionalGenerationForJanusVLN.from_pretrained(
             pretrained_model_name_or_path=model_args.model_name_or_path,
             config=config,

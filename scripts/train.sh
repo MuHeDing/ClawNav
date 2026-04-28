@@ -57,4 +57,9 @@ torchrun --nproc_per_node=$NPROC_PER_NODE \
             --seed 42 \
             --report_to "none" \
             --reference_frame first \
+            --use_llm_visual_prune True \
+            --visual_prune_layer 4 \
+            --sem_keep_ratio 0.4 \
+            --spa_keep_ratio 0.7 \
+            --mix_keep_ratio 0.55 \
             > ${OUTPUT_DIR}/train.log 2>&1

@@ -25,6 +25,7 @@
 # limitations under the License.
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 from typing_extensions import override
@@ -50,6 +51,14 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
+from .llm_visual_pruner import (
+    NON_VISUAL_TYPE,
+    TYPE_MIXED,
+    TYPE_SEMANTIC_HEAVY,
+    TYPE_SPATIAL_HEAVY,
+    TypeAwareVisualTokenPruner,
+    should_apply_visual_prune,
+)
 from .vggt.models.vggt import VGGT
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 
@@ -1208,6 +1217,23 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
+        self.use_llm_visual_prune = getattr(config, "use_llm_visual_prune", False)
+        self.visual_prune_layer = getattr(config, "visual_prune_layer", 4)
+        self.visual_prune_debug = getattr(config, "visual_prune_debug", False)
+        self.enable_visual_prune_eval_profile = getattr(config, "enable_visual_prune_eval_profile", False)
+        self.allow_cache_prefill_visual_prune = getattr(config, "allow_cache_prefill_visual_prune", False)
+        self.visual_pruner = (
+            TypeAwareVisualTokenPruner(
+                hidden_size=config.hidden_size,
+                sem_keep_ratio=getattr(config, "sem_keep_ratio", 0.4),
+                spa_keep_ratio=getattr(config, "spa_keep_ratio", 0.7),
+                mix_keep_ratio=getattr(config, "mix_keep_ratio", 0.55),
+            )
+            if self.use_llm_visual_prune
+            else None
+        )
+        self._last_visual_prune_stats = None
+        self._last_eval_profile = None
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1218,6 +1244,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def consume_visual_prune_profile(self) -> Optional[Dict[str, Any]]:
+        profile = self._last_eval_profile
+        self._last_eval_profile = None
+        return profile
 
     def forward(
         self,
@@ -1231,6 +1262,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        visual_token_mask: Optional[torch.Tensor] = None,
+        visual_token_types: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1254,6 +1287,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         if use_cache and past_key_values is None and not torch.jit.is_tracing():
             past_key_values = DynamicCache()
 
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
@@ -1269,8 +1304,57 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         elif position_ids.dim() == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
+        prune_attention_mask = attention_mask
+        prune_enabled = (
+            self.visual_pruner is not None
+            and visual_token_mask is not None
+            and visual_token_types is not None
+            and (
+                not use_cache
+                or (
+                    self.allow_cache_prefill_visual_prune
+                    and should_apply_visual_prune(
+                        use_cache=use_cache,
+                        past_seen_tokens=past_seen_tokens,
+                        visual_token_mask=visual_token_mask,
+                    )
+                )
+            )
+        )
+        if prune_enabled and prune_attention_mask is None:
+            prune_attention_mask = torch.ones(
+                inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device
+            )
+
+        collect_eval_profile = (
+            self.enable_visual_prune_eval_profile
+            and not self.training
+            and past_seen_tokens == 0
+            and inputs_embeds.shape[1] > 1
+        )
+        self._last_visual_prune_stats = None
+        self._last_eval_profile = None
+        eval_profile = None
+        profile_device = inputs_embeds.device
+        if collect_eval_profile:
+            if profile_device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(profile_device)
+                torch.cuda.synchronize(profile_device)
+            eval_profile = {
+                "prefill_sequence_length": int(inputs_embeds.shape[1]),
+                "prefill_visual_token_count": int(visual_token_mask.sum().item()) if visual_token_mask is not None else 0,
+                "prune_candidate": bool(prune_enabled),
+                "prune_layer": int(self.visual_prune_layer),
+                "layer_profiles": [],
+            }
+            forward_start_time = time.perf_counter()
+
         causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            prune_attention_mask if prune_enabled else attention_mask,
+            inputs_embeds,
+            cache_position,
+            past_key_values,
+            output_attentions,
         )
 
         hidden_states = inputs_embeds
@@ -1283,9 +1367,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            if collect_eval_profile and profile_device.type == "cuda":
+                torch.cuda.synchronize(profile_device)
+            layer_start_time = time.perf_counter() if collect_eval_profile else None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1319,7 +1407,103 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+            should_prune_here = (
+                prune_enabled
+                and layer_idx == self.visual_prune_layer
+                and prune_attention_mask is not None
+                and visual_token_mask is not None
+                and bool(visual_token_mask.any().item())
+            )
+            if should_prune_here:
+                (
+                    hidden_states,
+                    prune_attention_mask,
+                    position_ids,
+                    visual_token_mask,
+                    visual_token_types,
+                    batch_stats,
+                    kept_token_indices,
+                ) = self.visual_pruner(
+                    hidden_states=hidden_states,
+                    attention_mask=prune_attention_mask,
+                    position_ids=position_ids,
+                    visual_token_mask=visual_token_mask,
+                    visual_token_types=visual_token_types,
+                )
+                cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+                causal_mask = self._update_causal_mask(
+                    prune_attention_mask,
+                    hidden_states,
+                    cache_position,
+                    past_key_values,
+                    output_attentions,
+                )
+                position_embeddings = self.rotary_emb(hidden_states, position_ids)
+                self._last_visual_prune_stats = {
+                    "layer": layer_idx,
+                    "applied": True,
+                    "samples": [stats.as_dict() for stats in batch_stats],
+                    "kept_token_indices": [indices.detach().cpu().tolist() for indices in kept_token_indices],
+                }
+                if self.visual_prune_debug:
+                    log_parts = []
+                    for sample_idx, stats in enumerate(batch_stats):
+                        log_parts.append(
+                            "sample=%d layer=%d visual=%d->%d sem=%d/%d spa=%d/%d mix=%d/%d seq=%d->%d"
+                            % (
+                                sample_idx,
+                                layer_idx,
+                                stats.visual_before,
+                                stats.visual_after,
+                                stats.sem_kept,
+                                stats.sem_before,
+                                stats.spa_kept,
+                                stats.spa_before,
+                                stats.mix_kept,
+                                stats.mix_before,
+                                stats.sequence_before,
+                                stats.sequence_after,
+                            )
+                        )
+                    logger.info("Type-aware visual pruning applied. %s", " | ".join(log_parts))
+
+            if collect_eval_profile:
+                if profile_device.type == "cuda":
+                    torch.cuda.synchronize(profile_device)
+                eval_profile["layer_profiles"].append(
+                    {
+                        "layer_idx": int(layer_idx),
+                        "elapsed_ms": round((time.perf_counter() - layer_start_time) * 1000.0, 3),
+                        "sequence_length": int(hidden_states.shape[1]),
+                        "max_memory_allocated_mb": (
+                            round(torch.cuda.max_memory_allocated(profile_device) / (1024 ** 2), 2)
+                            if profile_device.type == "cuda"
+                            else None
+                        ),
+                    }
+                )
+
         hidden_states = self.norm(hidden_states)
+
+        if collect_eval_profile and eval_profile is not None:
+            if profile_device.type == "cuda":
+                torch.cuda.synchronize(profile_device)
+            eval_profile["forward_time_ms"] = round((time.perf_counter() - forward_start_time) * 1000.0, 3)
+            eval_profile["peak_memory_allocated_mb"] = (
+                round(torch.cuda.max_memory_allocated(profile_device) / (1024 ** 2), 2)
+                if profile_device.type == "cuda"
+                else None
+            )
+            if self._last_visual_prune_stats is None:
+                eval_profile["prune"] = {
+                    "applied": False,
+                    "layer": int(self.visual_prune_layer),
+                    "samples": [],
+                    "kept_token_indices": [],
+                }
+            else:
+                eval_profile["prune"] = self._last_visual_prune_stats
+            self._last_eval_profile = eval_profile
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1745,6 +1929,31 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
         # Initialize weights and apply final processing
         self.post_init()
 
+    def consume_visual_prune_profile(self) -> Optional[Dict[str, Any]]:
+        return self.model.consume_visual_prune_profile()
+
+    def _infer_image_token_types(
+        self,
+        image_embeds_2d: torch.Tensor,
+        image_embeds_3d: Optional[torch.Tensor],
+    ) -> torch.LongTensor:
+        token_count = image_embeds_2d.shape[0]
+        token_types = torch.full(
+            (token_count,),
+            TYPE_MIXED,
+            dtype=torch.long,
+            device=image_embeds_2d.device,
+        )
+        if image_embeds_3d is None or image_embeds_3d.shape[0] != token_count:
+            return token_types
+
+        sem_strength = image_embeds_2d.float().norm(dim=-1)
+        spa_strength = (self.lam * image_embeds_3d.float()).norm(dim=-1)
+        dominance_margin = 1.15
+        token_types[sem_strength > spa_strength * dominance_margin] = TYPE_SEMANTIC_HEAVY
+        token_types[spa_strength > sem_strength * dominance_margin] = TYPE_SPATIAL_HEAVY
+        return token_types
+
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, mode=None, **kwargs):
@@ -2036,6 +2245,11 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        visual_token_mask = None
+        visual_token_types = None
+        if input_ids is not None:
+            visual_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            visual_token_types = torch.full_like(input_ids, NON_VISUAL_TYPE, dtype=torch.long)
 
         if inputs_embeds is None:
             self.vggt.eval()
@@ -2112,6 +2326,7 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                 # debug_print_var("pixel_values self.visual)", pixel_values) 1564, 1176
                 
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_embeds_2d = image_embeds
                 
                 #debug_print_var("image_embeds self.visual)", image_embeds) # torch.Size([391, 3584])
                 
@@ -2120,6 +2335,7 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                 
                 #debug_print_var("image_embeds_3d: ", image_embeds_3d)
                 
+                image_token_types = self._infer_image_token_types(image_embeds_2d, image_embeds_3d)
                 image_embeds = image_embeds + self.lam * image_embeds_3d
                 
                 #debug_print_var("image_embeds Merge: ", image_embeds)
@@ -2138,6 +2354,11 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
 
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                if visual_token_mask is not None and visual_token_types is not None:
+                    visual_token_mask = visual_token_mask.to(inputs_embeds.device)
+                    visual_token_types = visual_token_types.to(inputs_embeds.device)
+                    visual_token_mask = visual_token_mask | mask.to(inputs_embeds.device)
+                    visual_token_types[mask.to(inputs_embeds.device)] = image_token_types.to(inputs_embeds.device)
 
                 # DEBUG: Print final inputs_embeds (after image fusion)
                 #debug_print_var("inputs_embeds (final, with fused images)", inputs_embeds) # torch.Size([1, 526, 3584])
@@ -2165,6 +2386,10 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
             
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
+            if visual_token_mask is not None:
+                visual_token_mask = visual_token_mask.to(inputs_embeds.device)
+            if visual_token_types is not None:
+                visual_token_types = visual_token_types.to(inputs_embeds.device)
                 
                 
 
@@ -2210,6 +2435,8 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            visual_token_mask=visual_token_mask,
+            visual_token_types=visual_token_types,
         )
 
         hidden_states = outputs[0]

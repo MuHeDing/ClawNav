@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <div align="center">
 <img src="assets/logo.png" alt="JanusVLN Logo" width="100"/>
 
@@ -247,3 +248,6 @@ If you find FSDrive is useful in your research or applications, please consider 
 ## 🙏 Acknowledgement
 Our work is primarily based on the following codebases:[Qwen2.5-VL](https://github.com/QwenLM/Qwen3-VL), [VGGT](https://github.com/facebookresearch/vggt), [StreamVLN](https://github.com/InternRobotics/StreamVLN), [VG-LLM](https://github.com/LaVi-Lab/VG-LLM). We are sincerely grateful for their work.
 
+=======
+# JanusVLN-pruning
+>>>>>>> 9e1955c01bedd312b481a560722eb85a2f320bd6

@@ -13,6 +13,12 @@ class ModelArguments:
     lam: float = field(default=0.2)
     distill_loss_weight: float = field(default=1.0)
     reference_frame: str = field(default="last")
+    use_llm_visual_prune: bool = field(default=True)
+    visual_prune_layer: int = field(default=4)
+    sem_keep_ratio: float = field(default=0.4)
+    spa_keep_ratio: float = field(default=0.7)
+    mix_keep_ratio: float = field(default=0.55)
+    visual_prune_debug: bool = field(default=False)
 
 
 @dataclass
