@@ -22,7 +22,7 @@ adaptive_sparse_scope=visual_middle
 adaptive_sparse_llm_kv_block_size=64
 adaptive_sparse_llm_start_blocks=7
 adaptive_sparse_llm_recent_blocks=14
-adaptive_sparse_llm_start_layer=14
+adaptive_sparse_llm_start_layer=4
 
 CHECKPOINT="/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra"
 echo "CHECKPOINT: ${CHECKPOINT}"
@@ -91,3 +91,4 @@ CUDA_VISIBLE_DEVICES=5,6 "${TORCHRUN}" --nproc_per_node=2 \
 
 # --save_video \
 #     --save_video_ratio 0.1 \
+# --adaptive_sparse_profile_full_attention

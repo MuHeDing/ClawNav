@@ -540,11 +540,12 @@ class VLNEvaluator:
             f"prefill_sparsity={summary.get('mean_prefill_sparsity')}",
             f"decode_sparsity={summary.get('mean_decode_sparsity')}",
             f"self_attn_flops_reduction={format_ratio(summary.get('self_attention_flops_reduction_ratio'))}",
-            f"sparse_attention_ms={format_ratio(summary.get('sparse_attention_latency_ms'))}",
-            f"sparse_attention_effective_tops={format_ratio(summary.get('sparse_attention_effective_tops'))}",
-            f"sparse_attention_actual_tops={format_ratio(summary.get('sparse_attention_actual_tops'))}",
-            f"full_attention_ms={format_ratio(summary.get('full_attention_latency_ms'))}",
-            f"full_attention_effective_tops={format_ratio(summary.get('full_attention_effective_tops'))}",
+            # Latency/TOPS logging is temporarily disabled.
+            # f"sparse_attention_ms={format_ratio(summary.get('sparse_attention_latency_ms'))}",
+            # f"sparse_attention_effective_tops={format_ratio(summary.get('sparse_attention_effective_tops'))}",
+            # f"sparse_attention_actual_tops={format_ratio(summary.get('sparse_attention_actual_tops'))}",
+            # f"full_attention_ms={format_ratio(summary.get('full_attention_latency_ms'))}",
+            # f"full_attention_effective_tops={format_ratio(summary.get('full_attention_effective_tops'))}",
         )
         console_layer_ids = {8, 24}
         for layer_summary in summary.get("layers", []):
@@ -556,11 +557,11 @@ class VLNEvaluator:
                 f"steps={layer_summary['count']}",
                 f"sparsity={format_ratio(layer_summary['mean_sparsity'])}",
                 f"self_attn_flops_reduction={format_ratio(layer_summary['self_attention_flops_reduction_ratio'])}",
-                f"sparse_attention_ms={format_ratio(layer_summary['sparse_attention_latency_ms'])}",
-                f"sparse_attention_effective_tops={format_ratio(layer_summary['sparse_attention_effective_tops'])}",
-                f"sparse_attention_actual_tops={format_ratio(layer_summary['sparse_attention_actual_tops'])}",
-                f"full_attention_ms={format_ratio(layer_summary['full_attention_latency_ms'])}",
-                f"full_attention_effective_tops={format_ratio(layer_summary['full_attention_effective_tops'])}",
+                # f"sparse_attention_ms={format_ratio(layer_summary['sparse_attention_latency_ms'])}",
+                # f"sparse_attention_effective_tops={format_ratio(layer_summary['sparse_attention_effective_tops'])}",
+                # f"sparse_attention_actual_tops={format_ratio(layer_summary['sparse_attention_actual_tops'])}",
+                # f"full_attention_ms={format_ratio(layer_summary['full_attention_latency_ms'])}",
+                # f"full_attention_effective_tops={format_ratio(layer_summary['full_attention_effective_tops'])}",
             )
 
     

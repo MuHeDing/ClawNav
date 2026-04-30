@@ -248,32 +248,34 @@ def record_adaptive_sparse_flops(
     inner.saved_attention_flops_records.append(saved_flops)
     inner.sparse_attention_flops_records.append(sparse_flops)
 
-    if sparse_latency_ms is not None:
-        if not hasattr(inner, "sparse_attention_latency_ms_records"):
-            inner.sparse_attention_latency_ms_records = []
-        if not hasattr(inner, "sparse_attention_effective_tops_records"):
-            inner.sparse_attention_effective_tops_records = []
-        if not hasattr(inner, "sparse_attention_actual_tops_records"):
-            inner.sparse_attention_actual_tops_records = []
-        sparse_latency_ms = float(sparse_latency_ms)
-        inner.sparse_attention_latency_ms_records.append(sparse_latency_ms)
-        sparse_effective_tops = _tops_or_none(dense_flops, sparse_latency_ms)
-        if sparse_effective_tops is not None:
-            inner.sparse_attention_effective_tops_records.append(sparse_effective_tops)
-        sparse_actual_tops = _tops_or_none(sparse_flops, sparse_latency_ms)
-        if sparse_actual_tops is not None:
-            inner.sparse_attention_actual_tops_records.append(sparse_actual_tops)
-
-    if full_attention_latency_ms is not None:
-        if not hasattr(inner, "full_attention_latency_ms_records"):
-            inner.full_attention_latency_ms_records = []
-        if not hasattr(inner, "full_attention_effective_tops_records"):
-            inner.full_attention_effective_tops_records = []
-        full_attention_latency_ms = float(full_attention_latency_ms)
-        inner.full_attention_latency_ms_records.append(full_attention_latency_ms)
-        full_attention_effective_tops = _tops_or_none(dense_flops, full_attention_latency_ms)
-        if full_attention_effective_tops is not None:
-            inner.full_attention_effective_tops_records.append(full_attention_effective_tops)
+    # Latency/TOPS profiling is temporarily disabled. Keep this code block for
+    # quick restoration when speed metrics are needed again.
+    # if sparse_latency_ms is not None:
+    #     if not hasattr(inner, "sparse_attention_latency_ms_records"):
+    #         inner.sparse_attention_latency_ms_records = []
+    #     if not hasattr(inner, "sparse_attention_effective_tops_records"):
+    #         inner.sparse_attention_effective_tops_records = []
+    #     if not hasattr(inner, "sparse_attention_actual_tops_records"):
+    #         inner.sparse_attention_actual_tops_records = []
+    #     sparse_latency_ms = float(sparse_latency_ms)
+    #     inner.sparse_attention_latency_ms_records.append(sparse_latency_ms)
+    #     sparse_effective_tops = _tops_or_none(dense_flops, sparse_latency_ms)
+    #     if sparse_effective_tops is not None:
+    #         inner.sparse_attention_effective_tops_records.append(sparse_effective_tops)
+    #     sparse_actual_tops = _tops_or_none(sparse_flops, sparse_latency_ms)
+    #     if sparse_actual_tops is not None:
+    #         inner.sparse_attention_actual_tops_records.append(sparse_actual_tops)
+    #
+    # if full_attention_latency_ms is not None:
+    #     if not hasattr(inner, "full_attention_latency_ms_records"):
+    #         inner.full_attention_latency_ms_records = []
+    #     if not hasattr(inner, "full_attention_effective_tops_records"):
+    #         inner.full_attention_effective_tops_records = []
+    #     full_attention_latency_ms = float(full_attention_latency_ms)
+    #     inner.full_attention_latency_ms_records.append(full_attention_latency_ms)
+    #     full_attention_effective_tops = _tops_or_none(dense_flops, full_attention_latency_ms)
+    #     if full_attention_effective_tops is not None:
+    #         inner.full_attention_effective_tops_records.append(full_attention_effective_tops)
 
     # LLM-layer and total-LLM FLOPs estimates are intentionally disabled.
     # Keep the attention-only FLOPs above; do not mix them with projection/MLP

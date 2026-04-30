@@ -368,11 +368,11 @@ def test_record_adaptive_sparse_flops_records_effective_and_actual_tops():
         full_attention_latency_ms=4.0,
     )
 
-    assert inner.sparse_attention_latency_ms_records == [2.0]
-    assert inner.sparse_attention_effective_tops_records == [1000.0]
-    assert inner.sparse_attention_actual_tops_records == [500.0]
-    assert inner.full_attention_latency_ms_records == [4.0]
-    assert inner.full_attention_effective_tops_records == [500.0]
+    assert not hasattr(inner, "sparse_attention_latency_ms_records")
+    assert not hasattr(inner, "sparse_attention_effective_tops_records")
+    assert not hasattr(inner, "sparse_attention_actual_tops_records")
+    assert not hasattr(inner, "full_attention_latency_ms_records")
+    assert not hasattr(inner, "full_attention_effective_tops_records")
 
 
 def test_summarize_adaptive_sparse_attention_reports_aggregate_tops():

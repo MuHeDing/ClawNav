@@ -882,48 +882,29 @@ class Qwen2_5_VLAttention(nn.Module):
             return None
 
         try:
-            attn_output, sparse_latency_ms = time_attention_call(
-                lambda: inner(
-                    query_states,
-                    key_states,
-                    value_states,
-                    is_causal=self.is_causal,
-                    scale=None,
-                    tensor_layout="HND",
-                    sparse_token_mask=adaptive_sparse_token_mask,
-                ),
-                query_states.device,
+            attn_output = inner(
+                query_states,
+                key_states,
+                value_states,
+                is_causal=self.is_causal,
+                scale=None,
+                tensor_layout="HND",
+                sparse_token_mask=adaptive_sparse_token_mask,
             )
-            full_attention_latency_ms = None
-            profile_full_attention = bool(
-                getattr(self.config, "adaptive_sparse_profile_full_attention", False)
-                or getattr(self.config, "adaptive_sparse_profile_full_kv_attention", False)
-            )
-            if profile_full_attention:
-                try:
-                    _, full_attention_latency_ms = time_attention_call(
-                        lambda: torch.nn.functional.scaled_dot_product_attention(
-                            query_states,
-                            key_states,
-                            value_states,
-                            attn_mask=None,
-                            dropout_p=0.0,
-                            is_causal=bool(self.is_causal and query_states.shape[-2] > 1),
-                        ),
-                        query_states.device,
-                    )
-                except Exception as profile_exc:
-                    if getattr(self, "adaptive_sparse_verbose", False):
-                        logger.warning_once(
-                            f"Full-KV attention profiling failed on layer {self.layer_idx}: {profile_exc}"
-                        )
+            # Latency/TOPS profiling is temporarily disabled. Restore this block
+            # with time_attention_call(...) when sparse attention speed metrics
+            # are needed again.
+            # attn_output, sparse_latency_ms = time_attention_call(...)
+            # full_attention_latency_ms = None
+            # if profile_full_attention:
+            #     _, full_attention_latency_ms = time_attention_call(...)
             record_adaptive_sparse_flops(
                 inner,
                 query_states,
                 key_states,
                 config=self.config,
-                sparse_latency_ms=sparse_latency_ms,
-                full_attention_latency_ms=full_attention_latency_ms,
+                # sparse_latency_ms=sparse_latency_ms,
+                # full_attention_latency_ms=full_attention_latency_ms,
             )
             return attn_output
         except Exception as exc:
