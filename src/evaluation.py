@@ -49,17 +49,25 @@ from evaluation_debug_utils import (
     build_episode_qualitative_record,
     build_model_step_record,
     canonical_scene_id,
+    format_ratio,
     multi_goal_overlay_pad_meters,
     normalize_vln_dataset_json_text,
+    resolve_qualitative_output_path,
     resolve_sanitized_vln_dataset_path,
     resolve_step_image_output_path,
     resolve_step_map_output_path,
+    should_save_step_artifacts,
 )
 from habitat_extensions import maps as habitat_extension_maps
 from qwen_vl_utils import extract_vision_info
 from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from qwen_vl.model.vggt.utils.load_fn import load_and_preprocess_images
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationForJanusVLN
+from qwen_vl.model.adaptive_sparse_attention import (
+    install_adaptive_sparse_attention_qwen,
+    reset_adaptive_sparse_attention_state,
+    summarize_adaptive_sparsity,
+)
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 
@@ -243,6 +251,12 @@ class VLNEvaluator:
                 self.output_path,
                 f"visual_prune_eval_profile_rank{get_rank()}.jsonl",
             )
+        self.adaptive_sparse_profile_path = None
+        if getattr(args, "use_llm_adaptive_sparse_attention", False):
+            self.adaptive_sparse_profile_path = os.path.join(
+                self.output_path,
+                f"adaptive_sparse_attention_profile_rank{get_rank()}.json",
+            )
         
         self.actions2idx = OrderedDict({
             'STOP': [0],
@@ -263,11 +277,13 @@ class VLNEvaluator:
             self.qualitative_output_path = None
             print("Qualitative trajectory dump disabled")
         else:
-            self.qualitative_output_path = os.path.join(
-                self.output_path,
-                f"qualitative_trajectories_rank{rank}.json",
-            )
-            print(f"Qualitative trajectory dump: {self.qualitative_output_path}")
+            self.qualitative_output_path = None
+            # self.qualitative_output_path = resolve_qualitative_output_path(
+            #     output_path=self.output_path,
+            #     rank=rank,
+            #     disabled=False,
+            # )
+            # print(f"Qualitative trajectory dump: {self.qualitative_output_path}")
 
     def _load_episode_multi_goals(self, dataset_path: Optional[str]) -> Dict[tuple, List[List[float]]]:
         if not dataset_path or not os.path.exists(dataset_path):
@@ -484,6 +500,69 @@ class VLNEvaluator:
             f"peak_mem_mb={peak_memory_mb}",
         )
 
+    def _log_adaptive_sparse_summary(
+        self,
+        scene_id: Optional[str],
+        episode_id: Optional[str],
+        step_id: Optional[int],
+        *,
+        final: bool = False,
+    ) -> None:
+        if not getattr(self.args, "use_llm_adaptive_sparse_attention", False):
+            return
+
+        summary = summarize_adaptive_sparsity(self.model.model)
+        tag = (
+            "adaptive_sparse_attention_episode_summary"
+            if final
+            else "adaptive_sparse_attention_summary"
+        )
+        record = {
+            "summary": True,
+            "final": bool(final),
+            "scene_id": scene_id,
+            "episode_id": None if episode_id is None else str(episode_id),
+            "step_id": None if step_id is None else int(step_id),
+            "adaptive_sparse_attention": summary,
+        }
+        if self.adaptive_sparse_profile_path is not None:
+            append_record_to_json_array_file(self.adaptive_sparse_profile_path, record)
+
+        if not summary.get("layers"):
+            print(tag, "no_sparsity_records")
+            return
+
+        print(
+            tag,
+            f"scene_episode={scene_id}_{episode_id}",
+            f"step={step_id}",
+            f"mean_sparsity={format_ratio(summary.get('mean_sparsity'))}",
+            f"prefill_sparsity={summary.get('mean_prefill_sparsity')}",
+            f"decode_sparsity={summary.get('mean_decode_sparsity')}",
+            f"self_attn_flops_reduction={format_ratio(summary.get('self_attention_flops_reduction_ratio'))}",
+            f"sparse_attention_ms={format_ratio(summary.get('sparse_attention_latency_ms'))}",
+            f"sparse_attention_effective_tops={format_ratio(summary.get('sparse_attention_effective_tops'))}",
+            f"sparse_attention_actual_tops={format_ratio(summary.get('sparse_attention_actual_tops'))}",
+            f"full_attention_ms={format_ratio(summary.get('full_attention_latency_ms'))}",
+            f"full_attention_effective_tops={format_ratio(summary.get('full_attention_effective_tops'))}",
+        )
+        console_layer_ids = {8, 24}
+        for layer_summary in summary.get("layers", []):
+            if int(layer_summary["layer"]) not in console_layer_ids:
+                continue
+            print(
+                "adaptive_sparse_attention_layer",
+                f"layer={layer_summary['layer']}",
+                f"steps={layer_summary['count']}",
+                f"sparsity={format_ratio(layer_summary['mean_sparsity'])}",
+                f"self_attn_flops_reduction={format_ratio(layer_summary['self_attention_flops_reduction_ratio'])}",
+                f"sparse_attention_ms={format_ratio(layer_summary['sparse_attention_latency_ms'])}",
+                f"sparse_attention_effective_tops={format_ratio(layer_summary['sparse_attention_effective_tops'])}",
+                f"sparse_attention_actual_tops={format_ratio(layer_summary['sparse_attention_actual_tops'])}",
+                f"full_attention_ms={format_ratio(layer_summary['full_attention_latency_ms'])}",
+                f"full_attention_effective_tops={format_ratio(layer_summary['full_attention_effective_tops'])}",
+            )
+
     
 
     def eval_action(self, idx) -> None:
@@ -532,10 +611,14 @@ class VLNEvaluator:
                     os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}'), exist_ok=True)
 
                 episode_multi_goals = self._episode_multi_goal_positions(episode)
-                save_step_artifacts = (
-                    should_save_video
-                    if getattr(self.args, "save_step_artifacts_with_video_only", False)
-                    else True
+                save_step_artifacts = should_save_step_artifacts(
+                    save_step_artifacts=getattr(self.args, "save_step_artifacts", False),
+                    should_save_video=should_save_video,
+                    save_step_artifacts_with_video_only=getattr(
+                        self.args,
+                        "save_step_artifacts_with_video_only",
+                        False,
+                    ),
                 )
                 if save_step_artifacts:
                     episode_step_image_dir = resolve_step_image_output_path(
@@ -554,9 +637,10 @@ class VLNEvaluator:
                     episode_step_map_dir.mkdir(parents=True, exist_ok=True)
 
                 rgb_list = []
-                model_path = [] if self.qualitative_output_path else None
+                model_path = [] if self.qualitative_output_path is not None else None
 
                 self.model.model.past_key_values_vggt = None
+                reset_adaptive_sparse_attention_state(self.model.model)
                 
                 while not env.episode_over:
                     rgb = observations["rgb"]
@@ -601,6 +685,16 @@ class VLNEvaluator:
                         episode_instruction=episode_instruction,
                         profile=self.model.consume_last_visual_prune_profile(),
                     )
+                    if (
+                        getattr(self.args, "use_llm_adaptive_sparse_attention", False)
+                        and self.args.adaptive_sparse_log_interval > 0
+                        and step_id % self.args.adaptive_sparse_log_interval == 0
+                    ):
+                        self._log_adaptive_sparse_summary(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            step_id=step_id,
+                        )
                     action_text = action
                     
                     if action not in self.actions2idx:
@@ -654,6 +748,13 @@ class VLNEvaluator:
                 vis_frames.clear()
                 
                 self.model.model.past_key_values_vggt = None
+                self._log_adaptive_sparse_summary(
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    final=True,
+                )
+                reset_adaptive_sparse_attention_state(self.model.model)
                 rgb_list.clear()
                 
                 sucs.append(metrics['success'])
@@ -698,6 +799,13 @@ class VLNEvaluator:
             with open(self.visual_prune_profile_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(summary_record) + "\n")
             print("visual_prune_profile_summary", summary_record)
+
+        self._log_adaptive_sparse_summary(
+            scene_id=None,
+            episode_id=None,
+            step_id=None,
+            final=True,
+        )
 
         env.close()
         return torch.tensor(sucs).to(self.device), torch.tensor(spls).to(self.device), torch.tensor(oss).to(self.device), torch.tensor(ones).to(self.device), torch.tensor(len(sucs)).to(self.device)     
@@ -912,10 +1020,16 @@ def eval():
                         help= "Maximum sequence length. Sequences will be right padded (and possibly truncated).")
     parser.add_argument("--save_video_ratio", type=float, default=0.05, help="0~1")
     parser.add_argument(
+        "--save_step_artifacts",
+        action="store_true",
+        default=False,
+        help="Save per-step RGB images and top-down maps under step_images/ and step_maps/",
+    )
+    parser.add_argument(
         "--save_step_artifacts_with_video_only",
         action="store_true",
         default=False,
-        help="Only save step_images and step_maps for episodes selected by --save_video",
+        help="When --save_step_artifacts is enabled, only save step_images and step_maps for episodes selected by --save_video",
     )
     parser.add_argument(
         "--disable_qualitative_json",
@@ -942,7 +1056,7 @@ def eval():
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
-    parser.add_argument('--max_steps', default=450, type=int,
+    parser.add_argument('--max_steps', default=400, type=int,
                         help='max_steps')
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--kv_start_size", type=int, default=8,
@@ -950,6 +1064,36 @@ def eval():
     parser.add_argument("--kv_recent_size", type=int, default=24,
                         help="VGGT KV cache recent size (keep last N frames)")
     parser.add_argument("--disable_visual_prune_eval_profile", action="store_true", default=False)
+    parser.add_argument("--use_llm_adaptive_sparse_attention", action="store_true", default=False,
+                        help="Install SpargeAttn adaptive sparse attention on Qwen LLM self-attention")
+    parser.add_argument("--spargeattn_path", type=str,
+                        default=None,
+                        help="Optional override path containing the spas_sage_attn package; by default Fast_JanusVLN uses the vendored copy under src/")
+    parser.add_argument("--adaptive_sparse_min_seq_len", type=int, default=128,
+                        help="Minimum Qwen prefill sequence length for adaptive sparse attention")
+    parser.add_argument("--adaptive_sparse_pvthreshd", type=float, default=1e6,
+                        help="PV threshold passed to SpargeAttn AdaptiveSparseAttention")
+    parser.add_argument("--adaptive_sparse_target_blocks", type=float, default=79,
+                        help="AdaptiveBlockMasker target blocks")
+    parser.add_argument("--adaptive_sparse_target_drop_mass", type=float, default=0.68,
+                        help="AdaptiveBlockMasker target drop mass")
+    parser.add_argument("--adaptive_sparse_log_interval", type=int, default=25,
+                        help="Print adaptive sparse summary every N navigation steps; <=0 disables periodic summary")
+    parser.add_argument("--adaptive_sparse_scope", type=str, default="visual_middle",
+                        choices=["all", "visual_middle"],
+                        help="Apply adaptive sparse attention to all tokens or only middle visual-token blocks")
+    parser.add_argument("--adaptive_sparse_llm_kv_block_size", type=int, default=64,
+                        help="LLM visual-token block size for visual_middle adaptive sparse scope")
+    parser.add_argument("--adaptive_sparse_llm_start_blocks", type=int, default=1,
+                        help="Number of first LLM visual-token blocks kept dense for visual_middle adaptive sparse scope")
+    parser.add_argument("--adaptive_sparse_llm_recent_blocks", type=int, default=1,
+                        help="Number of last LLM visual-token blocks kept dense for visual_middle adaptive sparse scope")
+    parser.add_argument("--adaptive_sparse_llm_start_layer", type=int, default=14,
+                        help="First Qwen LLM layer index allowed to use adaptive sparse attention; lower layers stay dense")
+    parser.add_argument("--adaptive_sparse_profile_full_attention", action="store_true", default=False,
+                        help="Also run and time full dense attention for TOPS comparison; this adds extra compute")
+    parser.add_argument("--adaptive_sparse_profile_full_kv_attention", action="store_true", default=False,
+                        help=argparse.SUPPRESS)
     
     args = parser.parse_args()
     set_seed(args.seed)
@@ -969,6 +1113,40 @@ def eval():
         kv_start_size=args.kv_start_size,
         kv_recent_size=args.kv_recent_size)
     model.model.config.enable_visual_prune_eval_profile = not args.disable_visual_prune_eval_profile
+    model.model.config.adaptive_sparse_min_seq_len = args.adaptive_sparse_min_seq_len
+    model.model.config.adaptive_sparse_scope = args.adaptive_sparse_scope
+    model.model.config.adaptive_sparse_llm_kv_block_size = args.adaptive_sparse_llm_kv_block_size
+    model.model.config.adaptive_sparse_llm_start_blocks = args.adaptive_sparse_llm_start_blocks
+    model.model.config.adaptive_sparse_llm_recent_blocks = args.adaptive_sparse_llm_recent_blocks
+    model.model.config.adaptive_sparse_llm_start_layer = args.adaptive_sparse_llm_start_layer
+    model.model.config.adaptive_sparse_profile_full_attention = (
+        args.adaptive_sparse_profile_full_attention
+        or args.adaptive_sparse_profile_full_kv_attention
+    )
+    if args.use_llm_adaptive_sparse_attention:
+        if args.spargeattn_path and args.spargeattn_path not in sys.path:
+            sys.path.insert(0, args.spargeattn_path)
+        install_adaptive_sparse_attention_qwen(
+            model.model,
+            verbose=True,
+            pvthreshd=args.adaptive_sparse_pvthreshd,
+            stateless=False,
+            mask_kwargs=dict(
+                prefill_min_blocks=2,
+                target_blocks=args.adaptive_sparse_target_blocks,
+                target_drop_mass=args.adaptive_sparse_target_drop_mass,
+                recent_window_len=2,
+                tau_init=0.5,
+                lam_init=0.0,
+                mu_reg=0.01,
+                beta=0.2,
+                lr_tau=0.1,
+                alpha_min=0.0,
+                alpha_max=4.5,
+                rho_lambda=0.5,
+            ),
+        )
+        print("LLM adaptive sparse attention installed")
 
     evaluate(model, args)
 

@@ -59,6 +59,12 @@ from .llm_visual_pruner import (
     TypeAwareVisualTokenPruner,
     should_apply_visual_prune,
 )
+from .adaptive_sparse_attention import (
+    build_middle_visual_token_mask,
+    can_use_adaptive_sparse_attention,
+    record_adaptive_sparse_flops,
+    time_attention_call,
+)
 from .vggt.models.vggt import VGGT
 from .loss import normalize_pointcloud, check_and_fix_inf_nan
 
@@ -840,6 +846,93 @@ class Qwen2_5_VLAttention(nn.Module):
 
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
 
+    def _adaptive_sparse_attention_forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        output_attentions: bool = False,
+        adaptive_sparse_token_mask: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        inner = getattr(self, "adaptive_sparse_attention", None)
+        if inner is None or output_attentions:
+            return None
+        start_layer = int(getattr(self.config, "adaptive_sparse_llm_start_layer", 0))
+        if self.layer_idx < start_layer:
+            return None
+
+        scope = getattr(self.config, "adaptive_sparse_scope", "all")
+        if scope == "visual_middle":
+            if adaptive_sparse_token_mask is None:
+                return None
+            if adaptive_sparse_token_mask.shape[-1] != query_states.shape[-2]:
+                return None
+            if not bool(adaptive_sparse_token_mask.any().item()):
+                return None
+
+        min_seq_len = getattr(self.config, "adaptive_sparse_min_seq_len", 128)
+        if not can_use_adaptive_sparse_attention(
+            query_states=query_states,
+            attention_mask=attention_mask,
+            min_seq_len=min_seq_len,
+            training=self.training,
+            require_cuda=True,
+        ):
+            return None
+
+        try:
+            attn_output, sparse_latency_ms = time_attention_call(
+                lambda: inner(
+                    query_states,
+                    key_states,
+                    value_states,
+                    is_causal=self.is_causal,
+                    scale=None,
+                    tensor_layout="HND",
+                    sparse_token_mask=adaptive_sparse_token_mask,
+                ),
+                query_states.device,
+            )
+            full_attention_latency_ms = None
+            profile_full_attention = bool(
+                getattr(self.config, "adaptive_sparse_profile_full_attention", False)
+                or getattr(self.config, "adaptive_sparse_profile_full_kv_attention", False)
+            )
+            if profile_full_attention:
+                try:
+                    _, full_attention_latency_ms = time_attention_call(
+                        lambda: torch.nn.functional.scaled_dot_product_attention(
+                            query_states,
+                            key_states,
+                            value_states,
+                            attn_mask=None,
+                            dropout_p=0.0,
+                            is_causal=bool(self.is_causal and query_states.shape[-2] > 1),
+                        ),
+                        query_states.device,
+                    )
+                except Exception as profile_exc:
+                    if getattr(self, "adaptive_sparse_verbose", False):
+                        logger.warning_once(
+                            f"Full-KV attention profiling failed on layer {self.layer_idx}: {profile_exc}"
+                        )
+            record_adaptive_sparse_flops(
+                inner,
+                query_states,
+                key_states,
+                config=self.config,
+                sparse_latency_ms=sparse_latency_ms,
+                full_attention_latency_ms=full_attention_latency_ms,
+            )
+            return attn_output
+        except Exception as exc:
+            if getattr(self, "adaptive_sparse_verbose", False):
+                logger.warning_once(
+                    f"Adaptive sparse attention fell back to dense attention on layer {self.layer_idx}: {exc}"
+                )
+            return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -850,6 +943,7 @@ class Qwen2_5_VLAttention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        adaptive_sparse_token_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -873,6 +967,20 @@ class Qwen2_5_VLAttention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        adaptive_attn_output = self._adaptive_sparse_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            output_attentions,
+            adaptive_sparse_token_mask,
+        )
+        if adaptive_attn_output is not None:
+            attn_output = adaptive_attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, -1)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None, past_key_value
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
@@ -934,6 +1042,7 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        adaptive_sparse_token_mask: Optional[torch.Tensor] = None,
     ):
         bsz, q_len, _ = hidden_states.size()
 
@@ -982,6 +1091,20 @@ class Qwen2_5_VLFlashAttention2(Qwen2_5_VLAttention):
             query_states = query_states.to(target_dtype)
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
+
+        adaptive_attn_output = self._adaptive_sparse_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            output_attentions,
+            adaptive_sparse_token_mask,
+        )
+        if adaptive_attn_output is not None:
+            attn_output = adaptive_attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None, past_key_value
 
         # Reashape to the expected shape for Flash Attention
         query_states = query_states.transpose(1, 2)
@@ -1036,6 +1159,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        adaptive_sparse_token_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -1052,6 +1176,7 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                adaptive_sparse_token_mask=adaptive_sparse_token_mask,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -1079,6 +1204,20 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         causal_mask = attention_mask
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+        adaptive_attn_output = self._adaptive_sparse_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            causal_mask,
+            output_attentions,
+            adaptive_sparse_token_mask,
+        )
+        if adaptive_attn_output is not None:
+            attn_output = adaptive_attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None, past_key_value
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -1142,6 +1281,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        adaptive_sparse_token_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1180,6 +1320,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            adaptive_sparse_token_mask=adaptive_sparse_token_mask,
         )
         hidden_states = residual + hidden_states
 
@@ -1264,6 +1405,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         visual_token_mask: Optional[torch.Tensor] = None,
         visual_token_types: Optional[torch.LongTensor] = None,
+        adaptive_sparse_token_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1386,6 +1528,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    adaptive_sparse_token_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1397,6 +1540,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    adaptive_sparse_token_mask=adaptive_sparse_token_mask,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1431,6 +1575,11 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     visual_token_types=visual_token_types,
                 )
                 cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+                if adaptive_sparse_token_mask is not None:
+                    adaptive_sparse_token_mask = adaptive_sparse_token_mask.gather(
+                        dim=1,
+                        index=kept_token_indices.to(adaptive_sparse_token_mask.device),
+                    )
                 causal_mask = self._update_causal_mask(
                     prune_attention_mask,
                     hidden_states,
@@ -2424,6 +2573,19 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
+        adaptive_sparse_token_mask = None
+        if (
+            getattr(self.config, "adaptive_sparse_scope", "all") == "visual_middle"
+            and input_ids is not None
+        ):
+            adaptive_sparse_token_mask = build_middle_visual_token_mask(
+                input_ids,
+                image_token_id=self.config.image_token_id,
+                kv_block_size=getattr(self.config, "adaptive_sparse_llm_kv_block_size", 64),
+                llm_start_blocks=getattr(self.config, "adaptive_sparse_llm_start_blocks", 1),
+                llm_recent_blocks=getattr(self.config, "adaptive_sparse_llm_recent_blocks", 1),
+            ).to(inputs_embeds.device)
+
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
@@ -2437,6 +2599,7 @@ class Qwen2_5_VLForConditionalGenerationForJanusVLN(Qwen2_5_VLPreTrainedModel, G
             cache_position=cache_position,
             visual_token_mask=visual_token_mask,
             visual_token_types=visual_token_types,
+            adaptive_sparse_token_mask=adaptive_sparse_token_mask,
         )
 
         hidden_states = outputs[0]

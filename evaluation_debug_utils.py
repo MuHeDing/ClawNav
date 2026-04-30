@@ -84,6 +84,36 @@ def build_episode_qualitative_record(
     return record
 
 
+def should_save_step_artifacts(
+    *,
+    save_step_artifacts: bool,
+    should_save_video: bool,
+    save_step_artifacts_with_video_only: bool,
+) -> bool:
+    if not save_step_artifacts:
+        return False
+    if save_step_artifacts_with_video_only:
+        return bool(should_save_video)
+    return True
+
+
+def resolve_qualitative_output_path(
+    *,
+    output_path: Path,
+    rank: int,
+    disabled: bool,
+) -> Optional[Path]:
+    if disabled:
+        return None
+    return Path(output_path) / f"qualitative_trajectories_rank{int(rank)}.json"
+
+
+def format_ratio(value: Optional[float]) -> str:
+    if value is None:
+        return "None"
+    return f"{float(value):.2f}"
+
+
 def extract_multi_goal_positions(episode: Dict[str, Any]) -> List[List[float]]:
     positions: List[List[float]] = []
     for goal_item in episode.get("multi_goals", []):
