@@ -55,10 +55,10 @@ def _run_block_sparse_kernel(
     """Helper to quantize inputs and dispatch the sparse kernel once."""
 
     lut, valid_block_num = block_map_lut_triton(mask_blocks)
-    if use_sm90:
-        q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q_chunk, k, km, 64, 128)
-    else:
-        q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q_chunk, k, km)
+    # The f16 sparse kernel below validates q_scale/k_scale against its own
+    # CTA tile sizes. Unlike the fp8 path, it has no sm90-specific dispatch
+    # here, so keep the default quantization blocks on every architecture.
+    q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q_chunk, k, km)
 
     out = torch.empty_like(q_chunk)
     _is_causal = 1 if is_causal else 0

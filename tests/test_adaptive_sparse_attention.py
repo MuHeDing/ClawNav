@@ -19,6 +19,7 @@ from evaluation_debug_utils import (
     should_save_step_artifacts,
 )
 from spas_sage_attn.core import estimate_block_sparse_attention_flops
+from spas_sage_attn import core as spas_core
 
 
 class FakeMasker:
@@ -118,6 +119,53 @@ def test_can_use_adaptive_sparse_attention_requires_safe_prefill_shape():
         training=True,
         require_cuda=False,
     )
+
+
+def test_f16_sparse_kernel_uses_kernel_compatible_quant_blocks_on_sm90(monkeypatch):
+    quant_calls = []
+
+    def fake_block_map_lut(mask_blocks):
+        return torch.empty(1, dtype=torch.int32), torch.empty(1, dtype=torch.int32)
+
+    def fake_get_vanilla_qk_quant(q, k, km=None, BLKQ=128, BLKK=64):
+        quant_calls.append((BLKQ, BLKK))
+        return (
+            torch.empty_like(q, dtype=torch.int8),
+            torch.empty((q.shape[0], q.shape[1], (q.shape[2] + BLKQ - 1) // BLKQ)),
+            torch.empty_like(k, dtype=torch.int8),
+            torch.empty((k.shape[0], k.shape[1], (k.shape[2] + BLKK - 1) // BLKK)),
+        )
+
+    def fake_sparse_kernel(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(spas_core, "block_map_lut_triton", fake_block_map_lut)
+    monkeypatch.setattr(spas_core, "get_vanilla_qk_quant", fake_get_vanilla_qk_quant)
+    monkeypatch.setattr(
+        spas_core.qattn,
+        "qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold",
+        fake_sparse_kernel,
+    )
+
+    q = torch.empty(1, 2, 129, 64)
+    k = torch.empty(1, 2, 129, 64)
+    v = torch.empty(1, 2, 129, 64)
+    mask_blocks = torch.ones(1, 2, 2, 3, dtype=torch.bool)
+    pvthreshd_vec = torch.ones(2)
+
+    spas_core._run_block_sparse_kernel(
+        q,
+        k,
+        v,
+        None,
+        mask_blocks,
+        pvthreshd_vec,
+        scale=1.0,
+        use_sm90=True,
+        is_causal=True,
+    )
+
+    assert quant_calls == [(128, 64)]
 
 
 def test_install_adaptive_sparse_attention_qwen_attaches_layer_wrappers():
