@@ -13,6 +13,32 @@ DEFAULT_ALLOWED_MEMORY_SOURCES = {
 
 class MemoryWriteSkill(Skill):
     name = "MemoryWriteSkill"
+    description = "Write approved keyframe or semantic memory records to the configured memory backend."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "should_write": {"type": "boolean"},
+            "memory_source": {"type": "string"},
+            "write_type": {"type": "string"},
+            "step_id": {"type": "integer"},
+            "scene_id": {"type": "string"},
+            "episode_id": {"type": "string"},
+            "image_path": {"type": "string"},
+            "note": {"type": "string"},
+            "metadata": {"type": "object"},
+        },
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "written": {"type": "boolean"},
+            "skipped": {"type": "boolean"},
+            "record": {"type": "object"},
+        },
+        "required": ["written"],
+    }
+    side_effects = True
+    oracle_safe = True
 
     def __init__(
         self,

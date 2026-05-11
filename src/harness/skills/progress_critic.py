@@ -6,6 +6,33 @@ from harness.types import SkillResult, VLNState
 
 class ProgressCriticSkill(Skill):
     name = "ProgressCriticSkill"
+    description = "Evaluate non-oracle progress signals for stuck, risky stop, or replan conditions."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "working_memory": {"type": "object"},
+            "policy_action": {"type": "string"},
+            "semantic_alignment": {"type": "number"},
+            "memory_consistency": {"type": "number"},
+            "max_steps": {"type": "integer"},
+        },
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "possible_stuck": {"type": "boolean"},
+            "low_displacement": {"type": "boolean"},
+            "repeated_observation": {"type": "boolean"},
+            "risky_stop": {"type": "boolean"},
+            "near_step_budget": {"type": "boolean"},
+            "should_recall": {"type": "boolean"},
+            "should_replan": {"type": "boolean"},
+            "signals": {"type": "array"},
+            "decision_inputs": {"type": "object"},
+            "used_oracle_metrics": {"type": "boolean"},
+        },
+    }
+    oracle_safe = True
 
     def __init__(
         self,
@@ -82,4 +109,3 @@ class ProgressCriticSkill(Skill):
             },
             confidence=1.0 if signals else 0.5,
         )
-

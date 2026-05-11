@@ -6,6 +6,26 @@ from harness.types import SkillResult, VLNState
 
 class ReplannerSkill(Skill):
     name = "ReplannerSkill"
+    description = "Create a recovery subgoal from non-oracle failure signals and memory hits."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "task_memory": {"type": "object"},
+            "failure_reason": {"type": "string"},
+            "memory_hits": {"type": "array"},
+        },
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "active_subgoal": {"type": "string"},
+            "memory_query_hint": {"type": "string"},
+            "reason": {"type": "string"},
+            "memory_hits": {"type": "array"},
+        },
+        "required": ["active_subgoal"],
+    }
+    oracle_safe = True
 
     def run(self, state: VLNState, payload: Dict[str, Any]) -> SkillResult:
         task_memory = payload.get("task_memory")

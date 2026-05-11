@@ -6,6 +6,26 @@ from harness.types import SkillResult, VLNState
 
 class NavigationPolicySkill(Skill):
     name = "NavigationPolicySkill"
+    description = "Run the JanusVLN navigation policy with optional subgoal and memory context."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "recent_frames": {"type": "array"},
+            "memory_images": {"type": "array"},
+            "active_subgoal": {"type": "string"},
+            "memory_context_text": {"type": "string"},
+        },
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "action_text": {"type": "string"},
+            "images_used": {"type": "integer"},
+            "instruction": {"type": "string"},
+        },
+        "required": ["action_text"],
+    }
+    oracle_safe = True
 
     def __init__(
         self,

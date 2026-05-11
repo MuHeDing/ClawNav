@@ -7,6 +7,29 @@ from harness.types import SkillResult
 
 class MemoryQuerySkill(Skill):
     name = "MemoryQuerySkill"
+    description = "Query spatial memory for instruction, subgoal, or failure-recovery context."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "query": {"type": "string"},
+            "step_id": {"type": "integer"},
+            "reason": {"type": "string"},
+            "n_results": {"type": "integer"},
+        },
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "memory_hits": {"type": "array"},
+            "query": {"type": "string"},
+            "backend": {"type": "string"},
+            "policy_context": {"type": "object"},
+            "control_context": {"type": "object"},
+            "executor_context": {"type": "object"},
+        },
+    }
+    oracle_safe = True
 
     def __init__(self, memory_manager: MemoryManager) -> None:
         self.memory_manager = memory_manager
@@ -34,4 +57,3 @@ class MemoryQuerySkill(Skill):
             },
             confidence=recall.control_context.get("confidence", 0.0),
         )
-
