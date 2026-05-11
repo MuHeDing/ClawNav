@@ -7,6 +7,7 @@ import pytest
 from qwen_vl.model.adaptive_sparse_attention import (
     build_middle_visual_token_mask,
     can_use_adaptive_sparse_attention,
+    compact_adaptive_sparsity_summary,
     install_adaptive_sparse_attention_qwen,
     _load_spargeattn_classes,
     record_adaptive_sparse_flops,
@@ -327,6 +328,59 @@ def test_summarize_adaptive_sparse_attention_ignores_disabled_llm_layer_savings(
     assert summary["estimated_total_llm_saved_flops"] == 0.0
     assert summary["estimated_total_llm_sparse_flops"] == 0.0
     assert summary["estimated_total_llm_flops_reduction_ratio"] is None
+
+
+def test_compact_adaptive_sparsity_summary_keeps_key_metrics_only():
+    summary = {
+        "mean_sparsity": 0.1,
+        "mean_prefill_sparsity": 0.01,
+        "mean_decode_sparsity": 0.11,
+        "dense_attention_flops": 1000.0,
+        "sparse_attention_flops": 900.0,
+        "saved_attention_flops": 100.0,
+        "flops_reduction_ratio": 0.1,
+        "self_attention_flops_reduction_ratio": 0.1,
+        "instrumented_sparse_layers": 2,
+        "estimated_total_llm_num_layers": 4,
+        "dense_llm_layer_flops": 999.0,
+        "layers": [
+            {
+                "layer": 2,
+                "mean_sparsity": 0.2,
+                "count": 3,
+                "mean_prefill_sparsity": 0.02,
+                "prefill_count": 1,
+                "mean_decode_sparsity": 0.22,
+                "decode_count": 2,
+                "dense_attention_flops": 500.0,
+                "sparse_attention_flops": 400.0,
+                "saved_attention_flops": 100.0,
+                "self_attention_flops_reduction_ratio": 0.2,
+            }
+        ],
+    }
+
+    checkpoint = compact_adaptive_sparsity_summary(summary)
+    final = compact_adaptive_sparsity_summary(summary, include_layers=True)
+
+    assert checkpoint["mean_sparsity"] == 0.1
+    assert checkpoint["saved_attention_flops"] == 100.0
+    assert checkpoint["layer_count"] == 1
+    assert "layers" not in checkpoint
+    assert "dense_llm_layer_flops" not in checkpoint
+    assert final["layers"] == [
+        {
+            "layer": 2,
+            "mean_sparsity": 0.2,
+            "count": 3,
+            "mean_prefill_sparsity": 0.02,
+            "prefill_count": 1,
+            "mean_decode_sparsity": 0.22,
+            "decode_count": 2,
+            "self_attention_flops_reduction_ratio": 0.2,
+        }
+    ]
+    assert "dense_attention_flops" not in final["layers"][0]
 
 
 def test_record_adaptive_sparse_flops_records_self_attention_only():

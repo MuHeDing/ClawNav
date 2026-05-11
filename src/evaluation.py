@@ -64,6 +64,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoProcessor
 from qwen_vl.model.vggt.utils.load_fn import load_and_preprocess_images
 from qwen_vl.model.modeling_qwen2_5_vl import Qwen2_5_VLForConditionalGenerationForJanusVLN
 from qwen_vl.model.adaptive_sparse_attention import (
+    compact_adaptive_sparsity_summary,
     install_adaptive_sparse_attention_qwen,
     reset_adaptive_sparse_attention_state,
     summarize_adaptive_sparsity,
@@ -252,10 +253,15 @@ class VLNEvaluator:
                 f"visual_prune_eval_profile_rank{get_rank()}.jsonl",
             )
         self.adaptive_sparse_profile_path = None
+        self.adaptive_sparse_summary_path = None
         if getattr(args, "use_llm_adaptive_sparse_attention", False):
             self.adaptive_sparse_profile_path = os.path.join(
                 self.output_path,
                 f"adaptive_sparse_attention_profile_rank{get_rank()}.json",
+            )
+            self.adaptive_sparse_summary_path = os.path.join(
+                self.output_path,
+                f"adaptive_sparse_attention_summary_rank{get_rank()}.json",
             )
         
         self.actions2idx = OrderedDict({
@@ -512,6 +518,19 @@ class VLNEvaluator:
             return
 
         summary = summarize_adaptive_sparsity(self.model.model)
+        run_final = bool(
+            final
+            and scene_id is None
+            and episode_id is None
+            and step_id is None
+        )
+        record_type = (
+            "run_summary"
+            if run_final
+            else "episode_summary"
+            if final
+            else "checkpoint"
+        )
         tag = (
             "adaptive_sparse_attention_episode_summary"
             if final
@@ -519,14 +538,23 @@ class VLNEvaluator:
         )
         record = {
             "summary": True,
-            "final": bool(final),
+            "record_type": record_type,
+            "final": run_final,
+            "episode_final": bool(final and not run_final),
             "scene_id": scene_id,
             "episode_id": None if episode_id is None else str(episode_id),
             "step_id": None if step_id is None else int(step_id),
-            "adaptive_sparse_attention": summary,
+            "adaptive_sparse_attention": compact_adaptive_sparsity_summary(
+                summary,
+                include_layers=run_final,
+            ),
         }
         if self.adaptive_sparse_profile_path is not None:
             append_record_to_json_array_file(self.adaptive_sparse_profile_path, record)
+        if run_final and self.adaptive_sparse_summary_path is not None:
+            with open(self.adaptive_sparse_summary_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+                f.write("\n")
 
         if not summary.get("layers"):
             print(tag, "no_sparsity_records")

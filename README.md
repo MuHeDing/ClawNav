@@ -1,8 +1,7 @@
-<<<<<<< HEAD
 <div align="center">
-<img src="assets/logo.png" alt="JanusVLN Logo" width="100"/>
+<img src="assets/logo.png" alt="ClawNav Logo" width="100"/>
 
-<h1>JanusVLN: Decoupling Semantics and Spatiality with Dual Implicit Memory for Vision-Language Navigation</h1>
+<h1>ClawNav: An OpenClaw-Style Visual Memory Harness for Training-Free Long-Horizon VLN</h1>
 
 [Shuang Zeng](https://scholar.google.com/citations?user=91lbdPcAAAAJ&hl=zh-CN)<sup>1,2</sup>,
 [Dekang Qi](https://scholar.google.com/citations?user=fOU1xMAAAAAJ&hl=zh-CN&oi=ao)<sup>1</sup>,
@@ -32,7 +31,9 @@ https://github.com/user-attachments/assets/bc477e20-2dd2-4927-b382-f483f578f3e1
 
 
 ## 💡 Introduction
-**JanusVLN** is a novel VLN framework and the first to feature a **dual implicit memory**. Inspired by the implicit scene representation in human navigation, which integrates left-brain semantic understanding with right-brain spatial cognition, JanusVLN constructs two complementary, fixed-size, compact neural memory. JanusVLN steers VLN research from 2D semantics-dominant toward 3D spatial-semantisynergy, a critical direction for developing next-generation spatial embodied agents.
+**ClawNav** is a research fork built on **Fast_JanusVLN / JanusVLN** for an OpenClaw-style, training-free Harness in long-horizon vision-language navigation. The project keeps JanusVLN as the reactive `NavigationPolicySkill` and adds a system layer for task-level memory, visual memory, progress critic, replanning, skill scheduling, and structured traces.
+
+The underlying navigation model, checkpoints, dataset preparation, and baseline evaluation commands are inherited from JanusVLN. ClawNav development focuses on inference-time visual memory storage, organization, and recall without changing the Fast_JanusVLN model architecture.
 
 
 <div style="text-align: center;">
@@ -230,7 +231,7 @@ bash scripts/evaluation.sh
 
 ## 📜 Citing
 
-If you find FSDrive is useful in your research or applications, please consider giving us a star 🌟 and citing it by the following BibTeX entry:
+If you use the underlying JanusVLN model, checkpoints, or evaluation setup, please cite the original JanusVLN work:
 
 ```
 @article{zeng2025janusvln,
@@ -246,8 +247,4 @@ If you find FSDrive is useful in your research or applications, please consider 
 
 
 ## 🙏 Acknowledgement
-Our work is primarily based on the following codebases:[Qwen2.5-VL](https://github.com/QwenLM/Qwen3-VL), [VGGT](https://github.com/facebookresearch/vggt), [StreamVLN](https://github.com/InternRobotics/StreamVLN), [VG-LLM](https://github.com/LaVi-Lab/VG-LLM). We are sincerely grateful for their work.
-
-=======
-# JanusVLN-pruning
->>>>>>> 9e1955c01bedd312b481a560722eb85a2f320bd6
+ClawNav is built on JanusVLN / Fast_JanusVLN. The upstream work is primarily based on the following codebases:[Qwen2.5-VL](https://github.com/QwenLM/Qwen3-VL), [VGGT](https://github.com/facebookresearch/vggt), [StreamVLN](https://github.com/InternRobotics/StreamVLN), [VG-LLM](https://github.com/LaVi-Lab/VG-LLM). We are sincerely grateful for their work.

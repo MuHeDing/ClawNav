@@ -22,7 +22,7 @@ adaptive_sparse_scope=visual_middle
 adaptive_sparse_llm_kv_block_size=64
 adaptive_sparse_llm_start_blocks=7
 adaptive_sparse_llm_recent_blocks=14
-adaptive_sparse_llm_start_layer=5
+adaptive_sparse_llm_start_layer=14
 
 CHECKPOINT="/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra"
 echo "CHECKPOINT: ${CHECKPOINT}"
@@ -66,7 +66,7 @@ echo "TORCHRUN: ${TORCHRUN}"
 
 # --- Level 1: 轻度优化 (推荐首先尝试) ---
 # 2个GPU，num_history=1，max_pixels=6272
-CUDA_VISIBLE_DEVICES=5,6 "${TORCHRUN}" --nproc_per_node=2 \
+CUDA_VISIBLE_DEVICES=7 "${TORCHRUN}" --nproc_per_node=1 \
     --master_port=$MASTER_PORT \
     src/evaluation.py \
     --model_path $CHECKPOINT \
@@ -75,6 +75,7 @@ CUDA_VISIBLE_DEVICES=5,6 "${TORCHRUN}" --nproc_per_node=2 \
     --max_pixels ${max_pixels} \
     --kv_start_size ${kv_start_size} \
     --kv_recent_size ${kv_recent_size} \
+    --disable_visual_prune_eval_profile \
     --use_llm_adaptive_sparse_attention \
     --adaptive_sparse_min_seq_len ${adaptive_sparse_min_seq_len} \
     --adaptive_sparse_pvthreshd ${adaptive_sparse_pvthreshd} \

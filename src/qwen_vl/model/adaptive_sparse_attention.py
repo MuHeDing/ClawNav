@@ -420,3 +420,60 @@ def summarize_adaptive_sparsity(model: Any) -> Dict[str, Any]:
         "estimated_total_llm_flops_reduction_ratio": estimated_total_llm_reduction,
         "layers": per_layer,
     }
+
+
+ADAPTIVE_SPARSITY_SUMMARY_KEYS = (
+    "mean_sparsity",
+    "mean_prefill_sparsity",
+    "mean_decode_sparsity",
+    "dense_attention_flops",
+    "sparse_attention_flops",
+    "saved_attention_flops",
+    "flops_reduction_ratio",
+    "self_attention_flops_reduction_ratio",
+    "sparse_attention_latency_ms",
+    "sparse_attention_effective_tops",
+    "sparse_attention_actual_tops",
+    "full_attention_latency_ms",
+    "full_attention_effective_tops",
+    "estimated_total_llm_num_layers",
+    "instrumented_sparse_layers",
+)
+
+ADAPTIVE_SPARSITY_LAYER_KEYS = (
+    "layer",
+    "mean_sparsity",
+    "count",
+    "mean_prefill_sparsity",
+    "prefill_count",
+    "mean_decode_sparsity",
+    "decode_count",
+    "flops_reduction_ratio",
+    "self_attention_flops_reduction_ratio",
+)
+
+
+def compact_adaptive_sparsity_summary(
+    summary: Dict[str, Any],
+    *,
+    include_layers: bool = False,
+) -> Dict[str, Any]:
+    """Return a small, stable summary for persisted sparse-attention profiles."""
+
+    compact = {
+        key: summary.get(key)
+        for key in ADAPTIVE_SPARSITY_SUMMARY_KEYS
+        if key in summary
+    }
+    if include_layers:
+        compact["layers"] = [
+            {
+                key: layer_summary.get(key)
+                for key in ADAPTIVE_SPARSITY_LAYER_KEYS
+                if key in layer_summary
+            }
+            for layer_summary in summary.get("layers", [])
+        ]
+    else:
+        compact["layer_count"] = len(summary.get("layers", []))
+    return compact

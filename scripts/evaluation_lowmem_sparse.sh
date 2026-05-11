@@ -22,12 +22,12 @@ adaptive_sparse_scope=visual_middle
 adaptive_sparse_llm_kv_block_size=64
 adaptive_sparse_llm_start_blocks=7
 adaptive_sparse_llm_recent_blocks=14
-adaptive_sparse_llm_start_layer=4
+adaptive_sparse_llm_start_layer=14
 
 CHECKPOINT="/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra"
 echo "CHECKPOINT: ${CHECKPOINT}"
 #OUTPUT_PATH="results/400_janusvln_start${kv_start_size}_recent${kv_recent_size}_history${num_history}_savevideo"
-OUTPUT_PATH="results/janusvln_extra_st8_re24_h8_llm_adap_sparse_tb_${adaptive_sparse_target_blocks}_drop_${adaptive_sparse_target_drop_mass}_st_b_${adaptive_sparse_llm_start_blocks}_re_b_${adaptive_sparse_llm_recent_blocks}_ly${adaptive_sparse_llm_start_layer}"
+OUTPUT_PATH="results/400_janusvln_extra_st8_re24_h8_llm_adap_sparse_tb_${adaptive_sparse_target_blocks}_drop_${adaptive_sparse_target_drop_mass}_st_b_${adaptive_sparse_llm_start_blocks}_re_b_${adaptive_sparse_llm_recent_blocks}_ly${adaptive_sparse_llm_start_layer}"
 echo "OUTPUT_PATH: ${OUTPUT_PATH}"
 echo "SPARGEATTN: using vendored Fast_JanusVLN/src/spas_sage_attn"
 echo "VGGT KV cache: kv_start_size=${kv_start_size}, kv_recent_size=${kv_recent_size}"
@@ -66,7 +66,7 @@ echo "TORCHRUN: ${TORCHRUN}"
 
 # --- Level 1: 轻度优化 (推荐首先尝试) ---
 # 2个GPU，num_history=1，max_pixels=6272
-CUDA_VISIBLE_DEVICES=5,6 "${TORCHRUN}" --nproc_per_node=2 \
+CUDA_VISIBLE_DEVICES=0,1 "${TORCHRUN}" --nproc_per_node=2 \
     --master_port=$MASTER_PORT \
     src/evaluation.py \
     --model_path $CHECKPOINT \
@@ -75,6 +75,7 @@ CUDA_VISIBLE_DEVICES=5,6 "${TORCHRUN}" --nproc_per_node=2 \
     --max_pixels ${max_pixels} \
     --kv_start_size ${kv_start_size} \
     --kv_recent_size ${kv_recent_size} \
+    --disable_visual_prune_eval_profile \
     --use_llm_adaptive_sparse_attention \
     --adaptive_sparse_min_seq_len ${adaptive_sparse_min_seq_len} \
     --adaptive_sparse_pvthreshd ${adaptive_sparse_pvthreshd} \
