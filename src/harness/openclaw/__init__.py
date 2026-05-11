@@ -1,0 +1,1 @@
+"""OpenClaw-compatible harness interfaces."""
