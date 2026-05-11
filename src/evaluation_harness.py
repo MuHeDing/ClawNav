@@ -197,7 +197,14 @@ class HarnessModelProxy:
             action_text=action_text,
             fallback=bool(trace.get("fallback", False)),
             decision_inputs={},
+            runtime=self._latest_runtime(trace),
         )
+
+    def _latest_runtime(self, trace: Dict[str, Any]) -> Dict[str, Any]:
+        runtime_items = trace.get("skill_runtime") or []
+        if not runtime_items:
+            return {}
+        return dict(runtime_items[-1])
 
 
 def evaluate_harness(model: Any, args: argparse.Namespace) -> None:

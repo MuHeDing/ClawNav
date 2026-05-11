@@ -181,3 +181,19 @@ def test_risky_stop_triggers_recall_and_replan_without_oracle_metric():
     assert replanner.calls
     assert "distance_to_goal" not in memory.calls[0]
     assert "distance_to_goal" not in replanner.calls[0]
+
+
+def test_controller_trace_records_skill_runtime_metadata():
+    nav = nav_skill()
+    controller = HarnessController(
+        make_registry(nav),
+        HarnessConfig(harness_mode="act_only"),
+    )
+
+    controller.run_step(make_state(), {})
+
+    assert "skill_runtime" in controller.last_trace
+    assert controller.last_trace["skill_runtime"][0]["skill"] == "NavigationPolicySkill"
+    assert "latency_ms" in controller.last_trace["skill_runtime"][0]
+    assert controller.last_trace["skill_runtime"][0]["runtime_status"] == "completed"
+    assert controller.last_trace["skill_runtime"][0]["result_type"] == "action"

@@ -1,3 +1,4 @@
+import time
 from typing import Any, Dict, Optional
 
 from harness.config import HarnessConfig
@@ -29,6 +30,7 @@ class HarnessController:
         self.last_trace = {
             "mode": self.config.harness_mode,
             "calls": [],
+            "skill_runtime": [],
             "fallback": False,
             "fallback_reason": "",
         }
@@ -133,7 +135,7 @@ class HarnessController:
     ) -> SkillResult:
         self.last_trace["fallback"] = True
         self.last_trace["fallback_reason"] = reason
-        result = self.skill_registry.run(
+        result = self._run_skill_with_runtime(
             "NavigationPolicySkill",
             state,
             self._navigation_payload(payload),
@@ -157,8 +159,29 @@ class HarnessController:
         if len(self.last_trace["calls"]) >= self.config.max_internal_calls_per_step:
             raise BudgetExceeded
         safe_payload = self._sanitize_payload(payload) if decision_skill else dict(payload)
-        result = self.skill_registry.run(name, state, safe_payload)
+        result = self._run_skill_with_runtime(name, state, safe_payload)
         self.last_trace["calls"].append(name)
+        return result
+
+    def _run_skill_with_runtime(
+        self,
+        name: str,
+        state: VLNState,
+        payload: Dict[str, Any],
+    ) -> SkillResult:
+        start = time.perf_counter()
+        result = self.skill_registry.run(name, state, payload)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        self.last_trace.setdefault("skill_runtime", []).append(
+            {
+                "skill": name,
+                "tool_name": name,
+                "runtime_status": "completed" if result.ok else "failed",
+                "latency_ms": latency_ms,
+                "error_type": "" if result.ok else "skill_error",
+                "result_type": result.result_type,
+            }
+        )
         return result
 
     def _sanitize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
