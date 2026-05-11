@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from harness.memory.protocol import build_query_payload, normalize_memory_result
 from harness.types import MemoryHit
 
 
@@ -71,20 +72,59 @@ class SpatialMemoryHttpClient(BaseSpatialMemoryClient):
     def query_semantic(self, text: str, n_results: int = 5) -> List[MemoryHit]:
         return self._post_query(
             "/query/semantic/text",
-            {"text": text, "n_results": n_results},
+            build_query_payload(
+                query_type="semantic",
+                text=text,
+                n_results=n_results,
+                memory_source=self.memory_source,
+            ),
         )
 
     def query_object(self, name: str, n_results: int = 5) -> List[MemoryHit]:
-        return self._post_query("/query/object", {"text": name, "n_results": n_results})
+        return self._post_query(
+            "/query/object",
+            build_query_payload(
+                query_type="object",
+                text=name,
+                n_results=n_results,
+                memory_source=self.memory_source,
+            ),
+        )
 
     def query_place(self, name: str, n_results: int = 5) -> List[MemoryHit]:
-        return self._post_query("/query/place", {"text": name, "n_results": n_results})
+        return self._post_query(
+            "/query/place",
+            build_query_payload(
+                query_type="place",
+                text=name,
+                n_results=n_results,
+                memory_source=self.memory_source,
+            ),
+        )
 
     def query_position(self, pose: Dict[str, Any], n_results: int = 5) -> List[MemoryHit]:
-        return self._post_query("/query/position", {"pose": pose, "n_results": n_results})
+        return self._post_query(
+            "/query/position",
+            build_query_payload(
+                query_type="position",
+                pose=pose,
+                n_results=n_results,
+                memory_source=self.memory_source,
+            ),
+        )
 
     def query_unified(self, payload: Dict[str, Any]) -> List[MemoryHit]:
-        return self._post_query("/query/unified", payload)
+        query_type = str(payload.get("query_type") or "semantic")
+        return self._post_query(
+            "/query/unified",
+            build_query_payload(
+                query_type=query_type,
+                text=payload.get("text") or payload.get("query"),
+                pose=payload.get("pose"),
+                n_results=int(payload.get("n_results", 5)),
+                memory_source=str(payload.get("memory_source") or self.memory_source),
+            ),
+        )
 
     def ingest_semantic(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         response = requests.post(
@@ -106,23 +146,17 @@ class SpatialMemoryHttpClient(BaseSpatialMemoryClient):
         return [self._memory_hit_from_result(item) for item in data.get("results", [])]
 
     def _memory_hit_from_result(self, item: Dict[str, Any]) -> MemoryHit:
-        evidence = item.get("evidence") or {}
-        source = self.memory_source or item.get("source") or "episode-local"
+        result = normalize_memory_result(item, memory_source=self.memory_source)
         return MemoryHit(
-            memory_id=str(item.get("id") or item.get("memory_id") or ""),
-            memory_type=str(item.get("memory_type") or "semantic"),
-            name=str(item.get("name") or item.get("text") or ""),
-            confidence=float(item.get("confidence", 0.0)),
-            target_pose=item.get("target_pose"),
-            evidence_text=str(
-                item.get("evidence_text")
-                or evidence.get("note")
-                or evidence.get("text")
-                or ""
-            ),
-            image_path=item.get("image_path") or evidence.get("image_path"),
-            note=str(item.get("note") or evidence.get("note") or ""),
-            timestamp=item.get("timestamp"),
-            memory_source=source,
-            metadata={key: value for key, value in item.items() if key not in {"evidence"}},
+            memory_id=result["memory_id"],
+            memory_type=result["memory_type"],
+            name=result["name"],
+            confidence=result["confidence"],
+            target_pose=result["target_pose"],
+            evidence_text=result["evidence_text"],
+            image_path=result["image_path"],
+            note=result["note"],
+            timestamp=result["timestamp"],
+            memory_source=result["memory_source"],
+            metadata=result["metadata"],
         )
