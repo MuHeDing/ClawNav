@@ -116,6 +116,7 @@ Phase 2: OpenClaw-compatible Harness Interface
   HabitatAdapter -> Robot embodiment adapter
   Harness trace -> OpenClaw runtime logs
   目标是即使暂不部署 OpenClaw，也保证接口形态能对齐 OpenClaw。
+  Implementation plan: docs/plans/2026-05-11-clawnav-phase2-openclaw-compatible-interface.md
 
 Phase 3: OpenClaw + VLN Runtime
   OpenClaw Planner
