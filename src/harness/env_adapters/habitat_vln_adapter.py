@@ -1,7 +1,15 @@
 from typing import Any, Dict, Optional
 
+from harness.env_adapters.base import BaseEmbodimentAdapter
 from harness.types import VLNState
 
+
+ACTIONS2IDX = {
+    "STOP": 0,
+    "MOVE_FORWARD": 1,
+    "TURN_LEFT": 2,
+    "TURN_RIGHT": 3,
+}
 
 ORACLE_METRIC_KEYS = {
     "distance_to_goal",
@@ -16,7 +24,7 @@ ORACLE_METRIC_KEYS = {
 }
 
 
-class HabitatVLNAdapter:
+class HabitatVLNAdapter(BaseEmbodimentAdapter):
     def __init__(self, expose_pose_online: bool = False) -> None:
         self.expose_pose_online = expose_pose_online
 
@@ -49,6 +57,18 @@ class HabitatVLNAdapter:
             diagnostic_pose=pose if not self.expose_pose_online else None,
             last_action=last_action,
         )
+
+    def action_space(self):
+        return list(ACTIONS2IDX.keys())
+
+    def action_to_executor_command(self, action_text: str) -> Dict[str, Any]:
+        if action_text not in ACTIONS2IDX:
+            raise ValueError(f"Unsupported Habitat action: {action_text}")
+        return {
+            "executor": "habitat_discrete",
+            "action_text": action_text,
+            "action_index": ACTIONS2IDX[action_text],
+        }
 
     def _extract_rgb(self, observations: Dict[str, Any]) -> Any:
         return observations.get("rgb")
