@@ -58,3 +58,31 @@ def test_tool_adapter_returns_structured_error_for_missing_tool():
 
     assert result["ok"] is False
     assert "not registered" in result["error"]
+
+
+def test_tool_adapter_rejects_oracle_decision_inputs():
+    registry = SkillRegistry()
+    registry.register(EchoSkill())
+    adapter = OpenClawToolAdapter(registry)
+
+    result = adapter.call_tool(
+        "EchoSkill",
+        {"text": "hello", "distance_to_goal": 1.0},
+        state=make_state(),
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "oracle_input_rejected"
+
+
+def test_tool_adapter_adds_call_metadata():
+    registry = SkillRegistry()
+    registry.register(EchoSkill())
+    adapter = OpenClawToolAdapter(registry)
+
+    result = adapter.call_tool("EchoSkill", {"text": "hello"}, state=make_state())
+
+    assert result["tool_name"] == "EchoSkill"
+    assert result["runtime_status"] == "completed"
+    assert isinstance(result["latency_ms"], float)
+    assert result["tool_schema_version"] == "phase2.skill_manifest.v1"
