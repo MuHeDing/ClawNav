@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from harness.memory.protocol import (
     SPATIAL_MEMORY_PROTOCOL_VERSION,
     build_query_payload,
@@ -49,3 +51,22 @@ def test_normalize_memory_result_rejects_oracle_metadata():
     )
 
     assert "distance_to_goal" not in result["metadata"]
+
+
+def test_spatial_memory_protocol_doc_exists_and_lists_endpoints():
+    doc = Path("docs/protocols/spatial-memory-protocol.md")
+    text = doc.read_text(encoding="utf-8")
+
+    for endpoint in [
+        "GET /health",
+        "POST /query/object",
+        "POST /query/place",
+        "POST /query/position",
+        "POST /query/semantic/text",
+        "POST /query/unified",
+        "POST /memory/semantic/ingest",
+    ]:
+        assert endpoint in text
+
+    assert "memory_source" in text
+    assert "No Oracle Fields" in text
