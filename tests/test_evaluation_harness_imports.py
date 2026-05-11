@@ -50,3 +50,7 @@ def test_harness_parser_does_not_require_sparse_or_slow_fast_flags():
 def test_module_exposes_component_builder_without_loading_model():
     module = importlib.import_module("evaluation_harness")
     assert hasattr(module, "build_harness_components")
+
+
+def test_openclaw_adapter_import_has_no_runtime_dependency():
+    import harness.openclaw.tool_adapter  # noqa: F401
