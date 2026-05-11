@@ -1,6 +1,6 @@
 from typing import Any, Dict, List
 
-from harness.skills.base import Skill
+from harness.skills.base import Skill, SkillManifest
 from harness.types import SkillResult
 
 
@@ -19,6 +19,12 @@ class SkillRegistry:
 
     def names(self) -> List[str]:
         return sorted(self._skills.keys())
+
+    def list_manifests(self) -> List[SkillManifest]:
+        return [self._skills[name].manifest() for name in self.names()]
+
+    def export_tool_schemas(self) -> List[Dict[str, Any]]:
+        return [manifest.to_dict() for manifest in self.list_manifests()]
 
     def run(self, name: str, state: Any, payload: Dict[str, Any]) -> SkillResult:
         skill = self._skills.get(name)

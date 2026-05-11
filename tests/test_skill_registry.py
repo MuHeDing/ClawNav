@@ -17,6 +17,18 @@ class ExplodingSkill(Skill):
         raise RuntimeError("boom")
 
 
+class NamedEchoSkill(Skill):
+    description = "Echoes payload."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self, name):
+        self.name = name
+
+    def run(self, state, payload):
+        return SkillResult.ok_result("echo", {"payload": payload})
+
+
 def test_register_skill_by_name():
     registry = SkillRegistry()
     registry.register(EchoSkill())
@@ -58,3 +70,24 @@ def test_registered_skill_runs_successfully():
     result = registry.run("EchoSkill", state=None, payload={"x": 1})
     assert result.ok is True
     assert result.payload["payload"] == {"x": 1}
+
+
+def test_registry_lists_skill_manifests():
+    registry = SkillRegistry()
+    registry.register(EchoSkill())
+
+    manifests = registry.list_manifests()
+
+    assert len(manifests) == 1
+    assert manifests[0].name == "EchoSkill"
+
+
+def test_registry_exports_manifest_dicts_sorted_by_name():
+    registry = SkillRegistry()
+    registry.register(NamedEchoSkill(name="ZSkill"))
+    registry.register(NamedEchoSkill(name="ASkill"))
+
+    data = registry.export_tool_schemas()
+
+    assert [item["name"] for item in data] == ["ASkill", "ZSkill"]
+    assert data[0]["schema_version"] == "phase2.skill_manifest.v1"
