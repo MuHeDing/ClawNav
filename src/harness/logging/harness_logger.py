@@ -41,6 +41,7 @@ class HarnessLogger:
         fallback: bool = False,
         diagnostics: Optional[Dict[str, Any]] = None,
         decision_inputs: Optional[Dict[str, Any]] = None,
+        runtime: Optional[Dict[str, Any]] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         decision_inputs = decision_inputs or {}
@@ -65,6 +66,20 @@ class HarnessLogger:
             "oracle_metrics_used_for_decision": oracle_metrics_used,
             "oracle_guard_passed": not oracle_metrics_used,
         }
+        runtime_fields: Dict[str, Any] = {
+            "trace_schema_version": "phase2.harness_trace.v2",
+            "skill_call_id": "",
+            "parent_call_id": "",
+            "tool_schema_version": "",
+            "latency_ms": None,
+            "input_summary": {},
+            "output_summary": {},
+            "error_type": "",
+            "runtime_status": "fallback" if fallback else "completed",
+        }
+        if runtime:
+            runtime_fields.update(runtime)
+        record.update(runtime_fields)
         if extra:
             record.update(extra)
 

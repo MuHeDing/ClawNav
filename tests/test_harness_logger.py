@@ -59,3 +59,35 @@ def test_record_contains_memory_source_and_decision_inputs(tmp_path):
     assert record["memory_backend"] == "fake"
     assert record["num_memory_hits"] == 2
     assert record["decision_inputs"]["used_memory_consistency"] is True
+
+
+def test_logger_writes_runtime_trace_metadata(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+    state = VLNState(
+        scene_id="s1",
+        episode_id="e1",
+        instruction="go to kitchen",
+        step_id=1,
+        current_image=None,
+    )
+
+    record = logger.log_step(
+        state,
+        intent="recall_memory",
+        skill="MemoryQuerySkill",
+        reason="initial_recall",
+        runtime={
+            "skill_call_id": "call-1",
+            "parent_call_id": "root",
+            "tool_schema_version": "phase2.skill_manifest.v1",
+            "latency_ms": 2.5,
+            "runtime_status": "completed",
+        },
+    )
+
+    assert record["trace_schema_version"] == "phase2.harness_trace.v2"
+    assert record["skill_call_id"] == "call-1"
+    assert record["parent_call_id"] == "root"
+    assert record["tool_schema_version"] == "phase2.skill_manifest.v1"
+    assert record["latency_ms"] == 2.5
+    assert record["runtime_status"] == "completed"
