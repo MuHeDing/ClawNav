@@ -54,3 +54,32 @@ def test_module_exposes_component_builder_without_loading_model():
 
 def test_openclaw_adapter_import_has_no_runtime_dependency():
     import harness.openclaw.tool_adapter  # noqa: F401
+
+
+def test_parser_includes_openclaw_runtime_args():
+    module = importlib.import_module("evaluation_harness")
+    args = module.build_parser().parse_args(
+        [
+            "--model_path",
+            "model",
+            "--output_path",
+            "out",
+            "--harness_runtime",
+            "openclaw_bridge",
+            "--openclaw_workspace_path",
+            "/tmp/openclaw",
+            "--openclaw_service_host",
+            "127.0.0.1",
+            "--openclaw_planner_backend",
+            "rule",
+        ]
+    )
+
+    assert args.harness_runtime == "openclaw_bridge"
+    assert args.openclaw_workspace_path == "/tmp/openclaw"
+    assert args.openclaw_service_host == "127.0.0.1"
+    assert args.openclaw_planner_backend == "rule"
+
+
+def test_openclaw_runtime_import_has_no_external_dependency():
+    import harness.openclaw.runtime  # noqa: F401

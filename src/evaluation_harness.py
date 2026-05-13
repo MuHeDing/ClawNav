@@ -65,11 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--harness_debug_max_episodes", type=int, default=None)
     parser.add_argument("--harness_trace_rank", type=int, default=0)
     parser.add_argument("--expose_sim_pose_online", action="store_true", default=False)
+    parser.add_argument("--harness_runtime", type=str, default="phase2")
+    parser.add_argument("--openclaw_workspace_path", type=str, default="")
+    parser.add_argument("--openclaw_service_registry_path", type=str, default="")
+    parser.add_argument("--openclaw_service_host", type=str, default="127.0.0.1")
+    parser.add_argument("--openclaw_planner_backend", type=str, default="rule")
+    parser.add_argument("--openclaw_gateway_url", type=str, default="")
     return parser
 
 
 def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
-    return HarnessConfig(
+    config = HarnessConfig(
         harness_mode=args.harness_mode,
         memory_backend=args.harness_memory_backend,
         spatial_memory_url=args.spatial_memory_url,
@@ -77,7 +83,24 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         recall_interval_steps=args.harness_recall_interval_steps,
         memory_source=args.harness_memory_source,
         expose_sim_pose_online=args.expose_sim_pose_online,
+        harness_runtime=args.harness_runtime,
+        openclaw_workspace_path=args.openclaw_workspace_path,
+        openclaw_service_registry_path=args.openclaw_service_registry_path,
+        openclaw_service_host=args.openclaw_service_host,
+        openclaw_planner_backend=args.openclaw_planner_backend,
+        openclaw_gateway_url=args.openclaw_gateway_url,
     )
+    if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
+        from harness.openclaw.service_registry import OpenClawServiceRegistry
+
+        registry = OpenClawServiceRegistry.from_file(
+            Path(config.openclaw_service_registry_path),
+            service_host=config.openclaw_service_host,
+        )
+        spatial_url = registry.spatial_memory_url()
+        if spatial_url:
+            config.spatial_memory_url = spatial_url
+    return config
 
 
 def build_memory_client(config: HarnessConfig):
@@ -116,6 +139,29 @@ def build_harness_components(
 
     controller = HarnessController(registry, config)
     adapter = HabitatVLNAdapter(expose_pose_online=config.expose_sim_pose_online)
+    openclaw_runtime = None
+    if config.harness_runtime == "openclaw_bridge":
+        from harness.openclaw.executor import HabitatOpenClawExecutor
+        from harness.openclaw.planner import RuleOpenClawPlanner
+        from harness.openclaw.runtime import OpenClawVLNRuntime
+
+        if config.openclaw_planner_backend == "gateway":
+            if not config.openclaw_gateway_url:
+                raise ValueError(
+                    "openclaw_gateway_url is required for gateway planner backend"
+                )
+            from harness.openclaw.gateway import OpenClawGatewayClient
+
+            planner = OpenClawGatewayClient(base_url=config.openclaw_gateway_url)
+        else:
+            planner = RuleOpenClawPlanner(
+                recall_interval_steps=config.recall_interval_steps,
+            )
+        openclaw_runtime = OpenClawVLNRuntime(
+            tool_registry=registry,
+            planner=planner,
+            executor=HabitatOpenClawExecutor(adapter),
+        )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",
         rank=args.harness_trace_rank,
@@ -130,6 +176,7 @@ def build_harness_components(
         "skill_registry": registry,
         "controller": controller,
         "adapter": adapter,
+        "openclaw_runtime": openclaw_runtime,
         "logger": logger,
     }
 
@@ -147,6 +194,21 @@ class HarnessModelProxy:
     def call_model(self, images, task, step_id):
         current_image = images[-1] if images else None
         state = self._build_proxy_state(task, step_id, current_image)
+        runtime = self.components.get("openclaw_runtime")
+        if runtime is not None:
+            runtime_result = runtime.step(
+                state,
+                {
+                    "recent_frames": list(images[:-1]),
+                    "policy_action": self.last_action_text,
+                },
+            )
+            action_text = runtime_result.action_text if runtime_result.ok else "STOP"
+            self.last_action_text = action_text
+            self._append_working_memory(images, action_text)
+            self._log_runtime_step(state, runtime_result, action_text)
+            return [action_text]
+
         result = self.components["controller"].run_step(
             state,
             {
@@ -198,6 +260,28 @@ class HarnessModelProxy:
             fallback=bool(trace.get("fallback", False)),
             decision_inputs={},
             runtime=self._latest_runtime(trace),
+        )
+
+    def _log_runtime_step(self, state, runtime_result, action_text: str) -> None:
+        metadata = dict(runtime_result.runtime_metadata)
+        executor_command = runtime_result.executor_command or {}
+        if "runtime_executor" in executor_command:
+            metadata["runtime_executor"] = executor_command["runtime_executor"]
+        metadata["runtime_status"] = "completed" if runtime_result.ok else "failed"
+        if runtime_result.error:
+            metadata["error_type"] = "openclaw_runtime_error"
+
+        self.components["logger"].log_step(
+            state,
+            intent=metadata.get("planned_intent", "act"),
+            skill=metadata.get("planned_tool", ""),
+            reason=metadata.get("planner_reason", runtime_result.error),
+            memory_backend=self.components["config"].memory_backend,
+            memory_source=self.components["config"].memory_source,
+            action_text=action_text,
+            fallback=not runtime_result.ok,
+            decision_inputs={},
+            runtime=metadata,
         )
 
     def _latest_runtime(self, trace: Dict[str, Any]) -> Dict[str, Any]:

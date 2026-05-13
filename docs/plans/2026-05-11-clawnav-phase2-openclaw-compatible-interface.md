@@ -1509,6 +1509,5 @@ Do not commit generated `results/` outputs unless the repository already tracks 
 ## Notes for Execution
 
 - Work from `ClawNav`, not the outer `Navigation_Claw` repository.
-- Prefer one commit per task.
 - If a task exposes a mismatch between this plan and current Phase 1 code, update the test to protect the intended contract before changing implementation.
 - Keep Phase 2 additive. Any change that breaks Phase 1 behavior should be treated as a regression unless explicitly justified in the task notes.
