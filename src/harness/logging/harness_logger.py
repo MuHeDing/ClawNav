@@ -76,6 +76,13 @@ class HarnessLogger:
             "output_summary": {},
             "error_type": "",
             "runtime_status": "fallback" if fallback else "completed",
+            "runtime_mode": "",
+            "planner_backend": "",
+            "planned_intent": "",
+            "planned_tool": "",
+            "planner_reason": "",
+            "runtime_executor": "",
+            "tool_calls": [],
         }
         if runtime:
             runtime_fields.update(runtime)

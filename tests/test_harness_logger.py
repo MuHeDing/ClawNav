@@ -91,3 +91,51 @@ def test_logger_writes_runtime_trace_metadata(tmp_path):
     assert record["tool_schema_version"] == "phase2.skill_manifest.v1"
     assert record["latency_ms"] == 2.5
     assert record["runtime_status"] == "completed"
+
+
+def test_logger_writes_openclaw_runtime_metadata(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+    state = VLNState(
+        scene_id="s1",
+        episode_id="e1",
+        instruction="go to kitchen",
+        step_id=1,
+        current_image=None,
+    )
+
+    record = logger.log_step(
+        state,
+        intent="act",
+        skill="NavigationPolicySkill",
+        runtime={
+            "runtime_mode": "openclaw_bridge",
+            "planner_backend": "rule",
+            "planned_intent": "act",
+            "planned_tool": "NavigationPolicySkill",
+            "runtime_executor": "openclaw_habitat",
+        },
+    )
+
+    assert record["trace_schema_version"] == "phase2.harness_trace.v2"
+    assert record["runtime_mode"] == "openclaw_bridge"
+    assert record["planner_backend"] == "rule"
+    assert record["planned_tool"] == "NavigationPolicySkill"
+    assert record["runtime_executor"] == "openclaw_habitat"
+
+
+def test_logger_writes_openclaw_runtime_defaults(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+
+    record = logger.log_step(
+        make_state(),
+        intent="act",
+        skill="NavigationPolicySkill",
+    )
+
+    assert record["runtime_mode"] == ""
+    assert record["planner_backend"] == ""
+    assert record["planned_intent"] == ""
+    assert record["planned_tool"] == ""
+    assert record["planner_reason"] == ""
+    assert record["runtime_executor"] == ""
+    assert record["tool_calls"] == []
