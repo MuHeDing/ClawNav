@@ -12,6 +12,8 @@ class HarnessConfig:
     openclaw_service_host: str = "127.0.0.1"
     openclaw_planner_backend: str = "rule"
     openclaw_gateway_url: str = ""
+    openclaw_executor_backend: str = "habitat"
+    openclaw_robot_executor_url: str = ""
     max_internal_calls_per_step: int = 3
     recall_interval_steps: int = 5
     max_replans_per_episode: int = 3

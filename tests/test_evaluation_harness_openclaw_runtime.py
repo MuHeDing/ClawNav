@@ -36,6 +36,8 @@ def make_args(tmp_path, **overrides):
         "openclaw_service_host": "127.0.0.1",
         "openclaw_planner_backend": "rule",
         "openclaw_gateway_url": "",
+        "openclaw_executor_backend": "habitat",
+        "openclaw_robot_executor_url": "",
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -110,5 +112,22 @@ def test_gateway_backend_requires_gateway_url(tmp_path):
         )
     except ValueError as exc:
         assert "openclaw_gateway_url" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_robot_executor_requires_url_when_selected(tmp_path):
+    try:
+        build_harness_components(
+            make_args(
+                tmp_path,
+                harness_runtime="openclaw_bridge",
+                openclaw_executor_backend="robot_http",
+                openclaw_robot_executor_url="",
+            ),
+            model=FakeBaseModel(),
+        )
+    except ValueError as exc:
+        assert "openclaw_robot_executor_url" in str(exc)
     else:
         raise AssertionError("expected ValueError")

@@ -71,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openclaw_service_host", type=str, default="127.0.0.1")
     parser.add_argument("--openclaw_planner_backend", type=str, default="rule")
     parser.add_argument("--openclaw_gateway_url", type=str, default="")
+    parser.add_argument("--openclaw_executor_backend", type=str, default="habitat")
+    parser.add_argument("--openclaw_robot_executor_url", type=str, default="")
     return parser
 
 
@@ -89,6 +91,8 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         openclaw_service_host=args.openclaw_service_host,
         openclaw_planner_backend=args.openclaw_planner_backend,
         openclaw_gateway_url=args.openclaw_gateway_url,
+        openclaw_executor_backend=args.openclaw_executor_backend,
+        openclaw_robot_executor_url=args.openclaw_robot_executor_url,
     )
     if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
         from harness.openclaw.service_registry import OpenClawServiceRegistry
@@ -157,10 +161,20 @@ def build_harness_components(
             planner = RuleOpenClawPlanner(
                 recall_interval_steps=config.recall_interval_steps,
             )
+        if config.openclaw_executor_backend == "robot_http":
+            if not config.openclaw_robot_executor_url:
+                raise ValueError(
+                    "openclaw_robot_executor_url is required for robot_http executor"
+                )
+            from harness.openclaw.robot_executor import RobotHttpExecutor
+
+            executor = RobotHttpExecutor(config.openclaw_robot_executor_url)
+        else:
+            executor = HabitatOpenClawExecutor(adapter)
         openclaw_runtime = OpenClawVLNRuntime(
             tool_registry=registry,
             planner=planner,
-            executor=HabitatOpenClawExecutor(adapter),
+            executor=executor,
         )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",
