@@ -23,6 +23,7 @@ def make_args(tmp_path, **overrides):
         "harness_mode": "memory_recall",
         "harness_memory_backend": "fake",
         "spatial_memory_url": "http://127.0.0.1:8022",
+        "memory_manifest_path": "",
         "harness_memory_source": "episode-local",
         "harness_max_internal_calls": 3,
         "harness_recall_interval_steps": 5,

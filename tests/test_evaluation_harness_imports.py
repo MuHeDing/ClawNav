@@ -31,12 +31,15 @@ def test_parser_helper_includes_harness_args():
             "full",
             "--harness_memory_backend",
             "fake",
+            "--memory_manifest_path",
+            "",
             "--harness_debug_max_episodes",
             "1",
         ]
     )
     assert args.harness_mode == "full"
     assert args.harness_memory_backend == "fake"
+    assert args.memory_manifest_path == ""
     assert args.harness_debug_max_episodes == 1
 
 

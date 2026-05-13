@@ -59,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--harness_mode", type=str, default="memory_recall")
     parser.add_argument("--harness_memory_backend", type=str, default="fake")
     parser.add_argument("--spatial_memory_url", type=str, default="http://127.0.0.1:8022")
+    parser.add_argument("--memory_manifest_path", type=str, default="")
     parser.add_argument("--harness_memory_source", type=str, default="episode-local")
     parser.add_argument("--harness_max_internal_calls", type=int, default=3)
     parser.add_argument("--harness_recall_interval_steps", type=int, default=5)
@@ -81,6 +82,7 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         harness_mode=args.harness_mode,
         memory_backend=args.harness_memory_backend,
         spatial_memory_url=args.spatial_memory_url,
+        memory_manifest_path=args.memory_manifest_path,
         max_internal_calls_per_step=args.harness_max_internal_calls,
         recall_interval_steps=args.harness_recall_interval_steps,
         memory_source=args.harness_memory_source,
@@ -104,6 +106,10 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         spatial_url = registry.spatial_memory_url()
         if spatial_url:
             config.spatial_memory_url = spatial_url
+    if config.memory_manifest_path:
+        from harness.memory.manifest import load_memory_manifest
+
+        load_memory_manifest(Path(config.memory_manifest_path))
     return config
 
 

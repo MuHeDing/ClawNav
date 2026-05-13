@@ -7,6 +7,7 @@ class HarnessConfig:
     harness_runtime: str = "phase2"
     memory_backend: str = "fake"
     spatial_memory_url: str = "http://127.0.0.1:8022"
+    memory_manifest_path: str = ""
     openclaw_workspace_path: str = ""
     openclaw_service_registry_path: str = ""
     openclaw_service_host: str = "127.0.0.1"
