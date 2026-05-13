@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
+from harness.openclaw.subagents import SubagentRequest
 from harness.types import VLNState
 
 
@@ -49,4 +50,29 @@ class RuleOpenClawPlanner:
             tool_name="NavigationPolicySkill",
             arguments={},
             reason="default_act",
+        )
+
+
+class SubagentOpenClawPlanner:
+    def __init__(self, client) -> None:
+        self.client = client
+
+    def plan(
+        self,
+        state: VLNState,
+        runtime_context: Dict[str, Any],
+    ) -> OpenClawPlanDecision:
+        response = self.client.call(
+            SubagentRequest(
+                role="planner",
+                instruction=state.instruction,
+                context=runtime_context,
+            )
+        )
+        return OpenClawPlanDecision(
+            intent=str(response.get("intent", "act")),
+            tool_name=str(response.get("tool_name", "NavigationPolicySkill")),
+            arguments=dict(response.get("arguments", {})),
+            reason=str(response.get("reason", "subagent")),
+            planner_backend="subagent",
         )

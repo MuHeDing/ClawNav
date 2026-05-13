@@ -39,6 +39,10 @@ def make_args(tmp_path, **overrides):
         "openclaw_gateway_url": "",
         "openclaw_executor_backend": "habitat",
         "openclaw_robot_executor_url": "",
+        "openclaw_subagent_backend": "fake",
+        "openclaw_enable_subagent_planner": False,
+        "openclaw_enable_subagent_critic": False,
+        "openclaw_enable_subagent_memory_curator": False,
     }
     data.update(overrides)
     return SimpleNamespace(**data)

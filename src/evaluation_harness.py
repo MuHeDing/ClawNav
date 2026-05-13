@@ -74,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openclaw_gateway_url", type=str, default="")
     parser.add_argument("--openclaw_executor_backend", type=str, default="habitat")
     parser.add_argument("--openclaw_robot_executor_url", type=str, default="")
+    parser.add_argument("--openclaw_subagent_backend", type=str, default="fake")
+    parser.add_argument("--openclaw_enable_subagent_planner", action="store_true", default=False)
+    parser.add_argument("--openclaw_enable_subagent_critic", action="store_true", default=False)
+    parser.add_argument(
+        "--openclaw_enable_subagent_memory_curator",
+        action="store_true",
+        default=False,
+    )
     return parser
 
 
@@ -95,6 +103,10 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         openclaw_gateway_url=args.openclaw_gateway_url,
         openclaw_executor_backend=args.openclaw_executor_backend,
         openclaw_robot_executor_url=args.openclaw_robot_executor_url,
+        openclaw_subagent_backend=args.openclaw_subagent_backend,
+        openclaw_enable_subagent_planner=args.openclaw_enable_subagent_planner,
+        openclaw_enable_subagent_critic=args.openclaw_enable_subagent_critic,
+        openclaw_enable_subagent_memory_curator=args.openclaw_enable_subagent_memory_curator,
     )
     if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
         from harness.openclaw.service_registry import OpenClawServiceRegistry
@@ -155,7 +167,21 @@ def build_harness_components(
         from harness.openclaw.planner import RuleOpenClawPlanner
         from harness.openclaw.runtime import OpenClawVLNRuntime
 
-        if config.openclaw_planner_backend == "gateway":
+        if config.openclaw_enable_subagent_planner:
+            from harness.openclaw.planner import SubagentOpenClawPlanner
+            from harness.openclaw.subagents import FakeSubagentClient
+
+            planner = SubagentOpenClawPlanner(
+                FakeSubagentClient(
+                    {
+                        "intent": "act",
+                        "tool_name": "NavigationPolicySkill",
+                        "arguments": {},
+                        "reason": "fake_subagent",
+                    }
+                )
+            )
+        elif config.openclaw_planner_backend == "gateway":
             if not config.openclaw_gateway_url:
                 raise ValueError(
                     "openclaw_gateway_url is required for gateway planner backend"

@@ -15,6 +15,10 @@ class HarnessConfig:
     openclaw_gateway_url: str = ""
     openclaw_executor_backend: str = "habitat"
     openclaw_robot_executor_url: str = ""
+    openclaw_subagent_backend: str = "fake"
+    openclaw_enable_subagent_planner: bool = False
+    openclaw_enable_subagent_critic: bool = False
+    openclaw_enable_subagent_memory_curator: bool = False
     max_internal_calls_per_step: int = 3
     recall_interval_steps: int = 5
     max_replans_per_episode: int = 3
