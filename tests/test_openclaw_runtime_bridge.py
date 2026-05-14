@@ -222,3 +222,30 @@ def test_runtime_executes_critic_and_replan_intents_before_action():
         assert result.ok is True
         assert result.runtime_metadata["tool_calls"][0]["tool_name"] == tool
         assert result.runtime_metadata["tool_calls"][-1]["tool_name"] == "NavigationPolicySkill"
+
+
+def test_runtime_enriches_write_memory_with_keyframe_candidate():
+    decision = OpenClawPlanDecision(
+        intent="write_memory",
+        tool_name="MemoryWriteSkill",
+        arguments={"note": "landmark"},
+        reason="curator",
+        planner_backend="gateway",
+    )
+    runtime = make_full_runtime(decision)
+
+    result = runtime.step(
+        make_state(step_id=7),
+        payload={
+            "keyframe_candidate": {
+                "step_id": 7,
+                "image_path": "/tmp/keyframe.png",
+                "reason": "interval",
+            }
+        },
+    )
+
+    first_call = result.runtime_metadata["tool_calls"][0]
+    assert first_call["tool_name"] == "MemoryWriteSkill"
+    assert "image_path" in first_call["payload_summary"]["keys"]
+    assert "write_type" in first_call["payload_summary"]["keys"]

@@ -76,9 +76,14 @@ class OpenClawVLNRuntime:
         tool_calls: List[Dict[str, Any]] = []
 
         if decision.intent in PRE_ACTION_INTENTS:
+            arguments = dict(decision.arguments)
+            if decision.intent == "write_memory":
+                candidate = payload.get("keyframe_candidate") or {}
+                arguments = {**candidate, **arguments}
+                arguments.setdefault("write_type", "episodic_keyframe")
             tool_result = self.tool_adapter.call_tool(
                 decision.tool_name,
-                decision.arguments,
+                arguments,
                 state=state,
             )
             tool_calls.append(tool_result)
