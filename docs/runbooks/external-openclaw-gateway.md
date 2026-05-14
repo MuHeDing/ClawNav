@@ -22,7 +22,7 @@ Run:
 
 ```bash
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:8011 \
-HARNESS_DEBUG_MAX_EPISODES=1 \
+HARNESS_DEBUG_MAX_EPISODES=5 \
 ./scripts/evaluation_openclaw_gateway.sh
 ```
 
