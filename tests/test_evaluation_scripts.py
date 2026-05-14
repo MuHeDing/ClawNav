@@ -33,5 +33,23 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
     contents = script.read_text(encoding="utf-8")
 
-    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-5}" in contents
+    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-20}" in contents
     assert "--harness_debug_max_episodes" in contents
+
+
+def test_openclaw_gateway_script_allows_runtime_fallback_after_preflight_failure():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}" in contents
+    assert "continuing so runtime fallback can handle planner errors" in contents
+
+
+def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "start_openclaw_cli_plan_gateway.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "harness.openclaw.openclaw_cli_plan_gateway" in contents
+    assert "OPENCLAW_GATEWAY_WS_URL" in contents

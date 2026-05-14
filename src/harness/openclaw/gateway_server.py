@@ -48,7 +48,13 @@ def make_gateway_handler(planner: LocalOpenClawGatewayPlanner):
             if self.path != "/health":
                 self._send_json({"error": "not found"}, status=404)
                 return
-            self._send_json({"ok": True, "service": "clawnav_openclaw_gateway"})
+            try:
+                if hasattr(planner, "health_payload"):
+                    self._send_json(planner.health_payload())
+                else:
+                    self._send_json({"ok": True, "service": "clawnav_openclaw_gateway"})
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=503)
 
         def do_POST(self) -> None:
             if self.path != "/plan":

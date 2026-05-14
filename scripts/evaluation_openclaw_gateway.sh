@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra}
-OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway}
+OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway3}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4}
 MASTER_PORT=${MASTER_PORT:-20401}
 TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
@@ -23,8 +23,9 @@ OPENCLAW_ROBOT_EXECUTOR_URL=${OPENCLAW_ROBOT_EXECUTOR_URL:-}
 
 EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
 DATA_PATH=${DATA_PATH:-}
-HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-5}
+HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-20}
 CHECK_GATEWAY=${CHECK_GATEWAY:-1}
+REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}
 
 extra_args=()
 if [[ -n "${DATA_PATH}" ]]; then
@@ -55,9 +56,15 @@ echo "Output path: ${OUTPUT_PATH}"
 export NO_PROXY no_proxy TOKENIZERS_PARALLELISM
 
 if [[ "${CHECK_GATEWAY}" == "1" ]]; then
-  PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
+  if ! PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
     scripts/check_openclaw_plan_gateway.py \
-    --gateway_url "${OPENCLAW_GATEWAY_URL}"
+    --gateway_url "${OPENCLAW_GATEWAY_URL}"; then
+    if [[ "${REQUIRE_GATEWAY}" == "1" ]]; then
+      echo "OpenClaw gateway preflight failed and REQUIRE_GATEWAY=1" >&2
+      exit 2
+    fi
+    echo "OpenClaw gateway preflight failed; continuing so runtime fallback can handle planner errors." >&2
+  fi
 fi
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
