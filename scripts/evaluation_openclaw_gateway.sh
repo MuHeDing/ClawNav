@@ -8,6 +8,7 @@ MASTER_PORT=${MASTER_PORT:-20401}
 TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 
 OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://127.0.0.1:8011}
+OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-90}
 OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY:-/ssd/dingmuhe/Embodied-task/Navigation_Claw/ABot-Claw_Muhe/openclaw_layer/SERVICE.md}
 OPENCLAW_SERVICE_HOST=${OPENCLAW_SERVICE_HOST:-127.0.0.1}
 NO_PROXY=${NO_PROXY:-127.0.0.1,localhost,::1}
@@ -58,7 +59,8 @@ export NO_PROXY no_proxy TOKENIZERS_PARALLELISM
 if [[ "${CHECK_GATEWAY}" == "1" ]]; then
   if ! PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
     scripts/check_openclaw_plan_gateway.py \
-    --gateway_url "${OPENCLAW_GATEWAY_URL}"; then
+    --gateway_url "${OPENCLAW_GATEWAY_URL}" \
+    --timeout "${OPENCLAW_GATEWAY_TIMEOUT}"; then
     if [[ "${REQUIRE_GATEWAY}" == "1" ]]; then
       echo "OpenClaw gateway preflight failed and REQUIRE_GATEWAY=1" >&2
       exit 2
@@ -85,6 +87,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
   --harness_memory_source "${HARNESS_MEMORY_SOURCE}" \
   --openclaw_planner_backend gateway \
   --openclaw_gateway_url "${OPENCLAW_GATEWAY_URL}" \
+  --openclaw_gateway_timeout "${OPENCLAW_GATEWAY_TIMEOUT}" \
   --openclaw_executor_backend "${OPENCLAW_EXECUTOR_BACKEND}" \
   --openclaw_service_registry_path "${OPENCLAW_SERVICE_REGISTRY}" \
   --openclaw_service_host "${OPENCLAW_SERVICE_HOST}" \

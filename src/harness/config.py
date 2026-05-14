@@ -13,6 +13,7 @@ class HarnessConfig:
     openclaw_service_host: str = "127.0.0.1"
     openclaw_planner_backend: str = "rule"
     openclaw_gateway_url: str = ""
+    openclaw_gateway_timeout_s: float = 5.0
     openclaw_executor_backend: str = "habitat"
     openclaw_robot_executor_url: str = ""
     openclaw_subagent_backend: str = "fake"

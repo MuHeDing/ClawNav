@@ -15,9 +15,32 @@ openclaw gateway restart
 HOST=127.0.0.1 PORT=8011 ./scripts/start_openclaw_cli_plan_gateway.sh
 ```
 
-The adapter checks `openclaw gateway call health --json` before serving each
-planner decision. If the OpenClaw CLI gateway becomes unavailable, `/plan`
-returns an error and ClawNav falls back to its local rule planner.
+By default the adapter uses `OPENCLAW_PLANNER_MODE=agent`, so each `/plan`
+request calls:
+
+```bash
+openclaw agent --agent main --json --message <planner-prompt>
+```
+
+The OpenClaw agent must have a working model configured, for example:
+
+```bash
+openclaw models auth --agent main login \
+  --provider qwen \
+  --method standard-api-key-cn \
+  --set-default
+openclaw models --agent main set qwen/qwen3.5-plus
+openclaw gateway restart
+openclaw agent --agent main --json --message '只回复 OK' --timeout 60
+```
+
+If the OpenClaw agent call fails or returns invalid JSON, the adapter falls back
+inside `/plan` to the local rule planner and annotates the returned reason with
+`openclaw_cli_agent_fallback:`. For the older health-only behavior, set:
+
+```bash
+OPENCLAW_PLANNER_MODE=heuristic ./scripts/start_openclaw_cli_plan_gateway.sh
+```
 
 ## 2. Check compliance
 
@@ -25,7 +48,8 @@ Run:
 
 ```bash
 PYTHONPATH=.:src python scripts/check_openclaw_plan_gateway.py \
-  --gateway_url http://127.0.0.1:8011
+  --gateway_url http://127.0.0.1:8011 \
+  --timeout 90
 ```
 
 ## 3. Run smoke
@@ -34,6 +58,7 @@ Run:
 
 ```bash
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:8011 \
+OPENCLAW_GATEWAY_TIMEOUT=90 \
 HARNESS_DEBUG_MAX_EPISODES=5 \
 ./scripts/evaluation_openclaw_gateway.sh
 ```

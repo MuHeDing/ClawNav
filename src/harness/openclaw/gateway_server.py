@@ -85,7 +85,10 @@ def make_gateway_handler(planner: LocalOpenClawGatewayPlanner):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                return
 
     return OpenClawGatewayHandler
 

@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openclaw_service_host", type=str, default="127.0.0.1")
     parser.add_argument("--openclaw_planner_backend", type=str, default="rule")
     parser.add_argument("--openclaw_gateway_url", type=str, default="")
+    parser.add_argument("--openclaw_gateway_timeout", type=float, default=5.0)
     parser.add_argument("--openclaw_executor_backend", type=str, default="habitat")
     parser.add_argument("--openclaw_robot_executor_url", type=str, default="")
     parser.add_argument("--openclaw_subagent_backend", type=str, default="fake")
@@ -101,6 +102,7 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         openclaw_service_host=args.openclaw_service_host,
         openclaw_planner_backend=args.openclaw_planner_backend,
         openclaw_gateway_url=args.openclaw_gateway_url,
+        openclaw_gateway_timeout_s=getattr(args, "openclaw_gateway_timeout", 5.0),
         openclaw_executor_backend=args.openclaw_executor_backend,
         openclaw_robot_executor_url=args.openclaw_robot_executor_url,
         openclaw_subagent_backend=args.openclaw_subagent_backend,
@@ -188,7 +190,10 @@ def build_harness_components(
                 )
             from harness.openclaw.gateway import OpenClawGatewayClient
 
-            planner = OpenClawGatewayClient(base_url=config.openclaw_gateway_url)
+            planner = OpenClawGatewayClient(
+                base_url=config.openclaw_gateway_url,
+                timeout_s=config.openclaw_gateway_timeout_s,
+            )
         else:
             planner = RuleOpenClawPlanner(
                 recall_interval_steps=config.recall_interval_steps,
