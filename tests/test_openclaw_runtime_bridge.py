@@ -1,6 +1,6 @@
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
 from harness.openclaw.executor import HabitatOpenClawExecutor
-from harness.openclaw.gateway import FakeOpenClawGatewayClient
+from harness.openclaw.gateway import FakeOpenClawGatewayClient, OpenClawGatewayError
 from harness.openclaw.planner import RuleOpenClawPlanner
 from harness.openclaw.runtime import OpenClawVLNRuntime
 from harness.skill_registry import SkillRegistry
@@ -29,6 +29,11 @@ class EchoMemorySkill(Skill):
             "memory",
             {"policy_context": {"memory_context_text": "kitchen"}},
         )
+
+
+class FailingGatewayPlanner:
+    def plan(self, state, runtime_context):
+        raise OpenClawGatewayError("502 Server Error: Bad Gateway for url: http://gateway/plan")
 
 
 def make_state(step_id=1):
@@ -106,3 +111,23 @@ def test_runtime_can_use_gateway_planner_client():
     assert result.ok is True
     assert result.runtime_metadata["planner_backend"] == "gateway"
     assert result.runtime_metadata["planner_reason"] == "gateway_test"
+
+
+def test_runtime_falls_back_to_rule_planner_when_gateway_fails():
+    registry = SkillRegistry()
+    registry.register(EchoNavigationSkill())
+    registry.register(EchoMemorySkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=FailingGatewayPlanner(),
+        fallback_planner=RuleOpenClawPlanner(recall_interval_steps=5),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(make_state(step_id=1), payload={})
+
+    assert result.ok is True
+    assert result.action_text == "TURN_LEFT"
+    assert result.runtime_metadata["planner_backend"] == "rule"
+    assert result.runtime_metadata["planner_fallback"] is True
+    assert "502 Server Error" in result.runtime_metadata["planner_error"]

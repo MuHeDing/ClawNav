@@ -16,6 +16,32 @@ def strip_oracle_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in data.items() if key not in ORACLE_KEYS}
 
 
+def json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        if not value:
+            return []
+        safe_items = []
+        for item in value:
+            safe_item = json_safe_value(item)
+            if safe_item is not None:
+                safe_items.append(safe_item)
+        return safe_items or None
+    if isinstance(value, dict):
+        return json_safe_dict(value)
+    return None
+
+
+def json_safe_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    safe: Dict[str, Any] = {}
+    for key, value in data.items():
+        safe_value = json_safe_value(value)
+        if safe_value is not None:
+            safe[str(key)] = safe_value
+    return safe
+
+
 @dataclass
 class OpenClawGatewayClient:
     base_url: str
@@ -35,7 +61,7 @@ class OpenClawGatewayClient:
                 "step_id": state.step_id,
                 "last_action": state.last_action,
             },
-            "runtime_context": strip_oracle_fields(runtime_context),
+            "runtime_context": json_safe_dict(strip_oracle_fields(runtime_context)),
         }
         response = self._post(f"{self.base_url.rstrip('/')}/plan", payload)
         return gateway_response_to_decision(response)
@@ -44,7 +70,9 @@ class OpenClawGatewayClient:
         if self.post_json is not None:
             return self.post_json(url, payload, self.timeout_s)
         try:
-            response = requests.post(url, json=payload, timeout=self.timeout_s)
+            session = requests.Session()
+            session.trust_env = False
+            response = session.post(url, json=payload, timeout=self.timeout_s)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:

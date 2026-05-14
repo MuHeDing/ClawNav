@@ -31,10 +31,12 @@ class OpenClawVLNRuntime:
         tool_registry: SkillRegistry,
         planner: OpenClawPlannerProtocol,
         executor: HabitatOpenClawExecutor,
+        fallback_planner: OpenClawPlannerProtocol = None,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
         self.executor = executor
+        self.fallback_planner = fallback_planner
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -44,7 +46,25 @@ class OpenClawVLNRuntime:
         state: VLNState,
         payload: Dict[str, Any],
     ) -> OpenClawRuntimeStepResult:
-        decision = self.planner.plan(state, runtime_context=payload)
+        planner_error = ""
+        planner_fallback = False
+        try:
+            decision = self.planner.plan(state, runtime_context=payload)
+        except Exception as exc:
+            planner_error = str(exc)
+            if self.fallback_planner is None:
+                return OpenClawRuntimeStepResult(
+                    ok=False,
+                    action_text="STOP",
+                    runtime_metadata={
+                        "runtime_mode": "openclaw_bridge",
+                        "planner_fallback": False,
+                        "planner_error": planner_error,
+                    },
+                    error=planner_error,
+                )
+            decision = self.fallback_planner.plan(state, runtime_context=payload)
+            planner_fallback = True
         tool_calls: List[Dict[str, Any]] = []
 
         if decision.intent == "recall_memory":
@@ -63,6 +83,9 @@ class OpenClawVLNRuntime:
         tool_calls.append(nav_result)
 
         metadata = self._metadata(decision, tool_calls)
+        if planner_error:
+            metadata["planner_error"] = planner_error
+        metadata["planner_fallback"] = planner_fallback
         if not nav_result.get("ok"):
             return OpenClawRuntimeStepResult(
                 ok=False,

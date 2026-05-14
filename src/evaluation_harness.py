@@ -207,6 +207,9 @@ def build_harness_components(
             tool_registry=registry,
             planner=planner,
             executor=executor,
+            fallback_planner=RuleOpenClawPlanner(
+                recall_interval_steps=config.recall_interval_steps,
+            ),
         )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",
