@@ -24,6 +24,7 @@ OPENCLAW_ROBOT_EXECUTOR_URL=${OPENCLAW_ROBOT_EXECUTOR_URL:-}
 EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
 DATA_PATH=${DATA_PATH:-}
 HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-}
+CHECK_GATEWAY=${CHECK_GATEWAY:-1}
 
 extra_args=()
 if [[ -n "${DATA_PATH}" ]]; then
@@ -52,6 +53,12 @@ echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
 echo "Output path: ${OUTPUT_PATH}"
 
 export NO_PROXY no_proxy TOKENIZERS_PARALLELISM
+
+if [[ "${CHECK_GATEWAY}" == "1" ]]; then
+  PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
+    scripts/check_openclaw_plan_gateway.py \
+    --gateway_url "${OPENCLAW_GATEWAY_URL}"
+fi
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 /ssd/dingmuhe/anaconda3/envs/janusvln/bin/torchrun --nproc_per_node=1 \
