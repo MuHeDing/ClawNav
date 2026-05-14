@@ -148,3 +148,14 @@ def test_proxy_payload_exposes_keyframe_candidate_without_image_object(tmp_path)
     assert payload["keyframe_candidate"]["step_id"] == 0
     assert "image" not in payload["keyframe_candidate"]
     assert payload["keyframe_candidate"]["reason"] == "interval"
+
+
+def test_proxy_saves_keyframe_artifact_for_write_memory(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(make_args(tmp_path), model=base_model)
+    proxy = HarnessModelProxy(base_model, components)
+
+    path = proxy._save_keyframe_if_needed("frame0", step_id=0)
+
+    assert path.endswith("keyframes/step_000000.txt")
+    assert (tmp_path / "keyframes" / "step_000000.txt").exists()

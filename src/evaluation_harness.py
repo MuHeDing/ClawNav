@@ -227,6 +227,7 @@ def build_harness_components(
         "adapter": adapter,
         "openclaw_runtime": openclaw_runtime,
         "logger": logger,
+        "output_path": Path(args.output_path),
     }
 
 
@@ -278,8 +279,25 @@ class HarnessModelProxy:
                 "step_id": step_id,
                 "reason": "interval",
                 "has_current_image": bool(images),
+                "image_path": self._save_keyframe_if_needed(
+                    images[-1] if images else None,
+                    step_id,
+                ),
             }
         return payload
+
+    def _save_keyframe_if_needed(self, image, step_id: int) -> str:
+        if image is None:
+            return ""
+        keyframe_dir = Path(self.components["output_path"]) / "keyframes"
+        keyframe_dir.mkdir(parents=True, exist_ok=True)
+        if hasattr(image, "save"):
+            path = keyframe_dir / f"step_{step_id:06d}.png"
+            image.save(path)
+        else:
+            path = keyframe_dir / f"step_{step_id:06d}.txt"
+            path.write_text(str(image), encoding="utf-8")
+        return str(path)
 
     def consume_last_visual_prune_profile(self):
         return self.base_model.consume_last_visual_prune_profile()
