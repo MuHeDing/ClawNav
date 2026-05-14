@@ -247,10 +247,7 @@ class HarnessModelProxy:
         if runtime is not None:
             runtime_result = runtime.step(
                 state,
-                {
-                    "recent_frames": list(images[:-1]),
-                    "policy_action": self.last_action_text,
-                },
+                self._runtime_payload(images, step_id),
             )
             action_text = runtime_result.action_text if runtime_result.ok else "STOP"
             self.last_action_text = action_text
@@ -270,6 +267,19 @@ class HarnessModelProxy:
         self._append_working_memory(images, action_text)
         self._log_step(state, result, action_text)
         return [action_text]
+
+    def _runtime_payload(self, images, step_id: int) -> Dict[str, Any]:
+        payload = {
+            "recent_frames": list(images[:-1]),
+            "policy_action": self.last_action_text,
+        }
+        if self.components["working_memory"].should_promote_keyframe(step_id):
+            payload["keyframe_candidate"] = {
+                "step_id": step_id,
+                "reason": "interval",
+                "has_current_image": bool(images),
+            }
+        return payload
 
     def consume_last_visual_prune_profile(self):
         return self.base_model.consume_last_visual_prune_profile()

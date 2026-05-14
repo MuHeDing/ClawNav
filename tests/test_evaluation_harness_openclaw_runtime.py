@@ -136,3 +136,15 @@ def test_robot_executor_requires_url_when_selected(tmp_path):
         assert "openclaw_robot_executor_url" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_proxy_payload_exposes_keyframe_candidate_without_image_object(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(make_args(tmp_path), model=base_model)
+    proxy = HarnessModelProxy(base_model, components)
+
+    payload = proxy._runtime_payload(["frame0"], step_id=0)
+
+    assert payload["keyframe_candidate"]["step_id"] == 0
+    assert "image" not in payload["keyframe_candidate"]
+    assert payload["keyframe_candidate"]["reason"] == "interval"
