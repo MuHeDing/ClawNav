@@ -1,7 +1,7 @@
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
 from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.gateway import FakeOpenClawGatewayClient, OpenClawGatewayError
-from harness.openclaw.planner import RuleOpenClawPlanner
+from harness.openclaw.planner import OpenClawPlanDecision, RuleOpenClawPlanner
 from harness.openclaw.runtime import OpenClawVLNRuntime
 from harness.skill_registry import SkillRegistry
 from harness.skills.base import Skill
@@ -36,6 +36,44 @@ class FailingGatewayPlanner:
         raise OpenClawGatewayError("502 Server Error: Bad Gateway for url: http://gateway/plan")
 
 
+class StaticPlanner:
+    def __init__(self, decision):
+        self.decision = decision
+
+    def plan(self, state, runtime_context):
+        return self.decision
+
+
+class EchoWriteSkill(Skill):
+    name = "MemoryWriteSkill"
+    description = "Writes fake memory."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def run(self, state, payload):
+        return SkillResult.ok_result("memory_write", {"stored": True, **payload})
+
+
+class EchoCriticSkill(Skill):
+    name = "ProgressCriticSkill"
+    description = "Returns fake critic result."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def run(self, state, payload):
+        return SkillResult.ok_result("critic", {"possible_stuck": False})
+
+
+class EchoReplannerSkill(Skill):
+    name = "ReplannerSkill"
+    description = "Returns fake subgoal."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def run(self, state, payload):
+        return SkillResult.ok_result("replan", {"active_subgoal": "recover hallway"})
+
+
 def make_state(step_id=1):
     return VLNState(
         scene_id="s1",
@@ -53,6 +91,20 @@ def make_runtime():
     return OpenClawVLNRuntime(
         tool_registry=registry,
         planner=RuleOpenClawPlanner(recall_interval_steps=5),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+
+def make_full_runtime(decision):
+    registry = SkillRegistry()
+    registry.register(EchoNavigationSkill())
+    registry.register(EchoMemorySkill())
+    registry.register(EchoWriteSkill())
+    registry.register(EchoCriticSkill())
+    registry.register(EchoReplannerSkill())
+    return OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
         executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
     )
 
@@ -131,3 +183,42 @@ def test_runtime_falls_back_to_rule_planner_when_gateway_fails():
     assert result.runtime_metadata["planner_backend"] == "rule"
     assert result.runtime_metadata["planner_fallback"] is True
     assert "502 Server Error" in result.runtime_metadata["planner_error"]
+
+
+def test_runtime_executes_write_memory_intent_before_action():
+    decision = OpenClawPlanDecision(
+        intent="write_memory",
+        tool_name="MemoryWriteSkill",
+        arguments={"step_id": 3, "note": "landmark"},
+        reason="curator",
+        planner_backend="gateway",
+    )
+    runtime = make_full_runtime(decision)
+
+    result = runtime.step(make_state(step_id=3), payload={})
+
+    assert result.ok is True
+    assert result.runtime_metadata["planned_intent"] == "write_memory"
+    assert result.runtime_metadata["tool_calls"][0]["tool_name"] == "MemoryWriteSkill"
+    assert result.runtime_metadata["tool_calls"][-1]["tool_name"] == "NavigationPolicySkill"
+
+
+def test_runtime_executes_critic_and_replan_intents_before_action():
+    for intent, tool in [
+        ("verify_progress", "ProgressCriticSkill"),
+        ("replan", "ReplannerSkill"),
+    ]:
+        decision = OpenClawPlanDecision(
+            intent=intent,
+            tool_name=tool,
+            arguments={"reason": "planner"},
+            reason="planner",
+            planner_backend="gateway",
+        )
+        runtime = make_full_runtime(decision)
+
+        result = runtime.step(make_state(step_id=4), payload={})
+
+        assert result.ok is True
+        assert result.runtime_metadata["tool_calls"][0]["tool_name"] == tool
+        assert result.runtime_metadata["tool_calls"][-1]["tool_name"] == "NavigationPolicySkill"

@@ -7,6 +7,14 @@ from harness.skill_registry import SkillRegistry
 from harness.types import VLNState
 
 
+PRE_ACTION_INTENTS = {
+    "recall_memory",
+    "write_memory",
+    "verify_progress",
+    "replan",
+}
+
+
 @dataclass
 class OpenClawRuntimeStepResult:
     ok: bool
@@ -67,13 +75,13 @@ class OpenClawVLNRuntime:
             planner_fallback = True
         tool_calls: List[Dict[str, Any]] = []
 
-        if decision.intent == "recall_memory":
-            recall = self.tool_adapter.call_tool(
+        if decision.intent in PRE_ACTION_INTENTS:
+            tool_result = self.tool_adapter.call_tool(
                 decision.tool_name,
                 decision.arguments,
                 state=state,
             )
-            tool_calls.append(recall)
+            tool_calls.append(tool_result)
 
         nav_result = self.tool_adapter.call_tool(
             "NavigationPolicySkill",
