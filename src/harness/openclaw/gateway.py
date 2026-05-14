@@ -12,8 +12,27 @@ class OpenClawGatewayError(RuntimeError):
     pass
 
 
+GATEWAY_FORBIDDEN_KEYS = ORACLE_KEYS | {
+    "future_observations",
+    "future_trajectory_frames",
+}
+
+
 def strip_oracle_fields(data: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in data.items() if key not in ORACLE_KEYS}
+    stripped: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key in GATEWAY_FORBIDDEN_KEYS:
+            continue
+        if isinstance(value, dict):
+            stripped[key] = strip_oracle_fields(value)
+        elif isinstance(value, list):
+            stripped[key] = [
+                strip_oracle_fields(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            stripped[key] = value
+    return stripped
 
 
 def json_safe_value(value: Any) -> Any:
