@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
@@ -15,6 +16,20 @@ INTENT_TOOL_NAMES = {
     "write_memory": "MemoryWriteSkill",
     "verify_progress": "ProgressCriticSkill",
     "replan": "ReplannerSkill",
+}
+
+ACTION_TEXTS = {
+    "STOP",
+    "MOVE_FORWARD",
+    "TURN_LEFT",
+    "TURN_RIGHT",
+}
+
+ACTION_ALIASES = {
+    "FORWARD": "MOVE_FORWARD",
+    "MOVE": "MOVE_FORWARD",
+    "LEFT": "TURN_LEFT",
+    "RIGHT": "TURN_RIGHT",
 }
 
 
@@ -133,6 +148,10 @@ class OpenClawCliPlanPlanner:
                 '"tool_name":"...",'
                 '"arguments":{},'
                 '"reason":"short_reason"}',
+                "For act/replan, when the next discrete action is known, put it in arguments.action_text.",
+                "arguments.action_text must be one of STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT.",
+                "For replan, also put the recovery instruction in arguments.active_subgoal.",
+                "Do not bury mandatory action commands only in reason.",
                 "Use act unless memory recall/write, progress verification, or replanning is useful before the next navigation action.",
                 "Payload:",
                 compact_payload,
@@ -190,12 +209,41 @@ class OpenClawCliPlanPlanner:
         arguments = decision.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise RuntimeError("openclaw agent returned non-object arguments")
+        arguments = dict(arguments)
+        action_text = self._normalize_action_text(arguments.get("action_text"))
+        if action_text:
+            arguments["action_text"] = action_text
+        elif intent in {"act", "replan"}:
+            inferred_action = self._infer_action_text(str(decision.get("reason") or ""))
+            if inferred_action:
+                arguments["action_text"] = inferred_action
         return {
             "intent": intent,
             "tool_name": str(decision.get("tool_name") or INTENT_TOOL_NAMES[intent]),
             "arguments": arguments,
             "reason": str(decision.get("reason") or "openclaw_agent"),
         }
+
+    def _normalize_action_text(self, value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+        normalized = ACTION_ALIASES.get(normalized, normalized)
+        return normalized if normalized in ACTION_TEXTS else ""
+
+    def _infer_action_text(self, text: str) -> str:
+        upper_text = text.upper()
+        patterns = [
+            r"\bMUST\s+(?:BE\s+)?(STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT)\b",
+            r"\b(?:ONLY|CORRECT)\s+(?:ACTION|COMMAND)\s+(?:IS\s+)?(STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT)\b",
+            r"\b(STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT)\s+(?:IS\s+)?(?:THE\s+)?ONLY\b",
+            r"\b(?:NEXT\s+ACTION|ACTION|COMMAND)\s*(?:IS|:)\s*(STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, upper_text)
+            if match:
+                return self._normalize_action_text(match.group(1))
+        return ""
 
     def _gateway_health(self) -> Dict[str, Any]:
         args = ["openclaw", "gateway", "call", "health", "--json"]

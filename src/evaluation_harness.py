@@ -242,9 +242,16 @@ class HarnessModelProxy:
         self.model = base_model.model
         self.components = components
         self.last_action_text = None
+        self.current_scene_id = ""
+        self.current_episode_id = ""
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_model, name)
+
+    def start_episode(self, scene_id: str, episode_id: str) -> None:
+        self.current_scene_id = str(scene_id or "")
+        self.current_episode_id = str(episode_id or "")
+        self.last_action_text = None
 
     def call_model(self, images, task, step_id):
         current_image = images[-1] if images else None
@@ -311,8 +318,8 @@ class HarnessModelProxy:
         from harness.types import VLNState
 
         return VLNState(
-            scene_id="",
-            episode_id="",
+            scene_id=self.current_scene_id,
+            episode_id=self.current_episode_id,
             instruction=task,
             step_id=step_id,
             current_image=current_image,

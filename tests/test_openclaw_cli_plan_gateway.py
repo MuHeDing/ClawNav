@@ -102,6 +102,58 @@ def test_cli_plan_gateway_agent_mode_calls_openclaw_agent_and_parses_json_text()
     assert runner.calls[0][0][:5] == ["openclaw", "agent", "--agent", "main", "--json"]
 
 
+def test_cli_plan_gateway_agent_mode_normalizes_action_text_argument():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "forward"},
+                                "reason": "move through doorway",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(run_openclaw=runner, planner_mode="agent")
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+
+
+def test_cli_plan_gateway_agent_mode_infers_clear_action_from_reason():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "replan",
+                                "tool_name": "ReplannerSkill",
+                                "arguments": {},
+                                "reason": "Step 2 MUST be MOVE_FORWARD to exit the loop. Do not issue TURN_LEFT.",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(run_openclaw=runner, planner_mode="agent")
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+
+
 def test_cli_plan_gateway_agent_mode_falls_back_to_heuristic_when_agent_fails():
     runner = FakeOpenClawRunner(returncode=1, stderr="qwen unavailable")
     planner = OpenClawCliPlanPlanner(

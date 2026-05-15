@@ -630,6 +630,8 @@ class VLNEvaluator:
                 self.current_episode_normalized = False
 
                 env.current_episode = episode
+                if hasattr(self.model, "start_episode"):
+                    self.model.start_episode(scene_id, episode_id)
                 observations = env.reset()
 
                 vis_frames = []

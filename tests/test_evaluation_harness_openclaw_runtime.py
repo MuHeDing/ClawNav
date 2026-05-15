@@ -68,16 +68,40 @@ def test_proxy_uses_openclaw_runtime_and_logs_metadata(tmp_path):
     base_model = FakeBaseModel()
     components = build_harness_components(make_args(tmp_path), model=base_model)
     proxy = HarnessModelProxy(base_model, components)
+    proxy.start_episode("scene-a", "episode-1")
 
     action = proxy.call_model(["frame0"], "go to kitchen", step_id=0)
 
     assert action == ["TURN_LEFT"]
     trace_path = tmp_path / "harness_traces" / "harness_trace_rank0.jsonl"
     record = json.loads(trace_path.read_text(encoding="utf-8").strip())
+    assert record["scene_id"] == "scene-a"
+    assert record["episode_id"] == "episode-1"
     assert record["runtime_mode"] == "openclaw_bridge"
     assert record["planned_intent"] == "recall_memory"
     assert record["runtime_executor"] == "openclaw_habitat"
     assert record["oracle_metrics_used_for_decision"] is False
+
+
+def test_proxy_start_episode_resets_last_action_and_updates_state_identity(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(make_args(tmp_path), model=base_model)
+    proxy = HarnessModelProxy(base_model, components)
+
+    proxy.start_episode("scene-a", "episode-1")
+    proxy.call_model(["frame0"], "go to kitchen", step_id=0)
+    proxy.start_episode("scene-b", "episode-2")
+    proxy.call_model(["frame1"], "go to bedroom", step_id=0)
+
+    trace_path = tmp_path / "harness_traces" / "harness_trace_rank0.jsonl"
+    records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[0]["scene_id"] == "scene-a"
+    assert records[0]["episode_id"] == "episode-1"
+    assert records[1]["scene_id"] == "scene-b"
+    assert records[1]["episode_id"] == "episode-2"
 
 
 def test_service_registry_can_supply_spatial_memory_url(tmp_path):

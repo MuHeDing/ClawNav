@@ -2,8 +2,9 @@
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra}
-OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4}
+DATA_PATH=${DATA_PATH:-/ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/val_unseen/val_unseen.json.gz}
+OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway_val_unseen_full}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5}
 MASTER_PORT=${MASTER_PORT:-20401}
 TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 if [[ -z "${NPROC_PER_NODE:-}" ]]; then
@@ -25,20 +26,9 @@ MEMORY_MANIFEST_PATH=${MEMORY_MANIFEST_PATH:-}
 
 OPENCLAW_EXECUTOR_BACKEND=${OPENCLAW_EXECUTOR_BACKEND:-habitat}
 OPENCLAW_ROBOT_EXECUTOR_URL=${OPENCLAW_ROBOT_EXECUTOR_URL:-}
-
 EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
-DATA_PATH=${DATA_PATH:-}
-HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-20}
-CHECK_GATEWAY=${CHECK_GATEWAY:-1}
-REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}
 
 extra_args=()
-if [[ -n "${DATA_PATH}" ]]; then
-  extra_args+=(--data_path "${DATA_PATH}")
-fi
-if [[ -n "${HARNESS_DEBUG_MAX_EPISODES}" ]]; then
-  extra_args+=(--harness_debug_max_episodes "${HARNESS_DEBUG_MAX_EPISODES}")
-fi
 if [[ -n "${MEMORY_MANIFEST_PATH}" ]]; then
   extra_args+=(--memory_manifest_path "${MEMORY_MANIFEST_PATH}")
 fi
@@ -54,26 +44,19 @@ if [[ "${OPENCLAW_EXECUTOR_BACKEND}" == "robot_http" ]]; then
 fi
 
 echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
+echo "Dataset: ${DATA_PATH}"
+echo "Output path: ${OUTPUT_PATH}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
 echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
-echo "Output path: ${OUTPUT_PATH}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES}"
 echo "Torch processes: ${NPROC_PER_NODE}"
 
 export NO_PROXY no_proxy TOKENIZERS_PARALLELISM
 
-if [[ "${CHECK_GATEWAY}" == "1" ]]; then
-  if ! PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
-    scripts/check_openclaw_plan_gateway.py \
-    --gateway_url "${OPENCLAW_GATEWAY_URL}" \
-    --timeout "${OPENCLAW_GATEWAY_TIMEOUT}"; then
-    if [[ "${REQUIRE_GATEWAY}" == "1" ]]; then
-      echo "OpenClaw gateway preflight failed and REQUIRE_GATEWAY=1" >&2
-      exit 2
-    fi
-    echo "OpenClaw gateway preflight failed; continuing so runtime fallback can handle planner errors." >&2
-  fi
-fi
+PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
+  scripts/check_openclaw_plan_gateway.py \
+  --gateway_url "${OPENCLAW_GATEWAY_URL}" \
+  --timeout "${OPENCLAW_GATEWAY_TIMEOUT}"
 
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
 /ssd/dingmuhe/anaconda3/envs/janusvln/bin/torchrun --nproc_per_node="${NPROC_PER_NODE}" \
@@ -82,8 +65,8 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
   --model_path "${MODEL_PATH}" \
   --habitat_config_path config/vln_r2r.yaml \
   --eval_split "${EVAL_SPLIT}" \
+  --data_path "${DATA_PATH}" \
   --num_history 8 \
-  --max_pixels 401408 \
   --kv_start_size 8 \
   --kv_recent_size 24 \
   --output_path "${OUTPUT_PATH}" \

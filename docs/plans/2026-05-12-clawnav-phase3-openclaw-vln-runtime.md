@@ -1469,7 +1469,6 @@ Do not commit `results/` outputs.
 ## Notes for Execution
 
 - Work from `ClawNav`, not the outer `Navigation_Claw` repository.
-- Prefer one commit per task.
 - Keep `--harness_runtime phase2` as the default path.
 - Treat `--harness_runtime openclaw_bridge` as the Phase 3 opt-in path.
 - Do not make external OpenClaw importable packages mandatory.

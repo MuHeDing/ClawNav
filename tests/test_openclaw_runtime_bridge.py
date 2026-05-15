@@ -18,6 +18,20 @@ class EchoNavigationSkill(Skill):
         return SkillResult.ok_result("action", {"action_text": "TURN_LEFT"})
 
 
+class RecordingNavigationSkill(Skill):
+    name = "NavigationPolicySkill"
+    description = "Records payload and returns a fixed action."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        return SkillResult.ok_result("action", {"action_text": "TURN_LEFT"})
+
+
 class EchoMemorySkill(Skill):
     name = "MemoryQuerySkill"
     description = "Returns fake memory."
@@ -222,6 +236,80 @@ def test_runtime_executes_critic_and_replan_intents_before_action():
         assert result.ok is True
         assert result.runtime_metadata["tool_calls"][0]["tool_name"] == tool
         assert result.runtime_metadata["tool_calls"][-1]["tool_name"] == "NavigationPolicySkill"
+
+
+def test_runtime_passes_replan_subgoal_to_navigation_policy():
+    decision = OpenClawPlanDecision(
+        intent="replan",
+        tool_name="ReplannerSkill",
+        arguments={"failure_reason": "rotation_loop"},
+        reason="planner",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(EchoReplannerSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(make_state(step_id=4), payload={})
+
+    assert result.ok is True
+    assert navigation.calls[0]["active_subgoal"] == "recover hallway"
+
+
+def test_runtime_uses_planner_action_override_without_policy_action():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "MOVE_FORWARD"},
+        reason="planner chose next discrete action",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(make_state(step_id=4), payload={})
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert result.executor_command["action_index"] == 1
+    assert navigation.calls == []
+    assert result.runtime_metadata["planner_action_override"] == "MOVE_FORWARD"
+
+
+def test_runtime_passes_memory_context_to_navigation_policy():
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "go to kitchen"},
+        reason="recall",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(EchoMemorySkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(make_state(step_id=0), payload={})
+
+    assert result.ok is True
+    assert navigation.calls[0]["memory_context_text"] == "kitchen"
 
 
 def test_runtime_enriches_write_memory_with_keyframe_candidate():

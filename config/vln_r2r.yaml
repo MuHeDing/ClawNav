@@ -54,7 +54,7 @@ habitat:
     split: val_unseen
     scenes_dir: /ssd/dingmuhe/Embodied-task/JanusVLN/data/scene_datasets/
     #data_path: data/datasets/r2r/val_unseen/400_val_unseen.json.gz
-    #data_path: /ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/{split}/{split}.json.gz
-    data_path: /ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/val_unseen/400_val_unseen.json.gz
+    data_path: /ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/{split}/{split}.json.gz
+    #data_path: /ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/val_unseen/400_val_unseen.json.gz
     #data_path: data/datasets/r2r/val_unseen/val_unseen_indent4_filtered.json.gz
     #data_path: /ssd/dingmuhe/Embodied-task/JanusVLN/generate_path/data/datasets/r2r/val_unseen2/long_horizon_all_clean.json.gz
