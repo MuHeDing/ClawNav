@@ -19,6 +19,7 @@ from harness.skills.memory_write import MemoryWriteSkill
 from harness.skills.navigation_policy import NavigationPolicySkill
 from harness.skills.progress_critic import ProgressCriticSkill
 from harness.skills.replanner import ReplannerSkill
+from harness.skills.visual_memory_curator import VisualMemoryCuratorSkill
 from harness.types import SkillResult
 
 
@@ -160,6 +161,8 @@ def build_harness_components(
     registry.register(MemoryWriteSkill(client=memory_client))
     registry.register(ProgressCriticSkill())
     registry.register(ReplannerSkill())
+    if config.openclaw_enable_subagent_memory_curator:
+        registry.register(VisualMemoryCuratorSkill())
 
     controller = HarnessController(registry, config)
     adapter = HabitatVLNAdapter(expose_pose_online=config.expose_sim_pose_online)
@@ -244,6 +247,7 @@ class HarnessModelProxy:
         self.last_action_text = None
         self.current_scene_id = ""
         self.current_episode_id = ""
+        self.recent_keyframe_paths = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_model, name)
@@ -252,6 +256,7 @@ class HarnessModelProxy:
         self.current_scene_id = str(scene_id or "")
         self.current_episode_id = str(episode_id or "")
         self.last_action_text = None
+        self.recent_keyframe_paths = []
 
     def call_model(self, images, task, step_id):
         current_image = images[-1] if images else None
@@ -282,34 +287,65 @@ class HarnessModelProxy:
         return [action_text]
 
     def _runtime_payload(self, images, step_id: int) -> Dict[str, Any]:
+        current_image = images[-1] if images else None
         payload = {
             "recent_frames": list(images[:-1]),
             "policy_action": self.last_action_text,
         }
         if self.components["working_memory"].should_promote_keyframe(step_id):
+            image_path = self._save_keyframe_if_needed(current_image, step_id)
+            if image_path:
+                self._remember_keyframe_path(image_path)
             payload["keyframe_candidate"] = {
                 "step_id": step_id,
                 "reason": "interval",
                 "has_current_image": bool(images),
-                "image_path": self._save_keyframe_if_needed(
-                    images[-1] if images else None,
-                    step_id,
-                ),
+                "image_path": image_path,
             }
+            payload["current_image_path"] = image_path
+        else:
+            payload["current_image_path"] = self._save_current_image_if_needed(
+                current_image,
+                step_id,
+            )
+        payload["recent_keyframe_paths"] = list(self.recent_keyframe_paths)
         return payload
 
     def _save_keyframe_if_needed(self, image, step_id: int) -> str:
+        return self._save_image_artifact(image, "keyframes", step_id)
+
+    def _save_current_image_if_needed(self, image, step_id: int) -> str:
+        return self._save_image_artifact(image, "openclaw_current_frames", step_id)
+
+    def _save_image_artifact(self, image, root_dir_name: str, step_id: int) -> str:
         if image is None:
             return ""
-        keyframe_dir = Path(self.components["output_path"]) / "keyframes"
-        keyframe_dir.mkdir(parents=True, exist_ok=True)
+        image_dir = self._episode_artifact_dir(root_dir_name)
+        image_dir.mkdir(parents=True, exist_ok=True)
         if hasattr(image, "save"):
-            path = keyframe_dir / f"step_{step_id:06d}.png"
+            path = image_dir / f"step_{step_id:06d}.png"
             image.save(path)
         else:
-            path = keyframe_dir / f"step_{step_id:06d}.txt"
+            path = image_dir / f"step_{step_id:06d}.txt"
             path.write_text(str(image), encoding="utf-8")
         return str(path)
+
+    def _episode_artifact_dir(self, root_dir_name: str) -> Path:
+        root_dir = Path(self.components["output_path"]) / root_dir_name
+        if not self.current_scene_id or not self.current_episode_id:
+            return root_dir
+        return root_dir / self._safe_path_part(self.current_scene_id) / self._safe_path_part(
+            self.current_episode_id
+        )
+
+    def _safe_path_part(self, value: str) -> str:
+        return "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+
+    def _remember_keyframe_path(self, image_path: str) -> None:
+        if image_path in self.recent_keyframe_paths:
+            return
+        self.recent_keyframe_paths.append(image_path)
+        self.recent_keyframe_paths = self.recent_keyframe_paths[-8:]
 
     def consume_last_visual_prune_profile(self):
         return self.base_model.consume_last_visual_prune_profile()

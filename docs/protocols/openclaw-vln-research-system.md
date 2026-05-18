@@ -43,9 +43,13 @@ The ablation matrix must include at least:
 - low-memory baseline
 - Phase 2 memory recall
 - Phase 3 OpenClaw bridge
+- OpenClaw + Qwen visual observations
+- episodic visual memory write
+- visual memory recall
 - scene-prior memory
 - train-scene-only memory
 - subagent planner
+- full visual memory system with write gating, namespace-filtered recall, and recall usage logging
 
 All full evaluation commands preserve the low-memory settings:
 
@@ -57,6 +61,28 @@ All full evaluation commands preserve the low-memory settings:
 ```
 
 The matrix must not enable LLM adaptive sparse attention or slow-fast active memory reuse.
+
+The ablation summary must report both navigation metrics and system metrics:
+
+- SR, SPL, and episode length from `summary.json`
+- visual analysis steps, failures, and average visual latency
+- memory write attempts, accepted writes, skipped writes, duplicate skips, and write acceptance rate
+- memory scope and namespace distributions
+- memory recall events, recall events with hits, useful recall rate, and action changes after recall
+- oracle leakage count from online decision traces
+
+After ablation runs finish, generate an evidence report:
+
+```bash
+PYTHONPATH=.:src python scripts/build_openclaw_visual_memory_report.py \
+  --require_visual \
+  --output results/openclaw_visual_memory_evidence.md \
+  results/openclaw_vln_ablation/baseline_lowmem \
+  results/openclaw_vln_ablation/openclaw_full_visual_memory_system
+```
+
+The report is a go/no-go gate. It must pass before using the run as evidence
+for visual-memory claims.
 
 ## No Oracle Decision Inputs
 
@@ -79,7 +105,8 @@ Research claims require more than smoke tests. At minimum, provide:
 - py_compile coverage for changed runtime and script modules
 - validated memory manifests for scene-prior and train-scene-only experiments
 - ablation output directories with `summary.json` and harness traces
-- summarized navigation metrics, trace step counts, memory recall counts, and oracle leakage counts
+- summarized navigation metrics, trace step counts, memory recall counts, visual memory quality metrics, and oracle leakage counts
+- a passing `build_openclaw_visual_memory_report.py --require_visual` evidence report for visual-memory claims
 - enough episodes and seeds to support the claimed navigation trend
 
 One-episode smoke results may be used only to confirm runtime operability.

@@ -25,6 +25,8 @@ def build_query_payload(
     pose: Optional[Dict[str, Any]] = None,
     n_results: int = 5,
     memory_source: str = "episode-local",
+    allowed_scopes: Optional[list] = None,
+    memory_namespace: str = "",
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "protocol_version": SPATIAL_MEMORY_PROTOCOL_VERSION,
@@ -36,6 +38,10 @@ def build_query_payload(
         payload["text"] = text
     if pose is not None:
         payload["pose"] = pose
+    if allowed_scopes:
+        payload["allowed_scopes"] = allowed_scopes
+    if memory_namespace:
+        payload["memory_namespace"] = memory_namespace
     return payload
 
 

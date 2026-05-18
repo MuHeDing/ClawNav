@@ -25,6 +25,8 @@ MEMORY_MANIFEST_PATH=${MEMORY_MANIFEST_PATH:-}
 
 OPENCLAW_EXECUTOR_BACKEND=${OPENCLAW_EXECUTOR_BACKEND:-habitat}
 OPENCLAW_ROBOT_EXECUTOR_URL=${OPENCLAW_ROBOT_EXECUTOR_URL:-}
+OPENCLAW_ENABLE_SUBAGENT_CRITIC=${OPENCLAW_ENABLE_SUBAGENT_CRITIC:-0}
+OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR=${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR:-0}
 
 EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
 DATA_PATH=${DATA_PATH:-}
@@ -52,10 +54,17 @@ if [[ "${OPENCLAW_EXECUTOR_BACKEND}" == "robot_http" ]]; then
   fi
   extra_args+=(--openclaw_robot_executor_url "${OPENCLAW_ROBOT_EXECUTOR_URL}")
 fi
+if [[ "${OPENCLAW_ENABLE_SUBAGENT_CRITIC}" == "1" ]]; then
+  extra_args+=(--openclaw_enable_subagent_critic)
+fi
+if [[ "${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR}" == "1" ]]; then
+  extra_args+=(--openclaw_enable_subagent_memory_curator)
+fi
 
 echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
 echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
+echo "OpenClaw critic/curator: ${OPENCLAW_ENABLE_SUBAGENT_CRITIC}/${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR}"
 echo "Output path: ${OUTPUT_PATH}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES}"
 echo "Torch processes: ${NPROC_PER_NODE}"

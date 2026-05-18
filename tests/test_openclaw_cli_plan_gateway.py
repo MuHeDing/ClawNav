@@ -21,6 +21,27 @@ class FakeOpenClawRunner:
         )
 
 
+class FakeVisualAnalyzer:
+    def __init__(self):
+        self.calls = []
+
+    def analyze(self, image_paths):
+        self.calls.append(list(image_paths))
+        return [
+            {
+                "image_path": path,
+                "caption": f"caption for {path}",
+                "visual_observation": f"doorway visible in {path}",
+                "landmarks": ["doorway"],
+                "objects": ["door"],
+                "spatial_cues": ["doorway ahead"],
+                "navigation_relevance": "stable landmark",
+                "confidence": 0.8,
+            }
+            for path in image_paths
+        ]
+
+
 def test_cli_plan_gateway_health_uses_openclaw_gateway_call():
     runner = FakeOpenClawRunner(stdout=json.dumps({"ok": True, "defaultAgentId": "main"}))
     planner = OpenClawCliPlanPlanner(run_openclaw=runner)
@@ -100,6 +121,42 @@ def test_cli_plan_gateway_agent_mode_calls_openclaw_agent_and_parses_json_text()
     assert decision["tool_name"] == "MemoryWriteSkill"
     assert decision["arguments"]["summary"] == "saw a kitchen"
     assert runner.calls[0][0][:5] == ["openclaw", "agent", "--agent", "main", "--json"]
+    assert "--session-id" in runner.calls[0][0]
+
+
+def test_cli_plan_gateway_agent_mode_uses_fresh_openclaw_session_per_planner():
+    runner_a = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "fresh session",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    runner_b = FakeOpenClawRunner(stdout=runner_a.stdout)
+    planner_a = OpenClawCliPlanPlanner(run_openclaw=runner_a, planner_mode="agent")
+    planner_b = OpenClawCliPlanPlanner(run_openclaw=runner_b, planner_mode="agent")
+
+    planner_a.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+    planner_b.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    args_a = runner_a.calls[0][0]
+    args_b = runner_b.calls[0][0]
+    session_id_a = args_a[args_a.index("--session-id") + 1]
+    session_id_b = args_b[args_b.index("--session-id") + 1]
+    assert session_id_a.startswith("clawnav-")
+    assert session_id_b.startswith("clawnav-")
+    assert session_id_a != session_id_b
 
 
 def test_cli_plan_gateway_agent_mode_normalizes_action_text_argument():
@@ -152,6 +209,275 @@ def test_cli_plan_gateway_agent_mode_infers_clear_action_from_reason():
     decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
 
     assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+
+
+def test_cli_plan_gateway_agent_prompt_includes_visual_image_paths():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "use visual context",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(run_openclaw=runner, planner_mode="agent")
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 2},
+            "runtime_context": {
+                "current_image_path": "/tmp/current.png",
+                "recent_keyframe_paths": [
+                    "/tmp/key0.png",
+                    "/tmp/key1.png",
+                    "/tmp/key2.png",
+                ],
+            },
+        }
+    )
+
+    message = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    assert "Visual context image paths" in message
+    assert "/tmp/current.png" in message
+    assert "/tmp/key1.png" in message
+    assert "/tmp/key2.png" in message
+    assert "/tmp/key0.png" not in message
+
+
+def test_cli_plan_gateway_agent_prompt_includes_visual_observations_in_describe_mode():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "use visual observations",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    visual_analyzer = FakeVisualAnalyzer()
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        openclaw_visual_mode="describe",
+        openclaw_visual_max_images=2,
+        visual_analyzer=visual_analyzer,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 2},
+            "runtime_context": {
+                "current_image_path": "/tmp/current.png",
+                "recent_keyframe_paths": [
+                    "/tmp/key0.png",
+                    "/tmp/key1.png",
+                ],
+            },
+        }
+    )
+
+    assert visual_analyzer.calls == [["/tmp/current.png", "/tmp/key1.png"]]
+    message = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    payload_text = message.split("Payload:\n", 1)[1]
+    prompt_payload = json.loads(payload_text)
+    observations = prompt_payload["runtime_context"]["visual_observations"]
+    assert [item["image_path"] for item in observations] == [
+        "/tmp/current.png",
+        "/tmp/key1.png",
+    ]
+    assert observations[0]["visual_observation"] == "doorway visible in /tmp/current.png"
+    assert observations[0]["landmarks"] == ["doorway"]
+
+
+def test_cli_plan_gateway_agent_prompt_requests_write_gate_for_visual_memory():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "schema check",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(run_openclaw=runner, planner_mode="agent")
+
+    planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    message = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    assert "write_gate" in message
+    assert "curator_decision" in message
+    assert "episode memory" in message
+    assert "scene memory" in message
+
+
+def test_cli_plan_gateway_enriches_write_memory_with_visual_observation_defaults():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "write_memory",
+                                "tool_name": "MemoryWriteSkill",
+                                "arguments": {"note": "planner wants memory"},
+                                "reason": "visual landmark",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        openclaw_visual_mode="describe",
+        visual_analyzer=FakeVisualAnalyzer(),
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 2},
+            "runtime_context": {"current_image_path": "/tmp/current.png"},
+        }
+    )
+
+    assert decision["intent"] == "write_memory"
+    assert decision["arguments"]["caption"] == "caption for /tmp/current.png"
+    assert decision["arguments"]["visual_observation"] == "doorway visible in /tmp/current.png"
+    assert decision["arguments"]["landmarks"] == ["doorway"]
+
+
+def test_cli_plan_gateway_agent_prompt_uses_minimal_payload():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "minimal context",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(run_openclaw=runner, planner_mode="agent")
+
+    planner.plan_payload(
+        {
+            "state": {
+                "instruction": "go",
+                "step_id": 2,
+                "last_action": "TURN_LEFT",
+                "success": True,
+            },
+            "runtime_context": {
+                "policy_action": "TURN_LEFT",
+                "current_image_path": "/tmp/current.png",
+                "recent_keyframe_paths": ["/tmp/key0.png"],
+                "keyframe_candidate": {
+                    "step_id": 2,
+                    "reason": "interval",
+                    "image_path": "/tmp/current.png",
+                    "raw_frame": "x" * 2000,
+                },
+                "memory_context_text": "m" * 2000,
+                "recent_frames": ["frame"] * 20,
+                "distance_to_goal": 1.0,
+            },
+        }
+    )
+
+    message = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    payload_text = message.split("Payload:\n", 1)[1]
+    prompt_payload = json.loads(payload_text)
+    assert prompt_payload == {
+        "state": {
+            "instruction": "go",
+            "last_action": "TURN_LEFT",
+            "step_id": 2,
+        },
+        "runtime_context": {
+            "current_image_path": "/tmp/current.png",
+            "keyframe_candidate": {
+                "image_path": "/tmp/current.png",
+                "reason": "interval",
+                "step_id": 2,
+            },
+            "policy_action": "TURN_LEFT",
+            "recent_keyframe_paths": ["/tmp/key0.png"],
+        },
+    }
+    assert len(message) < 1500
+    assert "distance_to_goal" not in message
+    assert "memory_context_text" not in message
+    assert "raw_frame" not in message
+
+
+def test_cli_plan_gateway_agent_mode_passes_openclaw_profile():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "profile",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        openclaw_profile="clawnav-vln-min",
+    )
+
+    planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    assert runner.calls[0][0][:3] == ["openclaw", "--profile", "clawnav-vln-min"]
+    assert runner.calls[0][0][3:6] == ["agent", "--agent", "main"]
 
 
 def test_cli_plan_gateway_agent_mode_falls_back_to_heuristic_when_agent_fails():

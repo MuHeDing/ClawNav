@@ -1,6 +1,19 @@
 from harness.config import HarnessConfig
+from harness.memory.spatial_memory_client import BaseSpatialMemoryClient
 from harness.memory.memory_manager import MemoryManager
 from harness.memory.spatial_memory_client import FakeSpatialMemoryClient
+from harness.types import MemoryHit
+
+
+class RecordingMemoryClient(BaseSpatialMemoryClient):
+    def __init__(self, hits):
+        super().__init__(memory_source="episode-local")
+        self.hits = hits
+        self.queries = []
+
+    def query_semantic(self, text: str, n_results: int = 5):
+        self.queries.append((text, n_results))
+        return self.hits[:n_results]
 
 
 def test_memory_manager_splits_contexts():
@@ -24,3 +37,72 @@ def test_memory_manager_proposes_write_without_side_effect():
     decision = manager.propose_write(step_id=0, image_path="frame.jpg", note="start")
     assert decision["should_write"] is True
     assert decision["write_type"] == "episodic_keyframe"
+
+
+def test_memory_manager_recall_uses_visual_fields_in_policy_context():
+    hit = MemoryHit(
+        memory_id="m1",
+        memory_type="place",
+        name="hallway",
+        confidence=0.9,
+        evidence_text="remembered hallway",
+        image_path="/tmp/keyframe.png",
+        metadata={
+            "caption": "A hallway with a doorway ahead.",
+            "objects": ["doorway"],
+            "landmarks": ["doorway"],
+            "place_category": "hallway",
+            "spatial_cues": ["doorway ahead"],
+            "navigation_relevance": "Route anchor toward kitchen.",
+            "memory_scope": "episode",
+            "memory_namespace": "episode:s1:e1",
+        },
+    )
+    manager = MemoryManager(RecordingMemoryClient([hit]), HarnessConfig())
+
+    result = manager.recall(text="go to kitchen", step_id=3, reason="initial")
+
+    assert "A hallway with a doorway ahead." in result.policy_context["memory_context_text"]
+    assert "doorway ahead" in result.policy_context["memory_context_text"]
+    assert result.policy_context["memory_images"] == ["/tmp/keyframe.png"]
+    assert result.control_context["best_landmark"] == "doorway"
+    assert result.control_context["recall_confidence"] == 0.9
+    assert result.executor_context["topological_anchor"] == "doorway"
+
+
+def test_memory_manager_recall_builds_query_from_visual_context_and_filters_namespace():
+    matching = MemoryHit(
+        memory_id="m1",
+        memory_type="place",
+        name="doorway",
+        confidence=0.9,
+        metadata={"memory_scope": "episode", "memory_namespace": "episode:s1:e1"},
+    )
+    other_episode = MemoryHit(
+        memory_id="m2",
+        memory_type="place",
+        name="doorway",
+        confidence=0.8,
+        metadata={"memory_scope": "episode", "memory_namespace": "episode:s1:e2"},
+    )
+    client = RecordingMemoryClient([matching, other_episode])
+    manager = MemoryManager(client, HarnessConfig())
+
+    result = manager.recall(
+        text="go to kitchen",
+        step_id=4,
+        reason="uncertain",
+        active_subgoal="find doorway",
+        visual_observation="sofa on right",
+        planner_reason="planner uncertain",
+        critic_signal="oscillation",
+        allowed_scopes=["episode"],
+        memory_namespace="episode:s1:e1",
+    )
+
+    query_text, _ = client.queries[0]
+    assert "go to kitchen" in query_text
+    assert "find doorway" in query_text
+    assert "sofa on right" in query_text
+    assert "oscillation" in query_text
+    assert [hit.memory_id for hit in result.hits] == ["m1"]

@@ -35,6 +35,8 @@ ACTION_ARGUMENT_KEYS = (
     "forced_action_text",
 )
 
+OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX = "openclaw_cli_agent_fallback:"
+
 
 @dataclass
 class OpenClawRuntimeStepResult:
@@ -77,6 +79,7 @@ class OpenClawVLNRuntime:
     ) -> OpenClawRuntimeStepResult:
         planner_error = ""
         planner_fallback = False
+        image_paths_used = self._image_paths_used(payload)
         try:
             decision = self.planner.plan(state, runtime_context=payload)
         except Exception as exc:
@@ -95,15 +98,36 @@ class OpenClawVLNRuntime:
             decision = self.fallback_planner.plan(state, runtime_context=payload)
             planner_fallback = True
         tool_calls: List[Dict[str, Any]] = []
+
+        if self._is_cli_agent_fallback_decision(decision):
+            metadata = self._metadata(decision, tool_calls, image_paths_used)
+            metadata["planner_agent_fallback"] = True
+            metadata["planner_fallback"] = planner_fallback
+            planner_error = str(decision.arguments.get("planner_error") or decision.reason)
+            if planner_error:
+                metadata["planner_error"] = planner_error
+            return OpenClawRuntimeStepResult(
+                ok=False,
+                action_text="STOP",
+                executor_command=self.executor.command_for_action("STOP"),
+                runtime_metadata=metadata,
+                error=planner_error or "openclaw_cli_agent_fallback",
+            )
+
         nav_payload = self._navigation_payload(payload)
 
         if decision.intent in PRE_ACTION_INTENTS:
             arguments = dict(decision.arguments)
             self._merge_navigation_context(nav_payload, arguments)
+            if decision.intent == "recall_memory":
+                arguments = self._memory_query_arguments(state, payload, arguments)
             if decision.intent == "write_memory":
-                candidate = payload.get("keyframe_candidate") or {}
-                arguments = {**candidate, **arguments}
-                arguments.setdefault("write_type", "episodic_keyframe")
+                arguments = self._memory_write_arguments(payload, arguments)
+            if decision.intent == "write_memory":
+                curator_result = self._curate_memory_write(state, arguments)
+                if curator_result:
+                    tool_calls.append(curator_result)
+                    arguments = self._apply_curator_result(arguments, curator_result)
             tool_result = self.tool_adapter.call_tool(
                 decision.tool_name,
                 arguments,
@@ -118,7 +142,14 @@ class OpenClawVLNRuntime:
 
         planned_action_text = self._planned_action_text(decision.arguments)
         if planned_action_text:
-            metadata = self._metadata(decision, tool_calls)
+            metadata = self._metadata(
+                decision,
+                tool_calls,
+                image_paths_used,
+                state=state,
+                runtime_context=payload,
+                action_text=planned_action_text,
+            )
             metadata["planner_action_override"] = planned_action_text
             metadata["policy_skipped"] = True
             if planner_error:
@@ -138,7 +169,15 @@ class OpenClawVLNRuntime:
         )
         tool_calls.append(nav_result)
 
-        metadata = self._metadata(decision, tool_calls)
+        action_text = str(nav_result.get("payload", {}).get("action_text") or "STOP")
+        metadata = self._metadata(
+            decision,
+            tool_calls,
+            image_paths_used,
+            state=state,
+            runtime_context=payload,
+            action_text=action_text,
+        )
         if planner_error:
             metadata["planner_error"] = planner_error
         metadata["planner_fallback"] = planner_fallback
@@ -150,7 +189,6 @@ class OpenClawVLNRuntime:
                 error=nav_result.get("error") or "navigation_failed",
             )
 
-        action_text = str(nav_result.get("payload", {}).get("action_text") or "STOP")
         return OpenClawRuntimeStepResult(
             ok=True,
             action_text=action_text,
@@ -158,8 +196,16 @@ class OpenClawVLNRuntime:
             runtime_metadata=metadata,
         )
 
-    def _metadata(self, decision, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return {
+    def _metadata(
+        self,
+        decision,
+        tool_calls: List[Dict[str, Any]],
+        image_paths_used: Optional[List[str]] = None,
+        state: Optional[VLNState] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+        action_text: str = "",
+    ) -> Dict[str, Any]:
+        metadata = {
             "runtime_mode": "openclaw_bridge",
             "planner_backend": decision.planner_backend,
             "planned_intent": decision.intent,
@@ -167,6 +213,168 @@ class OpenClawVLNRuntime:
             "planner_reason": decision.reason,
             "tool_calls": [self._summarize_tool_call(call) for call in tool_calls],
         }
+        if image_paths_used:
+            metadata["image_paths_used"] = image_paths_used
+        memory_writes = self._memory_writes(tool_calls)
+        if memory_writes:
+            metadata["memory_writes"] = memory_writes
+        visual_analysis = self._visual_analysis(tool_calls)
+        if visual_analysis:
+            metadata["visual_analysis"] = visual_analysis
+        recall_usage = self._recall_usage(
+            tool_calls,
+            decision=decision,
+            state=state,
+            runtime_context=runtime_context or {},
+            action_text=action_text,
+        )
+        if recall_usage:
+            metadata["recall_usage"] = recall_usage
+        return metadata
+
+    def _curate_memory_write(
+        self,
+        state: VLNState,
+        arguments: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if self.tool_adapter.get_tool_schema("VisualMemoryCuratorSkill") is None:
+            return None
+        return self.tool_adapter.call_tool(
+            "VisualMemoryCuratorSkill",
+            arguments,
+            state=state,
+        )
+
+    def _apply_curator_result(
+        self,
+        arguments: Dict[str, Any],
+        curator_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload = curator_result.get("payload")
+        if not isinstance(payload, dict):
+            return arguments
+        enriched = dict(arguments)
+        if "should_write" in payload:
+            enriched["should_write"] = bool(payload.get("should_write"))
+        write_gate = payload.get("write_gate")
+        if isinstance(write_gate, dict):
+            enriched["write_gate"] = write_gate
+        return enriched
+
+    def _image_paths_used(self, payload: Dict[str, Any]) -> List[str]:
+        paths: List[str] = []
+        for value in [payload.get("current_image_path")]:
+            if isinstance(value, str) and value:
+                paths.append(value)
+        recent_paths = payload.get("recent_keyframe_paths") or []
+        if isinstance(recent_paths, list):
+            for value in recent_paths:
+                if isinstance(value, str) and value:
+                    paths.append(value)
+        deduped: List[str] = []
+        for path in paths:
+            if path not in deduped:
+                deduped.append(path)
+        return deduped
+
+    def _memory_write_arguments(
+        self,
+        payload: Dict[str, Any],
+        arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidate = payload.get("keyframe_candidate") or {}
+        if not isinstance(candidate, dict):
+            candidate = {}
+        enriched = {**candidate, **arguments}
+        if not enriched.get("image_path"):
+            current_image_path = payload.get("current_image_path")
+            if isinstance(current_image_path, str) and current_image_path:
+                enriched["image_path"] = current_image_path
+        visual_observation = self._matching_visual_observation(
+            payload,
+            str(enriched.get("image_path") or ""),
+        )
+        if visual_observation:
+            for key in (
+                "caption",
+                "visual_observation",
+                "objects",
+                "landmarks",
+                "place_category",
+                "spatial_cues",
+                "navigation_relevance",
+                "confidence",
+            ):
+                if key in visual_observation and key not in enriched:
+                    enriched[key] = visual_observation[key]
+        if "write_gate" not in enriched:
+            enriched["write_gate"] = self._default_write_gate(payload, visual_observation)
+        enriched.setdefault("should_write", True)
+        enriched.setdefault("write_type", "episodic_keyframe")
+        return enriched
+
+    def _memory_query_arguments(
+        self,
+        state: VLNState,
+        payload: Dict[str, Any],
+        arguments: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        enriched = dict(arguments)
+        if not enriched.get("visual_observation"):
+            visual_observation = self._matching_visual_observation(
+                payload,
+                str(payload.get("current_image_path") or ""),
+            )
+            if visual_observation.get("visual_observation"):
+                enriched["visual_observation"] = visual_observation["visual_observation"]
+        enriched.setdefault("allowed_scopes", ["episode"])
+        if not enriched.get("memory_namespace"):
+            enriched["memory_namespace"] = f"episode:{state.scene_id}:{state.episode_id}"
+        return enriched
+
+    def _matching_visual_observation(
+        self,
+        payload: Dict[str, Any],
+        image_path: str,
+    ) -> Dict[str, Any]:
+        observations = payload.get("visual_observations")
+        if not isinstance(observations, list):
+            return {}
+        fallback: Dict[str, Any] = {}
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            if not fallback:
+                fallback = observation
+            if image_path and observation.get("image_path") == image_path:
+                return observation
+        return fallback
+
+    def _default_write_gate(
+        self,
+        payload: Dict[str, Any],
+        visual_observation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidate_reason = "planner_request"
+        if payload.get("keyframe_candidate"):
+            candidate_reason = "keyframe_candidate"
+        return {
+            "candidate_reason": candidate_reason,
+            "curator_decision": "write",
+            "curator_reason": str(
+                visual_observation.get("navigation_relevance")
+                or visual_observation.get("visual_observation")
+                or "planner requested visual memory write"
+            ),
+            "confidence": visual_observation.get("confidence"),
+        }
+
+    def _is_cli_agent_fallback_decision(self, decision) -> bool:
+        reason = getattr(decision, "reason", "")
+        return (
+            isinstance(reason, str)
+            and reason.startswith(OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX)
+        )
 
     def _navigation_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -233,6 +441,10 @@ class OpenClawVLNRuntime:
             for key in (
                 "action_text",
                 "images_used",
+                "image_path",
+                "caption",
+                "visual_observation",
+                "write_gate",
                 "instruction",
                 "active_subgoal",
                 "memory_context_text",
@@ -250,3 +462,125 @@ class OpenClawVLNRuntime:
             "error": call.get("error"),
             "payload_summary": payload_summary,
         }
+
+    def _memory_writes(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        writes: List[Dict[str, Any]] = []
+        for call in tool_calls:
+            if call.get("tool_name") != "MemoryWriteSkill":
+                continue
+            payload = call.get("payload") or {}
+            record = payload.get("record") if isinstance(payload, dict) else {}
+            if not isinstance(record, dict):
+                record = {}
+            writes.append(
+                {
+                    "written": bool(payload.get("written")) if isinstance(payload, dict) else False,
+                    "skipped": bool(payload.get("skipped")) if isinstance(payload, dict) else False,
+                    "skip_reason": payload.get("skip_reason", "") if isinstance(payload, dict) else "",
+                    "image_path": record.get("image_path") or payload.get("image_path"),
+                    "memory_scope": record.get("memory_scope") or payload.get("memory_scope"),
+                    "memory_namespace": record.get("memory_namespace") or payload.get("memory_namespace"),
+                    "memory_source": record.get("memory_source") or payload.get("memory_source"),
+                    "write_gate": record.get("write_gate") or payload.get("write_gate", {}),
+                }
+            )
+        return writes
+
+    def _visual_analysis(self, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for call in tool_calls:
+            if call.get("tool_name") != "MemoryWriteSkill":
+                continue
+            payload = call.get("payload") or {}
+            record = payload.get("record") if isinstance(payload, dict) else {}
+            if not isinstance(record, dict):
+                record = {}
+            visual_payload = record or payload
+            if visual_payload.get("caption") or visual_payload.get("visual_observation"):
+                return {
+                    "ran": True,
+                    "image_path": visual_payload.get("image_path", ""),
+                    "caption": visual_payload.get("caption", ""),
+                    "visual_observation": visual_payload.get("visual_observation", ""),
+                    "latency_ms": call.get("latency_ms"),
+                }
+        return {}
+
+    def _recall_usage(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        decision,
+        state: Optional[VLNState],
+        runtime_context: Dict[str, Any],
+        action_text: str,
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        for call in tool_calls:
+            if call.get("tool_name") != "MemoryQuerySkill":
+                continue
+            payload = call.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            hits = payload.get("memory_hits") or []
+            hit_ids = []
+            hit_image_paths = []
+            hit_captions = []
+            for hit in hits:
+                memory_id = getattr(hit, "memory_id", None)
+                image_path = getattr(hit, "image_path", None)
+                metadata = getattr(hit, "metadata", {}) or {}
+                caption = metadata.get("caption", "")
+                if memory_id:
+                    hit_ids.append(memory_id)
+                if image_path:
+                    hit_image_paths.append(image_path)
+                if caption:
+                    hit_captions.append(caption)
+            policy_context = payload.get("policy_context") or {}
+            control_context = payload.get("control_context") or {}
+            action_before = self._normalize_action_text(runtime_context.get("policy_action")) or ""
+            action_after = self._normalize_action_text(action_text) or ""
+            decision_arguments = getattr(decision, "arguments", {}) or {}
+            if not isinstance(decision_arguments, dict):
+                decision_arguments = {}
+            events.append(
+                {
+                    "event_type": "memory_recall",
+                    "step_id": payload.get(
+                        "step_id",
+                        decision_arguments.get(
+                            "step_id",
+                            state.step_id if state is not None else None,
+                        ),
+                    ),
+                    "query_text": payload.get("query", ""),
+                    "allowed_scopes": payload.get("allowed_scopes")
+                    or decision_arguments.get("allowed_scopes", []),
+                    "selected_namespace": payload.get("memory_namespace")
+                    or decision_arguments.get("memory_namespace", ""),
+                    "num_hits": len(hits),
+                    "hit_ids": hit_ids,
+                    "hit_image_paths": hit_image_paths,
+                    "hit_captions": hit_captions,
+                    "best_hit_id": hit_ids[0] if hit_ids else "",
+                    "recall_confidence": control_context.get(
+                        "recall_confidence",
+                        control_context.get("confidence", 0.0),
+                    ),
+                    "used_by_planner": decision.intent == "recall_memory",
+                    "used_by_policy": bool(
+                        policy_context.get("memory_context_text")
+                        or policy_context.get("memory_images")
+                    ),
+                    "used_by_critic": bool(control_context),
+                    "planner_intent_before_recall": decision.intent,
+                    "planner_intent_after_recall": decision.intent,
+                    "action_before_recall": action_before,
+                    "action_after_recall": action_after,
+                    "action_changed_after_recall": bool(
+                        action_before and action_after and action_before != action_after
+                    ),
+                    "stop_blocked_after_recall": False,
+                    "replan_created_after_recall": decision.intent == "replan",
+                }
+            )
+        return events

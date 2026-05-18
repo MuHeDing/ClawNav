@@ -13,6 +13,8 @@ def test_build_query_payload_includes_protocol_fields():
         text="kitchen",
         n_results=3,
         memory_source="episode-local",
+        allowed_scopes=["episode"],
+        memory_namespace="episode:s1:e1",
     )
 
     assert payload["protocol_version"] == SPATIAL_MEMORY_PROTOCOL_VERSION
@@ -20,6 +22,8 @@ def test_build_query_payload_includes_protocol_fields():
     assert payload["text"] == "kitchen"
     assert payload["n_results"] == 3
     assert payload["memory_source"] == "episode-local"
+    assert payload["allowed_scopes"] == ["episode"]
+    assert payload["memory_namespace"] == "episode:s1:e1"
 
 
 def test_normalize_memory_result_maps_evidence_fields():

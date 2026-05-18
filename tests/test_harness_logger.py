@@ -139,3 +139,43 @@ def test_logger_writes_openclaw_runtime_defaults(tmp_path):
     assert record["planner_reason"] == ""
     assert record["runtime_executor"] == ""
     assert record["tool_calls"] == []
+
+
+def test_logger_writes_recall_usage_metadata(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+
+    record = logger.log_step(
+        make_state(),
+        intent="recall_memory",
+        skill="MemoryQuerySkill",
+        runtime={
+            "recall_usage": [
+                {
+                    "event_type": "memory_recall",
+                    "query_text": "go to kitchen",
+                    "allowed_scopes": ["episode"],
+                    "selected_namespace": "episode:scene1:episode1",
+                    "num_hits": 1,
+                    "hit_ids": ["m1"],
+                    "hit_image_paths": ["/tmp/keyframe.png"],
+                    "used_by_planner": True,
+                    "used_by_policy": False,
+                    "used_by_critic": True,
+                    "action_changed_after_recall": True,
+                }
+            ],
+            "memory_writes": [
+                {
+                    "memory_scope": "episode",
+                    "memory_namespace": "episode:scene1:episode1",
+                    "write_gate": {"curator_decision": "write"},
+                }
+            ],
+        },
+    )
+
+    event = record["recall_usage"][0]
+    assert event["event_type"] == "memory_recall"
+    assert event["used_by_planner"] is True
+    assert event["action_changed_after_recall"] is True
+    assert record["memory_writes"][0]["memory_namespace"] == "episode:scene1:episode1"

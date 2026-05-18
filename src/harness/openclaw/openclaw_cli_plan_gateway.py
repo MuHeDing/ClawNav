@@ -2,9 +2,11 @@ import argparse
 import json
 import re
 import subprocess
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from harness.openclaw.gateway_server import make_gateway_server
+from harness.openclaw.visual_analyzer import OpenClawVisualAnalyzer
 
 
 OpenClawRunner = Callable[[List[str], float], subprocess.CompletedProcess]
@@ -32,6 +34,15 @@ ACTION_ALIASES = {
     "RIGHT": "TURN_RIGHT",
 }
 
+PROMPT_STATE_KEYS = ("instruction", "step_id", "last_action")
+PROMPT_RUNTIME_CONTEXT_KEYS = (
+    "policy_action",
+    "current_image_path",
+    "recent_keyframe_paths",
+)
+PROMPT_KEYFRAME_KEYS = ("step_id", "reason", "image_path")
+MAX_PROMPT_RECENT_KEYFRAME_PATHS = 2
+
 
 def run_openclaw_command(args: List[str], timeout_s: float) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -53,6 +64,13 @@ class OpenClawCliPlanPlanner:
         planner_mode: str = "heuristic",
         agent_id: str = "main",
         agent_timeout_s: float = 60.0,
+        openclaw_profile: str = "",
+        agent_session_id: str = "",
+        openclaw_visual_mode: str = "path",
+        openclaw_visual_max_images: int = 2,
+        openclaw_visual_timeout_ms: int = 30000,
+        openclaw_visual_model: str = "",
+        visual_analyzer: Any = None,
     ) -> None:
         self.recall_interval_steps = max(1, recall_interval_steps)
         self.run_openclaw = run_openclaw
@@ -61,6 +79,17 @@ class OpenClawCliPlanPlanner:
         self.planner_mode = planner_mode
         self.agent_id = agent_id
         self.agent_timeout_s = agent_timeout_s
+        self.openclaw_profile = openclaw_profile
+        self.agent_session_id = agent_session_id or f"clawnav-{uuid.uuid4().hex}"
+        self.openclaw_visual_mode = openclaw_visual_mode
+        self.openclaw_visual_max_images = max(0, openclaw_visual_max_images)
+        self.visual_analyzer = visual_analyzer
+        if self.visual_analyzer is None and self.openclaw_visual_mode == "describe":
+            self.visual_analyzer = OpenClawVisualAnalyzer(
+                run_openclaw=run_openclaw,
+                model=openclaw_visual_model,
+                timeout_ms=openclaw_visual_timeout_ms,
+            )
 
     def health_payload(self) -> Dict[str, Any]:
         health = self._gateway_health()
@@ -111,28 +140,37 @@ class OpenClawCliPlanPlanner:
         }
 
     def _agent_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = self._agent_prompt(payload)
-        args = [
-            "openclaw",
+        prompt_payload = self._prompt_payload(payload)
+        prompt = self._agent_prompt_from_prompt_payload(prompt_payload)
+        args = self._openclaw_args(
             "agent",
             "--agent",
             self.agent_id,
             "--json",
+            "--session-id",
+            self.agent_session_id,
             "--message",
             prompt,
             "--timeout",
             str(int(self.agent_timeout_s)),
-        ]
+        )
         result = self.run_openclaw(args, self.agent_timeout_s)
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "openclaw agent failed").strip()
             raise RuntimeError(message)
         agent_text = self._agent_visible_text(result.stdout or "")
         decision = self._extract_json_object(agent_text)
-        return self._normalize_decision(decision)
+        normalized = self._normalize_decision(decision)
+        self._enrich_write_memory_with_visual_observation(normalized, prompt_payload)
+        return normalized
 
     def _agent_prompt(self, payload: Dict[str, Any]) -> str:
-        compact_payload = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        prompt_payload = self._prompt_payload(payload)
+        return self._agent_prompt_from_prompt_payload(prompt_payload)
+
+    def _agent_prompt_from_prompt_payload(self, prompt_payload: Dict[str, Any]) -> str:
+        compact_payload = json.dumps(prompt_payload, ensure_ascii=True, sort_keys=True)
+        visual_context_lines = self._visual_context_lines(prompt_payload)
         return "\n".join(
             [
                 "You are the OpenClaw LLM planner brain for ClawNav.",
@@ -152,11 +190,148 @@ class OpenClawCliPlanPlanner:
                 "arguments.action_text must be one of STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT.",
                 "For replan, also put the recovery instruction in arguments.active_subgoal.",
                 "Do not bury mandatory action commands only in reason.",
+                "For write_memory add visual fields and write_gate.",
+                "write_gate has candidate_reason, curator_decision write|skip, curator_reason, confidence.",
+                "Use episode memory for current; scene memory only approved prior. No future/oracle evidence.",
                 "Use act unless memory recall/write, progress verification, or replanning is useful before the next navigation action.",
+                *visual_context_lines,
                 "Payload:",
                 compact_payload,
             ]
         )
+
+    def _enrich_write_memory_with_visual_observation(
+        self,
+        decision: Dict[str, Any],
+        prompt_payload: Dict[str, Any],
+    ) -> None:
+        if decision.get("intent") != "write_memory":
+            return
+        arguments = decision.get("arguments")
+        if not isinstance(arguments, dict):
+            return
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if not isinstance(runtime_context, dict):
+            return
+        observations = runtime_context.get("visual_observations") or []
+        if not isinstance(observations, list):
+            return
+        image_path = str(arguments.get("image_path") or runtime_context.get("current_image_path") or "")
+        selected: Dict[str, Any] = {}
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            if not selected:
+                selected = observation
+            if image_path and observation.get("image_path") == image_path:
+                selected = observation
+                break
+        if not selected:
+            return
+        for key in (
+            "image_path",
+            "caption",
+            "visual_observation",
+            "objects",
+            "landmarks",
+            "spatial_cues",
+            "navigation_relevance",
+            "confidence",
+        ):
+            if key in selected and key not in arguments:
+                arguments[key] = selected[key]
+
+    def _prompt_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        state = payload.get("state") or {}
+        prompt_state = self._copy_keys(state, PROMPT_STATE_KEYS)
+        runtime_context = payload.get("runtime_context") or {}
+        prompt_runtime_context = self._copy_keys(
+            runtime_context,
+            PROMPT_RUNTIME_CONTEXT_KEYS,
+        )
+        recent_paths = prompt_runtime_context.get("recent_keyframe_paths")
+        if isinstance(recent_paths, list):
+            prompt_runtime_context["recent_keyframe_paths"] = recent_paths[
+                -MAX_PROMPT_RECENT_KEYFRAME_PATHS:
+            ]
+        keyframe_candidate = runtime_context.get("keyframe_candidate")
+        if isinstance(keyframe_candidate, dict):
+            prompt_keyframe = self._copy_keys(keyframe_candidate, PROMPT_KEYFRAME_KEYS)
+            if prompt_keyframe:
+                prompt_runtime_context["keyframe_candidate"] = prompt_keyframe
+        if self.openclaw_visual_mode == "describe" and prompt_runtime_context:
+            visual_observations = self._visual_observations(prompt_runtime_context)
+            if visual_observations:
+                prompt_runtime_context["visual_observations"] = visual_observations
+        prompt_payload: Dict[str, Any] = {"state": prompt_state}
+        if prompt_runtime_context:
+            prompt_payload["runtime_context"] = prompt_runtime_context
+        return prompt_payload
+
+    def _copy_keys(self, data: Any, keys) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        copied: Dict[str, Any] = {}
+        for key in keys:
+            value = data.get(key)
+            if value is not None and value != "":
+                copied[key] = value
+        return copied
+
+    def _visual_observations(self, runtime_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if self.visual_analyzer is None:
+            return []
+        image_paths = self._visual_analysis_paths(runtime_context)
+        if not image_paths:
+            return []
+        return self.visual_analyzer.analyze(image_paths)
+
+    def _visual_context_lines(self, payload: Dict[str, Any]) -> List[str]:
+        runtime_context = payload.get("runtime_context") or {}
+        if not isinstance(runtime_context, dict):
+            return []
+        deduped = self._visual_image_paths(runtime_context)
+        if not deduped:
+            return []
+        return [
+            "Visual context image paths: " + json.dumps(deduped, ensure_ascii=True),
+        ]
+
+    def _visual_image_paths(self, runtime_context: Dict[str, Any]) -> List[str]:
+        current_image_path = runtime_context.get("current_image_path")
+        recent_keyframe_paths = runtime_context.get("recent_keyframe_paths") or []
+        image_paths: List[str] = []
+        if isinstance(current_image_path, str) and current_image_path:
+            image_paths.append(current_image_path)
+        if isinstance(recent_keyframe_paths, list):
+            image_paths.extend(
+                path for path in recent_keyframe_paths if isinstance(path, str) and path
+            )
+        deduped: List[str] = []
+        for path in image_paths:
+            if path not in deduped:
+                deduped.append(path)
+        return deduped
+
+    def _visual_analysis_paths(self, runtime_context: Dict[str, Any]) -> List[str]:
+        image_paths = self._visual_image_paths(runtime_context)
+        if self.openclaw_visual_max_images <= 0:
+            return []
+        if len(image_paths) <= self.openclaw_visual_max_images:
+            return image_paths
+        current_path = runtime_context.get("current_image_path")
+        selected: List[str] = []
+        if isinstance(current_path, str) and current_path:
+            selected.append(current_path)
+        remaining_slots = self.openclaw_visual_max_images - len(selected)
+        if remaining_slots > 0:
+            recent_paths = [
+                path
+                for path in image_paths
+                if path not in selected
+            ]
+            selected.extend(recent_paths[-remaining_slots:])
+        return selected[: self.openclaw_visual_max_images]
 
     def _agent_visible_text(self, stdout: str) -> str:
         try:
@@ -246,7 +421,7 @@ class OpenClawCliPlanPlanner:
         return ""
 
     def _gateway_health(self) -> Dict[str, Any]:
-        args = ["openclaw", "gateway", "call", "health", "--json"]
+        args = self._openclaw_args("gateway", "call", "health", "--json")
         if self.gateway_url:
             args.extend(["--url", self.gateway_url])
         args.extend(["--timeout", str(int(self.timeout_s * 1000))])
@@ -261,6 +436,13 @@ class OpenClawCliPlanPlanner:
         if not isinstance(data, dict) or not data.get("ok"):
             raise RuntimeError("openclaw gateway health is not ok")
         return data
+
+    def _openclaw_args(self, *args: str) -> List[str]:
+        command = ["openclaw"]
+        if self.openclaw_profile:
+            command.extend(["--profile", self.openclaw_profile])
+        command.extend(args)
+        return command
 
     def _memory_recall(
         self,
@@ -292,6 +474,12 @@ def main() -> None:
     parser.add_argument("--planner_mode", choices=("heuristic", "agent"), default="heuristic")
     parser.add_argument("--agent_id", default="main")
     parser.add_argument("--agent_timeout", type=float, default=60.0)
+    parser.add_argument("--openclaw_profile", default="")
+    parser.add_argument("--agent_session_id", default="")
+    parser.add_argument("--openclaw_visual_mode", choices=("path", "describe"), default="path")
+    parser.add_argument("--openclaw_visual_max_images", type=int, default=2)
+    parser.add_argument("--openclaw_visual_timeout_ms", type=int, default=30000)
+    parser.add_argument("--openclaw_visual_model", default="")
     args = parser.parse_args()
 
     planner = OpenClawCliPlanPlanner(
@@ -301,6 +489,12 @@ def main() -> None:
         planner_mode=args.planner_mode,
         agent_id=args.agent_id,
         agent_timeout_s=args.agent_timeout,
+        openclaw_profile=args.openclaw_profile,
+        agent_session_id=args.agent_session_id,
+        openclaw_visual_mode=args.openclaw_visual_mode,
+        openclaw_visual_max_images=args.openclaw_visual_max_images,
+        openclaw_visual_timeout_ms=args.openclaw_visual_timeout_ms,
+        openclaw_visual_model=args.openclaw_visual_model,
     )
     server = make_gateway_server(args.host, args.port, planner)
     print(

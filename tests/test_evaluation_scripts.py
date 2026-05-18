@@ -53,3 +53,32 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
 
     assert "harness.openclaw.openclaw_cli_plan_gateway" in contents
     assert "OPENCLAW_GATEWAY_WS_URL" in contents
+    assert "OPENCLAW_VISUAL_MODE" in contents
+    assert "--openclaw_visual_mode" in contents
+    assert "--openclaw_visual_model" in contents
+
+
+def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "evaluation_openclaw_visual_memory.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "OPENCLAW_VISUAL_MODE=${OPENCLAW_VISUAL_MODE:-describe}" in contents
+    assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-vl}" in contents
+    assert "scripts/check_openclaw_visual_plan_gateway.py" in contents
+    assert "REQUIRE_VISUAL_GATEWAY=${REQUIRE_VISUAL_GATEWAY:-1}" in contents
+    assert "./scripts/evaluation_openclaw_gateway.sh" in contents
+
+
+def test_openclaw_gateway_script_can_enable_visual_memory_curator_and_critic():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "OPENCLAW_ENABLE_SUBAGENT_CRITIC=${OPENCLAW_ENABLE_SUBAGENT_CRITIC:-0}" in contents
+    assert (
+        "OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR=${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR:-0}"
+        in contents
+    )
+    assert "--openclaw_enable_subagent_critic" in contents
+    assert "--openclaw_enable_subagent_memory_curator" in contents

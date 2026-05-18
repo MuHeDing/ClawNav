@@ -10,6 +10,11 @@ def test_phase4_research_system_doc_exists():
     assert "Train-Scene-Only Memory" in text
     assert "LLM/VLM Subagents" in text
     assert "Ablation Matrix" in text
+    assert "Qwen visual observations" in text
+    assert "write acceptance rate" in text
+    assert "useful recall rate" in text
+    assert "build_openclaw_visual_memory_report.py" in text
+    assert "--require_visual" in text
     assert "No Oracle Decision Inputs" in text
 
 
@@ -20,3 +25,6 @@ def test_external_openclaw_gateway_runbook_exists():
     assert "planner_backend=gateway" in text
     assert "planner_fallback=false" in text
     assert "check_openclaw_plan_gateway.py" in text
+    assert "OPENCLAW_VISUAL_MODE=describe" in text
+    assert "openclaw capability image describe" in text
+    assert "OPENCLAW_VISUAL_MODEL" in text

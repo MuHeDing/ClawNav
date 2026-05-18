@@ -16,6 +16,12 @@ class MemoryQuerySkill(Skill):
             "step_id": {"type": "integer"},
             "reason": {"type": "string"},
             "n_results": {"type": "integer"},
+            "active_subgoal": {"type": "string"},
+            "visual_observation": {"type": "string"},
+            "planner_reason": {"type": "string"},
+            "critic_signal": {"type": "string"},
+            "allowed_scopes": {"type": "array"},
+            "memory_namespace": {"type": "string"},
         },
     }
     output_schema = {
@@ -44,6 +50,12 @@ class MemoryQuerySkill(Skill):
             step_id=step_id,
             reason=reason,
             n_results=n_results,
+            active_subgoal=str(payload.get("active_subgoal") or ""),
+            visual_observation=str(payload.get("visual_observation") or ""),
+            planner_reason=str(payload.get("planner_reason") or ""),
+            critic_signal=str(payload.get("critic_signal") or ""),
+            allowed_scopes=payload.get("allowed_scopes"),
+            memory_namespace=str(payload.get("memory_namespace") or ""),
         )
         return SkillResult.ok_result(
             "memory_query",
@@ -51,6 +63,9 @@ class MemoryQuerySkill(Skill):
                 "memory_hits": recall.hits,
                 "query": recall.query,
                 "backend": recall.backend,
+                "step_id": step_id,
+                "allowed_scopes": payload.get("allowed_scopes") or [],
+                "memory_namespace": str(payload.get("memory_namespace") or ""),
                 "policy_context": recall.policy_context,
                 "control_context": recall.control_context,
                 "executor_context": recall.executor_context,

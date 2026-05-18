@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from evaluation_harness import HarnessModelProxy, build_harness_components
@@ -16,6 +17,14 @@ class FakeBaseModel:
 
     def consume_last_visual_prune_profile(self):
         return None
+
+
+class SaveableFrame:
+    def __init__(self, text):
+        self.text = text
+
+    def save(self, path):
+        path.write_text(self.text, encoding="utf-8")
 
 
 def make_args(tmp_path, **overrides):
@@ -53,6 +62,15 @@ def test_build_components_creates_openclaw_runtime_when_requested(tmp_path):
 
     assert components["openclaw_runtime"] is not None
     assert components["config"].harness_runtime == "openclaw_bridge"
+
+
+def test_build_components_registers_visual_memory_curator_when_enabled(tmp_path):
+    components = build_harness_components(
+        make_args(tmp_path, openclaw_enable_subagent_memory_curator=True),
+        model=FakeBaseModel(),
+    )
+
+    assert "VisualMemoryCuratorSkill" in components["skill_registry"].names()
 
 
 def test_build_components_leaves_runtime_off_by_default(tmp_path):
@@ -172,6 +190,27 @@ def test_proxy_payload_exposes_keyframe_candidate_without_image_object(tmp_path)
     assert payload["keyframe_candidate"]["step_id"] == 0
     assert "image" not in payload["keyframe_candidate"]
     assert payload["keyframe_candidate"]["reason"] == "interval"
+
+
+def test_proxy_payload_exposes_current_image_path_and_recent_keyframe_paths(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(make_args(tmp_path), model=base_model)
+    proxy = HarnessModelProxy(base_model, components)
+    proxy.start_episode("scene-a", "episode-1")
+
+    first_payload = proxy._runtime_payload([SaveableFrame("first")], step_id=0)
+    second_payload = proxy._runtime_payload([SaveableFrame("second")], step_id=1)
+
+    assert first_payload["current_image_path"]
+    assert first_payload["current_image_path"] == first_payload["keyframe_candidate"]["image_path"]
+    assert first_payload["recent_keyframe_paths"] == [first_payload["current_image_path"]]
+    assert second_payload["current_image_path"]
+    assert second_payload["current_image_path"] != first_payload["current_image_path"]
+    assert second_payload["recent_keyframe_paths"] == [first_payload["current_image_path"]]
+    assert Path(first_payload["current_image_path"]).exists()
+    assert Path(second_payload["current_image_path"]).exists()
+    assert first_payload["current_image_path"].endswith("step_000000.png")
+    assert second_payload["current_image_path"].endswith("step_000001.png")
 
 
 def test_proxy_saves_keyframe_artifact_for_write_memory(tmp_path):
