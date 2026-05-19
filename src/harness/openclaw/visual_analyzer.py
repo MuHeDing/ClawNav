@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -36,10 +37,20 @@ class OpenClawVisualAnalyzer:
 
     def analyze(self, image_paths: List[str]) -> List[Dict[str, Any]]:
         requested = [path for path in image_paths if isinstance(path, str) and path]
+        cached_before = {path for path in requested if path in self._cache}
         missing = [path for path in requested if path not in self._cache]
         if missing:
             self._describe_and_cache(missing)
-        return [dict(self._cache[path]) for path in requested]
+        observations = []
+        for path in requested:
+            observation = dict(self._cache[path])
+            metadata = dict(observation.get("analysis_metadata") or {})
+            if path in cached_before:
+                metadata["cache_hit"] = True
+                metadata["vlm_latency_ms"] = 0.0
+            observation["analysis_metadata"] = metadata
+            observations.append(observation)
+        return observations
 
     def _describe_and_cache(self, image_paths: List[str]) -> None:
         args = [
@@ -56,16 +67,27 @@ class OpenClawVisualAnalyzer:
         args.extend(["--timeout-ms", str(int(self.timeout_ms))])
 
         timeout_s = max(1.0, self.timeout_ms / 1000.0)
+        start = time.perf_counter()
         result = self.run_openclaw(args, timeout_s)
+        latency_ms = (time.perf_counter() - start) * 1000.0
         if result.returncode != 0:
             error = (result.stderr or result.stdout or "openclaw image describe failed").strip()
             for path in image_paths:
-                self._cache[path] = self._fallback_observation(path, error=error)
+                self._cache[path] = self._with_analysis_metadata(
+                    self._fallback_observation(path, error=error),
+                    latency_ms=latency_ms,
+                    error=True,
+                )
             return
 
         parsed = self._parse_stdout(result.stdout or "", image_paths)
         for path in image_paths:
-            self._cache[path] = parsed.get(path) or self._fallback_observation(path)
+            observation = parsed.get(path) or self._fallback_observation(path)
+            self._cache[path] = self._with_analysis_metadata(
+                observation,
+                latency_ms=latency_ms,
+                error=bool(observation.get("error")),
+            )
 
     def _parse_stdout(
         self,
@@ -151,6 +173,22 @@ class OpenClawVisualAnalyzer:
         if error:
             observation["error"] = error
         return observation
+
+    def _with_analysis_metadata(
+        self,
+        observation: Dict[str, Any],
+        latency_ms: float,
+        error: bool = False,
+    ) -> Dict[str, Any]:
+        enriched = dict(observation)
+        enriched["analysis_metadata"] = {
+            "vlm_latency_ms": round(float(latency_ms), 3),
+            "visual_model": self.model,
+            "visual_mode": "describe",
+            "cache_hit": False,
+            "error": error,
+        }
+        return enriched
 
     def _first_text(self, item: Dict[str, Any]) -> str:
         for key in ("caption", "description", "text", "finalAssistantVisibleText"):

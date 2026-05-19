@@ -37,6 +37,13 @@ class FakeVisualAnalyzer:
                 "spatial_cues": ["doorway ahead"],
                 "navigation_relevance": "stable landmark",
                 "confidence": 0.8,
+                "analysis_metadata": {
+                    "vlm_latency_ms": 12.5,
+                    "visual_model": "qwen/qwen3.5-vl",
+                    "visual_mode": "describe",
+                    "cache_hit": path.endswith("key1.png"),
+                    "error": False,
+                },
             }
             for path in image_paths
         ]
@@ -306,6 +313,52 @@ def test_cli_plan_gateway_agent_prompt_includes_visual_observations_in_describe_
     ]
     assert observations[0]["visual_observation"] == "doorway visible in /tmp/current.png"
     assert observations[0]["landmarks"] == ["doorway"]
+
+
+def test_cli_plan_gateway_returns_visual_analysis_runtime_metadata():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "use visual observations",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        openclaw_visual_mode="describe",
+        openclaw_visual_max_images=2,
+        visual_analyzer=FakeVisualAnalyzer(),
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 2},
+            "runtime_context": {
+                "current_image_path": "/tmp/current.png",
+                "recent_keyframe_paths": ["/tmp/key1.png"],
+            },
+        }
+    )
+
+    visual = decision["runtime_metadata"]["visual_analysis"]
+    assert visual["ran"] is True
+    assert visual["num_images"] == 2
+    assert visual["image_paths"] == ["/tmp/current.png", "/tmp/key1.png"]
+    assert visual["vlm_latency_ms"] == 12.5
+    assert visual["cache_hits"] == 1
+    assert visual["failures"] == 0
 
 
 def test_cli_plan_gateway_agent_prompt_requests_write_gate_for_visual_memory():

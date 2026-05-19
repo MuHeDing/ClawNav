@@ -126,4 +126,9 @@ def gateway_response_to_decision(response: Dict[str, Any]) -> OpenClawPlanDecisi
         arguments=strip_oracle_fields(arguments),
         reason=str(response.get("reason", "")),
         planner_backend="gateway",
+        runtime_metadata=strip_oracle_fields(
+            response.get("runtime_metadata")
+            if isinstance(response.get("runtime_metadata"), dict)
+            else {}
+        ),
     )

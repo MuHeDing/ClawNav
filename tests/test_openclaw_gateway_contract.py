@@ -45,6 +45,25 @@ def test_gateway_contract_accepts_all_runtime_intents():
         assert decision.tool_name == tool
 
 
+def test_gateway_contract_preserves_runtime_metadata():
+    decision = gateway_response_to_decision(
+        {
+            "intent": "act",
+            "tool_name": "NavigationPolicySkill",
+            "arguments": {},
+            "reason": "contract_test",
+            "runtime_metadata": {
+                "visual_analysis": {
+                    "ran": True,
+                    "vlm_latency_ms": 42.0,
+                }
+            },
+        }
+    )
+
+    assert decision.runtime_metadata["visual_analysis"]["vlm_latency_ms"] == 42.0
+
+
 def test_gateway_contract_rejects_missing_tool_name():
     try:
         gateway_response_to_decision({"intent": "act"})

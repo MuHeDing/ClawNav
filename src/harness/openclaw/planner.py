@@ -12,6 +12,7 @@ class OpenClawPlanDecision:
     arguments: Dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     planner_backend: str = "rule"
+    runtime_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class RuleOpenClawPlanner:

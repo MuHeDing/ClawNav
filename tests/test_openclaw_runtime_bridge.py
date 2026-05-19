@@ -495,6 +495,28 @@ def test_runtime_records_planner_intent_change_after_recall():
     assert event["action_changed_after_recall"] is True
 
 
+def test_runtime_uses_planner_visual_analysis_latency_metadata():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "MOVE_FORWARD"},
+        reason="visual metadata",
+        planner_backend="gateway",
+        runtime_metadata={
+            "visual_analysis": {
+                "ran": True,
+                "vlm_latency_ms": 37.5,
+                "num_images": 1,
+            }
+        },
+    )
+    runtime = make_full_runtime(decision)
+
+    result = runtime.step(make_state(step_id=2), payload={})
+
+    assert result.runtime_metadata["visual_analysis"]["vlm_latency_ms"] == 37.5
+
+
 def test_runtime_enriches_recall_memory_with_visual_observation_and_episode_namespace():
     decision = OpenClawPlanDecision(
         intent="recall_memory",

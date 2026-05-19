@@ -50,8 +50,16 @@ def test_visual_analyzer_describes_images_with_openclaw_capability():
             "spatial_cues": [],
             "navigation_relevance": "",
             "confidence": None,
+            "analysis_metadata": {
+                "vlm_latency_ms": observations[0]["analysis_metadata"]["vlm_latency_ms"],
+                "visual_model": "qwen/qwen3.5-vl",
+                "visual_mode": "describe",
+                "cache_hit": False,
+                "error": False,
+            },
         }
     ]
+    assert observations[0]["analysis_metadata"]["vlm_latency_ms"] >= 0.0
     command = runner.calls[0][0]
     assert command[:4] == ["openclaw", "capability", "image", "describe-many"]
     assert command.count("--file") == 1
@@ -67,7 +75,14 @@ def test_visual_analyzer_caches_by_image_path():
     first = analyzer.analyze(["/tmp/current.png"])
     second = analyzer.analyze(["/tmp/current.png"])
 
-    assert first == second
+    assert first[0]["analysis_metadata"]["cache_hit"] is False
+    assert second[0]["analysis_metadata"]["cache_hit"] is True
+    assert second[0]["analysis_metadata"]["vlm_latency_ms"] == 0.0
+    first_without_cache = dict(first[0])
+    second_without_cache = dict(second[0])
+    first_without_cache.pop("analysis_metadata")
+    second_without_cache.pop("analysis_metadata")
+    assert first_without_cache == second_without_cache
     assert len(runner.calls) == 1
 
 
@@ -80,3 +95,17 @@ def test_visual_analyzer_fails_soft_when_openclaw_fails():
     assert observations[0]["image_path"] == "/tmp/current.png"
     assert observations[0]["caption"] == ""
     assert observations[0]["error"] == "qwen unavailable"
+    assert observations[0]["analysis_metadata"]["error"] is True
+
+
+def test_visual_analyzer_records_latency_and_cache_status():
+    runner = FakeOpenClawRunner()
+    analyzer = OpenClawVisualAnalyzer(run_openclaw=runner)
+
+    observations = analyzer.analyze(["/tmp/current.png"])
+    cached = analyzer.analyze(["/tmp/current.png"])
+
+    assert observations[0]["analysis_metadata"]["vlm_latency_ms"] >= 0.0
+    assert observations[0]["analysis_metadata"]["cache_hit"] is False
+    assert cached[0]["analysis_metadata"]["cache_hit"] is True
+    assert cached[0]["analysis_metadata"]["vlm_latency_ms"] == 0.0

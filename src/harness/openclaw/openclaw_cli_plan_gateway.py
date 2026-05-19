@@ -162,6 +162,9 @@ class OpenClawCliPlanPlanner:
         decision = self._extract_json_object(agent_text)
         normalized = self._normalize_decision(decision)
         self._enrich_write_memory_with_visual_observation(normalized, prompt_payload)
+        visual_analysis = self._visual_analysis_metadata(prompt_payload)
+        if visual_analysis:
+            normalized["runtime_metadata"] = {"visual_analysis": visual_analysis}
         return normalized
 
     def _agent_prompt(self, payload: Dict[str, Any]) -> str:
@@ -332,6 +335,45 @@ class OpenClawCliPlanPlanner:
             ]
             selected.extend(recent_paths[-remaining_slots:])
         return selected[: self.openclaw_visual_max_images]
+
+    def _visual_analysis_metadata(self, prompt_payload: Dict[str, Any]) -> Dict[str, Any]:
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if not isinstance(runtime_context, dict):
+            return {}
+        observations = runtime_context.get("visual_observations") or []
+        if not isinstance(observations, list) or not observations:
+            return {}
+        image_paths: List[str] = []
+        vlm_latency_ms = 0.0
+        cache_hits = 0
+        failures = 0
+        model = ""
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            image_path = observation.get("image_path")
+            if isinstance(image_path, str) and image_path:
+                image_paths.append(image_path)
+            metadata = observation.get("analysis_metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if metadata.get("cache_hit"):
+                cache_hits += 1
+            else:
+                vlm_latency_ms += float(metadata.get("vlm_latency_ms") or 0.0)
+            if metadata.get("error") or observation.get("error"):
+                failures += 1
+            if not model and metadata.get("visual_model"):
+                model = str(metadata.get("visual_model"))
+        return {
+            "ran": True,
+            "num_images": len(image_paths),
+            "image_paths": image_paths,
+            "vlm_latency_ms": round(vlm_latency_ms, 3),
+            "cache_hits": cache_hits,
+            "failures": failures,
+            "model": model,
+        }
 
     def _agent_visible_text(self, stdout: str) -> str:
         try:

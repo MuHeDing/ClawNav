@@ -241,11 +241,23 @@ class OpenClawVLNRuntime:
         }
         if image_paths_used:
             metadata["image_paths_used"] = image_paths_used
+        planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        planner_visual_analysis = {}
+        if isinstance(planner_runtime_metadata, dict):
+            candidate = planner_runtime_metadata.get("visual_analysis")
+            if isinstance(candidate, dict):
+                planner_visual_analysis = candidate
         memory_writes = self._memory_writes(tool_calls)
         if memory_writes:
             metadata["memory_writes"] = memory_writes
         visual_analysis = self._visual_analysis(tool_calls)
-        if visual_analysis:
+        if planner_visual_analysis:
+            metadata["visual_analysis"] = planner_visual_analysis
+            if visual_analysis.get("latency_ms") is not None:
+                metadata["visual_analysis"]["memory_write_latency_ms"] = visual_analysis.get(
+                    "latency_ms"
+                )
+        elif visual_analysis:
             metadata["visual_analysis"] = visual_analysis
         recall_usage = self._recall_usage(
             tool_calls,
