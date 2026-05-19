@@ -55,6 +55,7 @@ def summarize_run(path: Path) -> Dict[str, Any]:
     visual_analysis_steps = 0
     visual_analysis_failures = 0
     visual_analysis_latencies: List[float] = []
+    write_novelty_scores: List[float] = []
     memory_write_steps = 0
     memory_write_attempts = 0
     memory_write_written = 0
@@ -71,6 +72,7 @@ def summarize_run(path: Path) -> Dict[str, Any]:
     critic_use_events = 0
     action_changed_after_recall_steps = 0
     action_changed_after_recall_events = 0
+    planner_intent_changed_after_recall_events = 0
     episode_namespace_hits = 0
     scene_namespace_hits = 0
     task_namespace_hits = 0
@@ -90,7 +92,9 @@ def summarize_run(path: Path) -> Dict[str, Any]:
                 visual_analysis_steps += 1
                 if visual_analysis.get("error"):
                     visual_analysis_failures += 1
-                latency_ms = visual_analysis.get("latency_ms")
+                latency_ms = visual_analysis.get("vlm_latency_ms")
+                if latency_ms is None:
+                    latency_ms = visual_analysis.get("latency_ms")
                 if isinstance(latency_ms, (int, float)):
                     visual_analysis_latencies.append(float(latency_ms))
             memory_writes = record.get("memory_writes") or []
@@ -107,6 +111,9 @@ def summarize_run(path: Path) -> Dict[str, Any]:
                 if _is_duplicate_skip(write):
                     duplicate_skip_count += 1
                 write_gate = write.get("write_gate") or {}
+                novelty_score = write_gate.get("novelty_score")
+                if isinstance(novelty_score, (int, float)):
+                    write_novelty_scores.append(float(novelty_score))
                 _increment(write_gate_decisions, write_gate.get("curator_decision"))
                 _increment(memory_scope_counts, write.get("memory_scope"))
                 _increment(memory_namespace_counts, write.get("memory_namespace"))
@@ -127,6 +134,13 @@ def summarize_run(path: Path) -> Dict[str, Any]:
                 if event.get("action_changed_after_recall"):
                     action_changed_after_recall_events += 1
                     action_changed_after_recall_steps += 1
+                if (
+                    event.get("planner_intent_before_recall")
+                    and event.get("planner_intent_after_recall")
+                    and event.get("planner_intent_before_recall")
+                    != event.get("planner_intent_after_recall")
+                ):
+                    planner_intent_changed_after_recall_events += 1
                 namespace = str(event.get("selected_namespace") or "")
                 if namespace.startswith("episode:"):
                     episode_namespace_hits += 1
@@ -145,11 +159,13 @@ def summarize_run(path: Path) -> Dict[str, Any]:
         "visual_analysis_steps": visual_analysis_steps,
         "visual_analysis_failures": visual_analysis_failures,
         "visual_analysis_latency_ms_avg": _mean(visual_analysis_latencies),
+        "avg_vlm_latency_ms": _mean(visual_analysis_latencies),
         "memory_write_steps": memory_write_steps,
         "memory_write_attempts": memory_write_attempts,
         "memory_write_written": memory_write_written,
         "memory_write_skipped": memory_write_skipped,
         "duplicate_skip_count": duplicate_skip_count,
+        "avg_write_novelty_score": _mean(write_novelty_scores),
         "write_acceptance_rate": _ratio(memory_write_written, memory_write_attempts),
         "memory_pollution_rate": _ratio(memory_write_skipped, memory_write_attempts),
         "write_gate_decisions": write_gate_decisions,
@@ -164,6 +180,7 @@ def summarize_run(path: Path) -> Dict[str, Any]:
         "critic_use_events": critic_use_events,
         "action_changed_after_recall_steps": action_changed_after_recall_steps,
         "action_changed_after_recall_events": action_changed_after_recall_events,
+        "planner_intent_changed_after_recall_events": planner_intent_changed_after_recall_events,
         "episode_namespace_hits": episode_namespace_hits,
         "scene_namespace_hits": scene_namespace_hits,
         "task_namespace_hits": task_namespace_hits,

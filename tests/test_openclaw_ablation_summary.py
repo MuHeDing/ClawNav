@@ -17,12 +17,15 @@ def test_summarize_run_reads_navigation_and_harness_metrics(tmp_path):
                 "runtime_mode": "openclaw_bridge",
                 "planned_intent": "recall_memory",
                 "tool_calls": [{"tool_name": "MemoryQuerySkill"}],
-                "visual_analysis": {"ran": True, "latency_ms": 12.0},
+                "visual_analysis": {"ran": True, "vlm_latency_ms": 12.0},
                 "memory_writes": [
                     {
                         "written": True,
                         "skipped": False,
-                        "write_gate": {"curator_decision": "write"},
+                        "write_gate": {
+                            "curator_decision": "write",
+                            "novelty_score": 0.71,
+                        },
                         "memory_scope": "episode",
                         "memory_namespace": "episode:s1:e1",
                     }
@@ -31,6 +34,8 @@ def test_summarize_run_reads_navigation_and_harness_metrics(tmp_path):
                     {
                         "used_by_planner": True,
                         "action_changed_after_recall": True,
+                        "planner_intent_before_recall": "recall_memory",
+                        "planner_intent_after_recall": "replan",
                         "selected_namespace": "episode:s1:e1",
                         "num_hits": 1,
                     }
@@ -58,6 +63,9 @@ def test_summarize_run_reads_navigation_and_harness_metrics(tmp_path):
     assert summary["write_acceptance_rate"] == 1.0
     assert summary["useful_recall_rate"] == 1.0
     assert summary["visual_analysis_latency_ms_avg"] == 12.0
+    assert summary["avg_vlm_latency_ms"] == 12.0
+    assert summary["avg_write_novelty_score"] == 0.71
+    assert summary["planner_intent_changed_after_recall_events"] == 1
     assert summary["memory_scope_counts"] == {"episode": 1}
     assert summary["memory_namespace_counts"] == {"episode:s1:e1": 1}
 
