@@ -13,7 +13,14 @@ class BaseSpatialMemoryClient:
     def health(self) -> bool:
         return True
 
-    def query_semantic(self, text: str, n_results: int = 5) -> List[MemoryHit]:
+    def query_semantic(
+        self,
+        text: str,
+        n_results: int = 5,
+        allowed_scopes: Optional[List[str]] = None,
+        memory_namespace: str = "",
+        memory_source: str = "",
+    ) -> List[MemoryHit]:
         raise NotImplementedError
 
     def query_object(self, name: str, n_results: int = 5) -> List[MemoryHit]:
@@ -28,15 +35,29 @@ class BaseSpatialMemoryClient:
     def query_unified(self, payload: Dict[str, Any]) -> List[MemoryHit]:
         text = payload.get("text") or payload.get("query") or ""
         n_results = int(payload.get("n_results", 5))
-        return self.query_semantic(text, n_results=n_results)
+        return self.query_semantic(
+            text,
+            n_results=n_results,
+            allowed_scopes=payload.get("allowed_scopes"),
+            memory_namespace=str(payload.get("memory_namespace") or ""),
+            memory_source=str(payload.get("memory_source") or ""),
+        )
 
     def ingest_semantic(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "payload": payload}
 
 
 class FakeSpatialMemoryClient(BaseSpatialMemoryClient):
-    def query_semantic(self, text: str, n_results: int = 5) -> List[MemoryHit]:
+    def query_semantic(
+        self,
+        text: str,
+        n_results: int = 5,
+        allowed_scopes: Optional[List[str]] = None,
+        memory_namespace: str = "",
+        memory_source: str = "",
+    ) -> List[MemoryHit]:
         query = (text or "memory").strip() or "memory"
+        source = memory_source or self.memory_source
         hits = [
             MemoryHit(
                 memory_id=f"fake-{idx}",
@@ -46,7 +67,13 @@ class FakeSpatialMemoryClient(BaseSpatialMemoryClient):
                 target_pose={"x": float(idx), "y": float(idx + 1)},
                 evidence_text=f"Possible remembered landmark for {query}",
                 note=f"fake memory hit {idx}",
-                memory_source=self.memory_source,
+                memory_source=source,
+                metadata={
+                    "memory_scope": allowed_scopes[0]
+                    if allowed_scopes
+                    else "episode",
+                    "memory_namespace": memory_namespace,
+                },
             )
             for idx in range(max(1, n_results))
         ]
@@ -69,14 +96,23 @@ class SpatialMemoryHttpClient(BaseSpatialMemoryClient):
         response.raise_for_status()
         return True
 
-    def query_semantic(self, text: str, n_results: int = 5) -> List[MemoryHit]:
+    def query_semantic(
+        self,
+        text: str,
+        n_results: int = 5,
+        allowed_scopes: Optional[List[str]] = None,
+        memory_namespace: str = "",
+        memory_source: str = "",
+    ) -> List[MemoryHit]:
         return self._post_query(
             "/query/semantic/text",
             build_query_payload(
                 query_type="semantic",
                 text=text,
                 n_results=n_results,
-                memory_source=self.memory_source,
+                memory_source=memory_source or self.memory_source,
+                allowed_scopes=allowed_scopes,
+                memory_namespace=memory_namespace,
             ),
         )
 

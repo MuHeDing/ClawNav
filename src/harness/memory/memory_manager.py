@@ -45,7 +45,12 @@ class MemoryManager:
             planner_reason=planner_reason,
             critic_signal=critic_signal,
         )
-        hits = self.client.query_semantic(query_text, n_results=n_results)
+        hits = self.client.query_semantic(
+            query_text,
+            n_results=n_results,
+            allowed_scopes=allowed_scopes,
+            memory_namespace=memory_namespace,
+        )
         hits = self._filter_hits(
             hits,
             allowed_scopes=allowed_scopes,

@@ -11,8 +11,23 @@ class RecordingMemoryClient(BaseSpatialMemoryClient):
         self.hits = hits
         self.queries = []
 
-    def query_semantic(self, text: str, n_results: int = 5):
-        self.queries.append((text, n_results))
+    def query_semantic(
+        self,
+        text: str,
+        n_results: int = 5,
+        allowed_scopes=None,
+        memory_namespace: str = "",
+        memory_source: str = "",
+    ):
+        self.queries.append(
+            {
+                "text": text,
+                "n_results": n_results,
+                "allowed_scopes": allowed_scopes,
+                "memory_namespace": memory_namespace,
+                "memory_source": memory_source,
+            }
+        )
         return self.hits[:n_results]
 
 
@@ -100,9 +115,24 @@ def test_memory_manager_recall_builds_query_from_visual_context_and_filters_name
         memory_namespace="episode:s1:e1",
     )
 
-    query_text, _ = client.queries[0]
+    query_text = client.queries[0]["text"]
     assert "go to kitchen" in query_text
     assert "find doorway" in query_text
     assert "sofa on right" in query_text
     assert "oscillation" in query_text
     assert [hit.memory_id for hit in result.hits] == ["m1"]
+
+
+def test_memory_manager_passes_scope_filters_before_semantic_query():
+    client = RecordingMemoryClient([])
+    manager = MemoryManager(client, HarnessConfig())
+
+    manager.recall(
+        text="find doorway",
+        step_id=4,
+        allowed_scopes=["episode"],
+        memory_namespace="episode:s1:e1",
+    )
+
+    assert client.queries[0]["allowed_scopes"] == ["episode"]
+    assert client.queries[0]["memory_namespace"] == "episode:s1:e1"
