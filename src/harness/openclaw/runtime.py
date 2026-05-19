@@ -68,6 +68,8 @@ class OpenClawVLNRuntime:
         self.planner = planner
         self.executor = executor
         self.fallback_planner = fallback_planner
+        self.recent_visual_memories: List[Dict[str, Any]] = []
+        self.max_recent_visual_memories = 10
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -124,6 +126,10 @@ class OpenClawVLNRuntime:
             if decision.intent == "write_memory":
                 arguments = self._memory_write_arguments(payload, arguments)
             if decision.intent == "write_memory":
+                arguments.setdefault(
+                    "recent_visual_memories",
+                    list(self.recent_visual_memories),
+                )
                 curator_result = self._curate_memory_write(state, arguments)
                 if curator_result:
                     tool_calls.append(curator_result)
@@ -134,6 +140,8 @@ class OpenClawVLNRuntime:
                 state=state,
             )
             tool_calls.append(tool_result)
+            if decision.intent == "write_memory":
+                self._remember_written_visual_memory(tool_result)
             self._merge_tool_navigation_context(nav_payload, tool_result)
 
         self._merge_navigation_context(nav_payload, decision.arguments)
@@ -485,6 +493,45 @@ class OpenClawVLNRuntime:
                 }
             )
         return writes
+
+    def _remember_written_visual_memory(self, tool_result: Dict[str, Any]) -> None:
+        payload = tool_result.get("payload") or {}
+        if not isinstance(payload, dict) or not payload.get("written"):
+            return
+        record = payload.get("record")
+        if not isinstance(record, dict):
+            return
+        memory = {
+            "memory_id": str(
+                record.get("memory_id")
+                or record.get("id")
+                or record.get("image_path")
+                or record.get("step_id")
+                or ""
+            ),
+            "image_path": record.get("image_path", ""),
+            "caption": record.get("caption", ""),
+            "visual_observation": record.get("visual_observation", ""),
+            "objects": record.get("objects", []),
+            "landmarks": record.get("landmarks", []),
+            "spatial_cues": record.get("spatial_cues", []),
+        }
+        if not any(
+            memory.get(key)
+            for key in (
+                "memory_id",
+                "caption",
+                "visual_observation",
+                "objects",
+                "landmarks",
+                "spatial_cues",
+            )
+        ):
+            return
+        self.recent_visual_memories.append(memory)
+        self.recent_visual_memories = self.recent_visual_memories[
+            -self.max_recent_visual_memories:
+        ]
 
     def _visual_analysis(self, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
         for call in tool_calls:

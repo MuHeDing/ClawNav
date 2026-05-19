@@ -663,3 +663,45 @@ def test_runtime_applies_visual_memory_curator_before_write_memory():
         "Generic wall with no navigation cue."
     )
     assert store == []
+
+
+def test_runtime_supplies_recent_visual_memories_to_curator_for_duplicate_skip():
+    decision = OpenClawPlanDecision(
+        intent="write_memory",
+        tool_name="MemoryWriteSkill",
+        arguments={"note": "red door landmark"},
+        reason="curator",
+        planner_backend="gateway",
+    )
+    store = []
+    registry = SkillRegistry()
+    registry.register(EchoNavigationSkill())
+    registry.register(VisualMemoryCuratorSkill())
+    registry.register(MemoryWriteSkill(store=store))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+    payload = {
+        "current_image_path": "/tmp/red-door.png",
+        "visual_observations": [
+            {
+                "image_path": "/tmp/red-door.png",
+                "caption": "A red door next to a sofa.",
+                "objects": ["sofa"],
+                "landmarks": ["red door"],
+                "spatial_cues": ["sofa on right"],
+                "confidence": 0.9,
+            }
+        ],
+    }
+
+    first = runtime.step(make_state(step_id=13), payload=payload)
+    second = runtime.step(make_state(step_id=14), payload=payload)
+
+    assert first.runtime_metadata["memory_writes"][0]["written"] is True
+    second_write = second.runtime_metadata["memory_writes"][0]
+    assert second_write["skipped"] is True
+    assert second_write["write_gate"]["curator_decision"] == "skip"
+    assert second_write["write_gate"]["duplicate_of_memory_id"] == "/tmp/red-door.png"
