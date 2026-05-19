@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Set
 
 from harness.config import HarnessConfig
 from harness.memory.spatial_memory_client import BaseSpatialMemoryClient
@@ -56,6 +57,7 @@ class MemoryManager:
             allowed_scopes=allowed_scopes,
             memory_namespace=memory_namespace,
         )
+        hits = self._rerank_hits(hits, query_text=query_text, step_id=step_id)
         self.mark_recalled(step_id)
         return MemoryRecallResult(
             hits=hits,
@@ -161,6 +163,68 @@ class MemoryManager:
                 continue
             filtered.append(hit)
         return filtered
+
+    def _rerank_hits(
+        self,
+        hits: List[MemoryHit],
+        query_text: str,
+        step_id: int,
+    ) -> List[MemoryHit]:
+        query_terms = self._term_set(query_text)
+        return sorted(
+            hits,
+            key=lambda hit: self._rerank_score(hit, query_terms, step_id),
+            reverse=True,
+        )
+
+    def _rerank_score(
+        self,
+        hit: MemoryHit,
+        query_terms: Set[str],
+        step_id: int,
+    ) -> float:
+        metadata = hit.metadata or {}
+        overlap = len(query_terms.intersection(self._hit_terms(hit)))
+        confidence = float(hit.confidence or 0.0)
+        recency = self._recency_score(metadata.get("step_id"), step_id)
+        scope_bonus = {
+            "episode": 0.3,
+            "scene": 0.15,
+            "task": 0.05,
+        }.get(str(metadata.get("memory_scope") or ""), 0.0)
+        return confidence + (0.35 * overlap) + (0.2 * recency) + scope_bonus
+
+    def _recency_score(self, hit_step: Any, step_id: int) -> float:
+        if not isinstance(hit_step, int) or step_id < hit_step:
+            return 0.0
+        return max(0.0, 1.0 - min(step_id - hit_step, 50) / 50.0)
+
+    def _hit_terms(self, hit: MemoryHit) -> Set[str]:
+        metadata = hit.metadata or {}
+        terms = set()
+        for value in (
+            hit.name,
+            hit.evidence_text,
+            hit.note,
+            metadata.get("caption", ""),
+            metadata.get("visual_observation", ""),
+            metadata.get("place_category", ""),
+            metadata.get("navigation_relevance", ""),
+        ):
+            terms.update(self._term_set(str(value or "")))
+        for key in ("objects", "landmarks", "spatial_cues"):
+            values = metadata.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    terms.update(self._term_set(str(value)))
+        return terms
+
+    def _term_set(self, text: str) -> Set[str]:
+        return {
+            term
+            for term in re.findall(r"[a-zA-Z0-9_]+", text.lower())
+            if len(term) > 2
+        }
 
     def _visual_evidence_text(self, hit: MemoryHit) -> str:
         metadata = hit.metadata or {}

@@ -136,3 +136,60 @@ def test_memory_manager_passes_scope_filters_before_semantic_query():
 
     assert client.queries[0]["allowed_scopes"] == ["episode"]
     assert client.queries[0]["memory_namespace"] == "episode:s1:e1"
+
+
+def test_memory_manager_reranks_by_visual_overlap_and_confidence():
+    generic = MemoryHit(
+        memory_id="generic",
+        memory_type="semantic",
+        name="generic hallway",
+        confidence=0.95,
+        metadata={
+            "landmarks": ["window"],
+            "objects": ["chair"],
+            "memory_scope": "episode",
+        },
+    )
+    doorway = MemoryHit(
+        memory_id="door",
+        memory_type="semantic",
+        name="doorway memory",
+        confidence=0.70,
+        metadata={
+            "landmarks": ["red door"],
+            "objects": ["sofa"],
+            "memory_scope": "episode",
+        },
+    )
+    manager = MemoryManager(RecordingMemoryClient([generic, doorway]), HarnessConfig())
+
+    recall = manager.recall(
+        text="go toward the red door near the sofa",
+        step_id=3,
+        visual_observation="red door ahead with sofa on right",
+        allowed_scopes=["episode"],
+    )
+
+    assert [hit.memory_id for hit in recall.hits] == ["door", "generic"]
+
+
+def test_memory_manager_reranks_recent_hit_when_scores_tie():
+    older = MemoryHit(
+        memory_id="old",
+        memory_type="semantic",
+        name="doorway",
+        confidence=0.8,
+        metadata={"step_id": 2},
+    )
+    newer = MemoryHit(
+        memory_id="new",
+        memory_type="semantic",
+        name="doorway",
+        confidence=0.8,
+        metadata={"step_id": 9},
+    )
+    manager = MemoryManager(RecordingMemoryClient([older, newer]), HarnessConfig())
+
+    recall = manager.recall("doorway", step_id=10)
+
+    assert [hit.memory_id for hit in recall.hits] == ["new", "old"]
