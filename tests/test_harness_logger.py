@@ -179,3 +179,51 @@ def test_logger_writes_recall_usage_metadata(tmp_path):
     assert event["used_by_planner"] is True
     assert event["action_changed_after_recall"] is True
     assert record["memory_writes"][0]["memory_namespace"] == "episode:scene1:episode1"
+
+
+def test_logger_writes_visual_memory_trace_contract(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+
+    record = logger.log_step(
+        make_state(),
+        intent="recall_memory",
+        skill="MemoryQuerySkill",
+        runtime={
+            "visual_analysis": {
+                "ran": True,
+                "vlm_latency_ms": 37.5,
+                "num_images": 1,
+                "image_paths": ["/tmp/keyframe.png"],
+            },
+            "memory_writes": [
+                {
+                    "memory_scope": "episode",
+                    "memory_namespace": "episode:scene1:episode1",
+                    "write_gate": {
+                        "curator_decision": "write",
+                        "novelty_score": 0.71,
+                        "duplicate_of_memory_id": None,
+                    },
+                }
+            ],
+            "recall_usage": [
+                {
+                    "event_type": "memory_recall",
+                    "planner_intent_before_recall": "recall_memory",
+                    "planner_intent_after_recall": "replan",
+                    "action_changed_after_recall": True,
+                    "selected_namespace": "episode:scene1:episode1",
+                }
+            ],
+        },
+    )
+
+    assert record["visual_analysis"]["ran"] is True
+    assert record["visual_analysis"]["vlm_latency_ms"] == 37.5
+    assert record["memory_writes"][0]["write_gate"]["novelty_score"] == 0.71
+    assert record["recall_usage"][0]["planner_intent_before_recall"] == "recall_memory"
+    assert record["recall_usage"][0]["planner_intent_after_recall"] == "replan"
+    assert record["recall_usage"][0]["selected_namespace"].startswith("episode:")
+    serialized = json.dumps(record)
+    assert "image_bytes" not in serialized
+    assert record["oracle_guard_passed"] is True
