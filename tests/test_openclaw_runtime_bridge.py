@@ -77,6 +77,32 @@ class StaticPlanner:
         return self.decision
 
 
+class RecallThenReplanPlanner:
+    def __init__(self):
+        self.payloads = []
+
+    def plan(self, state, runtime_context):
+        self.payloads.append(dict(runtime_context))
+        if runtime_context.get("memory_context_text"):
+            return OpenClawPlanDecision(
+                intent="replan",
+                tool_name="ReplannerSkill",
+                arguments={
+                    "action_text": "MOVE_FORWARD",
+                    "active_subgoal": "follow recalled doorway",
+                },
+                reason="memory_changed_plan",
+                planner_backend="gateway",
+            )
+        return OpenClawPlanDecision(
+            intent="recall_memory",
+            tool_name="MemoryQuerySkill",
+            arguments={"text": "doorway", "allowed_scopes": ["episode"]},
+            reason="need_memory",
+            planner_backend="gateway",
+        )
+
+
 class EchoWriteSkill(Skill):
     name = "MemoryWriteSkill"
     description = "Writes fake memory."
@@ -436,6 +462,36 @@ def test_runtime_records_recall_causality_from_context_and_action_change():
     assert event["used_by_planner"] is True
     assert event["action_before_recall"] == "MOVE_FORWARD"
     assert event["action_after_recall"] == "TURN_LEFT"
+    assert event["action_changed_after_recall"] is True
+
+
+def test_runtime_records_planner_intent_change_after_recall():
+    planner = RecallThenReplanPlanner()
+    registry = SkillRegistry()
+    registry.register(EchoNavigationSkill())
+    registry.register(EchoMemorySkill())
+    registry.register(EchoReplannerSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(
+        make_state(step_id=1),
+        payload={"policy_action": "TURN_LEFT"},
+    )
+
+    assert result.action_text == "MOVE_FORWARD"
+    assert len(planner.payloads) == 2
+    assert planner.payloads[1]["memory_context_text"] == "kitchen"
+    event = result.runtime_metadata["recall_usage"][0]
+    assert event["planner_intent_before_recall"] == "recall_memory"
+    assert event["planner_intent_after_recall"] == "replan"
+    assert event["replan_created_after_recall"] is True
+    assert event["used_by_planner"] is True
+    assert event["action_before_recall"] == "TURN_LEFT"
+    assert event["action_after_recall"] == "MOVE_FORWARD"
     assert event["action_changed_after_recall"] is True
 
 

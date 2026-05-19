@@ -100,6 +100,7 @@ class OpenClawVLNRuntime:
             decision = self.fallback_planner.plan(state, runtime_context=payload)
             planner_fallback = True
         tool_calls: List[Dict[str, Any]] = []
+        causal_recall: Dict[str, Any] = {}
 
         if self._is_cli_agent_fallback_decision(decision):
             metadata = self._metadata(decision, tool_calls, image_paths_used)
@@ -143,6 +144,20 @@ class OpenClawVLNRuntime:
             if decision.intent == "write_memory":
                 self._remember_written_visual_memory(tool_result)
             self._merge_tool_navigation_context(nav_payload, tool_result)
+            if decision.intent == "recall_memory":
+                after_decision = self._after_recall_decision(state, payload, nav_payload)
+                if after_decision is not None:
+                    causal_recall = {
+                        "before_decision": decision,
+                        "after_decision": after_decision,
+                        "action_before": self._normalize_action_text(
+                            payload.get("policy_action")
+                        )
+                        or "",
+                    }
+                    if after_decision.intent in {"act", "replan"}:
+                        decision = after_decision
+                        self._merge_navigation_context(nav_payload, decision.arguments)
 
         self._merge_navigation_context(nav_payload, decision.arguments)
         if decision.intent == "replan" and not nav_payload.get("active_subgoal") and decision.reason:
@@ -157,6 +172,7 @@ class OpenClawVLNRuntime:
                 state=state,
                 runtime_context=payload,
                 action_text=planned_action_text,
+                causal_recall=causal_recall,
             )
             metadata["planner_action_override"] = planned_action_text
             metadata["policy_skipped"] = True
@@ -185,6 +201,7 @@ class OpenClawVLNRuntime:
             state=state,
             runtime_context=payload,
             action_text=action_text,
+            causal_recall=causal_recall,
         )
         if planner_error:
             metadata["planner_error"] = planner_error
@@ -212,6 +229,7 @@ class OpenClawVLNRuntime:
         state: Optional[VLNState] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
         action_text: str = "",
+        causal_recall: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         metadata = {
             "runtime_mode": "openclaw_bridge",
@@ -235,10 +253,29 @@ class OpenClawVLNRuntime:
             state=state,
             runtime_context=runtime_context or {},
             action_text=action_text,
+            causal_recall=causal_recall or {},
         )
         if recall_usage:
             metadata["recall_usage"] = recall_usage
         return metadata
+
+    def _after_recall_decision(
+        self,
+        state: VLNState,
+        original_payload: Dict[str, Any],
+        nav_payload: Dict[str, Any],
+    ) -> Optional[Any]:
+        if original_payload.get("_after_recall_replan"):
+            return None
+        after_payload = {
+            **original_payload,
+            **nav_payload,
+            "_after_recall_replan": True,
+        }
+        try:
+            return self.planner.plan(state, runtime_context=after_payload)
+        except Exception:
+            return None
 
     def _curate_memory_write(
         self,
@@ -559,8 +596,12 @@ class OpenClawVLNRuntime:
         state: Optional[VLNState],
         runtime_context: Dict[str, Any],
         action_text: str,
+        causal_recall: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
+        causal_recall = causal_recall or {}
+        before_decision = causal_recall.get("before_decision") or decision
+        after_decision = causal_recall.get("after_decision") or decision
         for call in tool_calls:
             if call.get("tool_name") != "MemoryQuerySkill":
                 continue
@@ -584,9 +625,13 @@ class OpenClawVLNRuntime:
                     hit_captions.append(caption)
             policy_context = payload.get("policy_context") or {}
             control_context = payload.get("control_context") or {}
-            action_before = self._normalize_action_text(runtime_context.get("policy_action")) or ""
+            action_before = (
+                causal_recall.get("action_before")
+                or self._normalize_action_text(runtime_context.get("policy_action"))
+                or ""
+            )
             action_after = self._normalize_action_text(action_text) or ""
-            decision_arguments = getattr(decision, "arguments", {}) or {}
+            decision_arguments = getattr(before_decision, "arguments", {}) or {}
             if not isinstance(decision_arguments, dict):
                 decision_arguments = {}
             events.append(
@@ -613,21 +658,22 @@ class OpenClawVLNRuntime:
                         "recall_confidence",
                         control_context.get("confidence", 0.0),
                     ),
-                    "used_by_planner": decision.intent == "recall_memory",
+                    "used_by_planner": bool(causal_recall.get("after_decision"))
+                    or before_decision.intent == "recall_memory",
                     "used_by_policy": bool(
                         policy_context.get("memory_context_text")
                         or policy_context.get("memory_images")
                     ),
                     "used_by_critic": bool(control_context),
-                    "planner_intent_before_recall": decision.intent,
-                    "planner_intent_after_recall": decision.intent,
+                    "planner_intent_before_recall": before_decision.intent,
+                    "planner_intent_after_recall": after_decision.intent,
                     "action_before_recall": action_before,
                     "action_after_recall": action_after,
                     "action_changed_after_recall": bool(
                         action_before and action_after and action_before != action_after
                     ),
                     "stop_blocked_after_recall": False,
-                    "replan_created_after_recall": decision.intent == "replan",
+                    "replan_created_after_recall": after_decision.intent == "replan",
                 }
             )
         return events
