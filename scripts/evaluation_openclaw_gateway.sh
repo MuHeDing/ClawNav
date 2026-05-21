@@ -12,7 +12,7 @@ if [[ -z "${NPROC_PER_NODE:-}" ]]; then
 fi
 
 OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://127.0.0.1:8011}
-OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-90}
+OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-180}
 OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY:-/ssd/dingmuhe/Embodied-task/Navigation_Claw/ABot-Claw_Muhe/openclaw_layer/SERVICE.md}
 OPENCLAW_SERVICE_HOST=${OPENCLAW_SERVICE_HOST:-127.0.0.1}
 NO_PROXY=${NO_PROXY:-127.0.0.1,localhost,::1}
@@ -28,9 +28,46 @@ OPENCLAW_ROBOT_EXECUTOR_URL=${OPENCLAW_ROBOT_EXECUTOR_URL:-}
 OPENCLAW_ENABLE_SUBAGENT_CRITIC=${OPENCLAW_ENABLE_SUBAGENT_CRITIC:-0}
 OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR=${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR:-0}
 
+HARNESS_SELECTED_EPISODES=(
+  "2azQ1b91cZZ:11"
+  "2azQ1b91cZZ:10"
+  "2azQ1b91cZZ:12"
+  "2azQ1b91cZZ:16"
+  "2azQ1b91cZZ:18"
+  "2azQ1b91cZZ:17"
+  "2azQ1b91cZZ:43"
+  "2azQ1b91cZZ:44"
+  "2azQ1b91cZZ:70"
+  "2azQ1b91cZZ:71"
+  "2azQ1b91cZZ:72"
+  "2azQ1b91cZZ:78"
+  "2azQ1b91cZZ:79"
+  "2azQ1b91cZZ:80"
+  "2azQ1b91cZZ:81"
+  "zsNo4HB9uLZ:2"
+  "zsNo4HB9uLZ:15"
+  "zsNo4HB9uLZ:26"
+  "zsNo4HB9uLZ:37"
+  "zsNo4HB9uLZ:54"
+  "zsNo4HB9uLZ:73"
+  "zsNo4HB9uLZ:75"
+  "zsNo4HB9uLZ:126"
+  "zsNo4HB9uLZ:137"
+  "zsNo4HB9uLZ:145"
+  "zsNo4HB9uLZ:147"
+  "zsNo4HB9uLZ:163"
+  "zsNo4HB9uLZ:165"
+  "zsNo4HB9uLZ:247"
+  "zsNo4HB9uLZ:251"
+)
+if [[ -z "${HARNESS_EPISODE_KEYS:-}" ]]; then
+  HARNESS_EPISODE_KEYS=$(IFS=,; echo "${HARNESS_SELECTED_EPISODES[*]}")
+fi
+
 EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
 DATA_PATH=${DATA_PATH:-}
-HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-20}
+HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}
+MAX_STEPS=${MAX_STEPS:-400}
 CHECK_GATEWAY=${CHECK_GATEWAY:-1}
 REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}
 
@@ -40,6 +77,9 @@ if [[ -n "${DATA_PATH}" ]]; then
 fi
 if [[ -n "${HARNESS_DEBUG_MAX_EPISODES}" ]]; then
   extra_args+=(--harness_debug_max_episodes "${HARNESS_DEBUG_MAX_EPISODES}")
+fi
+if [[ -n "${HARNESS_EPISODE_KEYS}" ]]; then
+  extra_args+=(--harness_episode_keys "${HARNESS_EPISODE_KEYS}")
 fi
 if [[ -n "${MEMORY_MANIFEST_PATH}" ]]; then
   extra_args+=(--memory_manifest_path "${MEMORY_MANIFEST_PATH}")
@@ -65,6 +105,9 @@ echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
 echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
 echo "OpenClaw critic/curator: ${OPENCLAW_ENABLE_SUBAGENT_CRITIC}/${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR}"
+echo "Max episodes: ${HARNESS_DEBUG_MAX_EPISODES:-all}"
+echo "Episode keys: ${HARNESS_EPISODE_KEYS:-all}"
+echo "Max steps per episode: ${MAX_STEPS}"
 echo "Output path: ${OUTPUT_PATH}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES}"
 echo "Torch processes: ${NPROC_PER_NODE}"
@@ -91,6 +134,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
   --model_path "${MODEL_PATH}" \
   --habitat_config_path config/vln_r2r.yaml \
   --eval_split "${EVAL_SPLIT}" \
+  --max_steps "${MAX_STEPS}" \
   --num_history 8 \
   --max_pixels 401408 \
   --kv_start_size 8 \

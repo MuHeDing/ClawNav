@@ -33,8 +33,11 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
     contents = script.read_text(encoding="utf-8")
 
-    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-20}" in contents
+    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}" in contents
+    assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
+    assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-180}" in contents
     assert "--harness_debug_max_episodes" in contents
+    assert "--max_steps" in contents
 
 
 def test_openclaw_gateway_script_allows_runtime_fallback_after_preflight_failure():
@@ -54,7 +57,11 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "harness.openclaw.openclaw_cli_plan_gateway" in contents
     assert "OPENCLAW_GATEWAY_WS_URL" in contents
     assert "OPENCLAW_VISUAL_MODE" in contents
+    assert "OPENCLAW_AGENT_TIMEOUT=${OPENCLAW_AGENT_TIMEOUT:-180}" in contents
+    assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents
+    assert "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}" in contents
     assert "--openclaw_visual_mode" in contents
+    assert "--openclaw_visual_interval_steps" in contents
     assert "--openclaw_visual_model" in contents
 
 

@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--harness_max_internal_calls", type=int, default=3)
     parser.add_argument("--harness_recall_interval_steps", type=int, default=5)
     parser.add_argument("--harness_debug_max_episodes", type=int, default=None)
+    parser.add_argument(
+        "--harness_episode_keys",
+        type=str,
+        default="",
+        help="Comma-separated scene_id:episode_id keys to evaluate, preserving the requested order.",
+    )
     parser.add_argument("--harness_trace_rank", type=int, default=0)
     parser.add_argument("--expose_sim_pose_online", action="store_true", default=False)
     parser.add_argument("--harness_runtime", type=str, default="phase2")
@@ -85,6 +91,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     return parser
+
+
+def _canonical_episode_scene_id(scene_id: Any) -> str:
+    raw_scene_id = str(scene_id or "")
+    normalized = raw_scene_id.rstrip("/").replace("\\", "/")
+    parts = normalized.split("/")
+    if len(parts) >= 2:
+        return parts[-2]
+    return Path(normalized).stem
+
+
+def _parse_harness_episode_keys(raw_keys: str) -> list[str]:
+    keys = [key.strip() for key in str(raw_keys or "").split(",") if key.strip()]
+    invalid_keys = [key for key in keys if ":" not in key]
+    if invalid_keys:
+        raise ValueError(
+            "--harness_episode_keys entries must use scene_id:episode_id format: "
+            + ", ".join(invalid_keys)
+        )
+    return keys
+
+
+def filter_harness_episodes_by_keys(episodes: list[Any], raw_keys: str) -> list[Any]:
+    requested_keys = _parse_harness_episode_keys(raw_keys)
+    if not requested_keys:
+        return episodes
+
+    episodes_by_key = {
+        f"{_canonical_episode_scene_id(getattr(episode, 'scene_id', ''))}:{getattr(episode, 'episode_id', '')}": episode
+        for episode in episodes
+    }
+    missing_keys = [key for key in requested_keys if key not in episodes_by_key]
+    if missing_keys:
+        raise ValueError(
+            "--harness_episode_keys requested episodes that are not in the dataset: "
+            + ", ".join(missing_keys)
+        )
+    return [episodes_by_key[key] for key in requested_keys]
 
 
 def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
@@ -432,6 +476,8 @@ def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
     class HarnessVLNEvaluator(eval_mod.VLNEvaluator):
         def config_env(self):
             env = super().config_env()
+            episode_keys = getattr(self.args, "harness_episode_keys", "")
+            env.episodes = filter_harness_episodes_by_keys(env.episodes, episode_keys)
             max_episodes = getattr(self.args, "harness_debug_max_episodes", None)
             if max_episodes is not None:
                 env.episodes = env.episodes[: int(max_episodes)]

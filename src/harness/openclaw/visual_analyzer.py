@@ -68,7 +68,18 @@ class OpenClawVisualAnalyzer:
 
         timeout_s = max(1.0, self.timeout_ms / 1000.0)
         start = time.perf_counter()
-        result = self.run_openclaw(args, timeout_s)
+        try:
+            result = self.run_openclaw(args, timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            error = str(exc).strip() or "openclaw image describe timed out"
+            for path in image_paths:
+                self._cache[path] = self._with_analysis_metadata(
+                    self._fallback_observation(path, error=error),
+                    latency_ms=latency_ms,
+                    error=True,
+                )
+            return
         latency_ms = (time.perf_counter() - start) * 1000.0
         if result.returncode != 0:
             error = (result.stderr or result.stdout or "openclaw image describe failed").strip()
@@ -108,9 +119,7 @@ class OpenClawVisualAnalyzer:
         for index, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
-            path = self._item_path(item)
-            if not path and index < len(image_paths):
-                path = image_paths[index]
+            path = image_paths[index] if index < len(image_paths) else self._item_path(item)
             if not path:
                 continue
             parsed[path] = self._observation_from_item(path, item)
@@ -123,7 +132,7 @@ class OpenClawVisualAnalyzer:
             return data
         if not isinstance(data, dict):
             return []
-        for key in ("results", "descriptions", "items", "payloads"):
+        for key in ("results", "descriptions", "items", "payloads", "outputs"):
             value = data.get(key)
             if isinstance(value, list):
                 return value

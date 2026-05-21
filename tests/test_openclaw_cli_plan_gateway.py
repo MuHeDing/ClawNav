@@ -131,6 +131,86 @@ def test_cli_plan_gateway_agent_mode_calls_openclaw_agent_and_parses_json_text()
     assert "--session-id" in runner.calls[0][0]
 
 
+def test_cli_plan_gateway_skips_visual_describe_between_interval_steps():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "interval skip",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    visual_analyzer = FakeVisualAnalyzer()
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        openclaw_visual_mode="describe",
+        openclaw_visual_interval_steps=5,
+        visual_analyzer=visual_analyzer,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 3},
+            "runtime_context": {"current_image_path": "frame3.png"},
+        }
+    )
+
+    assert visual_analyzer.calls == []
+    prompt = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    assert "visual_observations" not in prompt
+
+
+def test_cli_plan_gateway_describes_visuals_on_interval_steps():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "interval describe",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    visual_analyzer = FakeVisualAnalyzer()
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        openclaw_visual_mode="describe",
+        openclaw_visual_interval_steps=5,
+        visual_analyzer=visual_analyzer,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 5},
+            "runtime_context": {"current_image_path": "frame5.png"},
+        }
+    )
+
+    assert visual_analyzer.calls == [["frame5.png"]]
+    prompt = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    assert "visual_observations" in prompt
+
+
 def test_cli_plan_gateway_agent_mode_uses_fresh_openclaw_session_per_planner():
     runner_a = FakeOpenClawRunner(
         stdout=json.dumps(

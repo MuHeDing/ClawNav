@@ -68,6 +68,31 @@ def test_visual_analyzer_describes_images_with_openclaw_capability():
     assert command[command.index("--timeout-ms") + 1] == "30000"
 
 
+def test_visual_analyzer_parses_openclaw_outputs_with_normalized_paths():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "outputs": [
+                    {
+                        "path": "/abs/current.png",
+                        "text": "A wood-paneled hall with a doorway ahead.",
+                    }
+                ],
+            }
+        )
+    )
+    analyzer = OpenClawVisualAnalyzer(run_openclaw=runner)
+
+    observations = analyzer.analyze(["relative/current.png"])
+
+    assert observations[0]["image_path"] == "relative/current.png"
+    assert observations[0]["caption"] == "A wood-paneled hall with a doorway ahead."
+    assert observations[0]["visual_observation"] == (
+        "A wood-paneled hall with a doorway ahead."
+    )
+
+
 def test_visual_analyzer_caches_by_image_path():
     runner = FakeOpenClawRunner()
     analyzer = OpenClawVisualAnalyzer(run_openclaw=runner)
@@ -95,6 +120,20 @@ def test_visual_analyzer_fails_soft_when_openclaw_fails():
     assert observations[0]["image_path"] == "/tmp/current.png"
     assert observations[0]["caption"] == ""
     assert observations[0]["error"] == "qwen unavailable"
+    assert observations[0]["analysis_metadata"]["error"] is True
+
+
+def test_visual_analyzer_fails_soft_when_openclaw_times_out():
+    def timeout_runner(args, timeout_s):
+        raise subprocess.TimeoutExpired(args, timeout_s)
+
+    analyzer = OpenClawVisualAnalyzer(run_openclaw=timeout_runner, timeout_ms=30000)
+
+    observations = analyzer.analyze(["/tmp/current.png"])
+
+    assert observations[0]["image_path"] == "/tmp/current.png"
+    assert observations[0]["caption"] == ""
+    assert "timed out" in observations[0]["error"]
     assert observations[0]["analysis_metadata"]["error"] is True
 
 

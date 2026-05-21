@@ -68,6 +68,7 @@ class OpenClawCliPlanPlanner:
         agent_session_id: str = "",
         openclaw_visual_mode: str = "path",
         openclaw_visual_max_images: int = 2,
+        openclaw_visual_interval_steps: int = 1,
         openclaw_visual_timeout_ms: int = 30000,
         openclaw_visual_model: str = "",
         visual_analyzer: Any = None,
@@ -83,6 +84,7 @@ class OpenClawCliPlanPlanner:
         self.agent_session_id = agent_session_id or f"clawnav-{uuid.uuid4().hex}"
         self.openclaw_visual_mode = openclaw_visual_mode
         self.openclaw_visual_max_images = max(0, openclaw_visual_max_images)
+        self.openclaw_visual_interval_steps = max(1, openclaw_visual_interval_steps)
         self.visual_analyzer = visual_analyzer
         if self.visual_analyzer is None and self.openclaw_visual_mode == "describe":
             self.visual_analyzer = OpenClawVisualAnalyzer(
@@ -262,7 +264,11 @@ class OpenClawCliPlanPlanner:
             prompt_keyframe = self._copy_keys(keyframe_candidate, PROMPT_KEYFRAME_KEYS)
             if prompt_keyframe:
                 prompt_runtime_context["keyframe_candidate"] = prompt_keyframe
-        if self.openclaw_visual_mode == "describe" and prompt_runtime_context:
+        if (
+            self.openclaw_visual_mode == "describe"
+            and prompt_runtime_context
+            and self._should_analyze_visual(prompt_state, prompt_runtime_context)
+        ):
             visual_observations = self._visual_observations(prompt_runtime_context)
             if visual_observations:
                 prompt_runtime_context["visual_observations"] = visual_observations
@@ -280,6 +286,24 @@ class OpenClawCliPlanPlanner:
             if value is not None and value != "":
                 copied[key] = value
         return copied
+
+    def _should_analyze_visual(
+        self,
+        state: Dict[str, Any],
+        runtime_context: Dict[str, Any],
+    ) -> bool:
+        if self.openclaw_visual_interval_steps <= 1:
+            return True
+        keyframe_candidate = runtime_context.get("keyframe_candidate")
+        if isinstance(keyframe_candidate, dict) and keyframe_candidate.get("image_path"):
+            return True
+        step_id = state.get("step_id")
+        if not isinstance(step_id, int):
+            try:
+                step_id = int(step_id)
+            except (TypeError, ValueError):
+                return True
+        return step_id % self.openclaw_visual_interval_steps == 0
 
     def _visual_observations(self, runtime_context: Dict[str, Any]) -> List[Dict[str, Any]]:
         if self.visual_analyzer is None:
@@ -520,6 +544,7 @@ def main() -> None:
     parser.add_argument("--agent_session_id", default="")
     parser.add_argument("--openclaw_visual_mode", choices=("path", "describe"), default="path")
     parser.add_argument("--openclaw_visual_max_images", type=int, default=2)
+    parser.add_argument("--openclaw_visual_interval_steps", type=int, default=1)
     parser.add_argument("--openclaw_visual_timeout_ms", type=int, default=30000)
     parser.add_argument("--openclaw_visual_model", default="")
     args = parser.parse_args()
@@ -535,6 +560,7 @@ def main() -> None:
         agent_session_id=args.agent_session_id,
         openclaw_visual_mode=args.openclaw_visual_mode,
         openclaw_visual_max_images=args.openclaw_visual_max_images,
+        openclaw_visual_interval_steps=args.openclaw_visual_interval_steps,
         openclaw_visual_timeout_ms=args.openclaw_visual_timeout_ms,
         openclaw_visual_model=args.openclaw_visual_model,
     )
