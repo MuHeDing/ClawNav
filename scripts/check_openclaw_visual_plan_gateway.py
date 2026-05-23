@@ -9,7 +9,10 @@ from typing import Any, Dict, List
 import requests
 
 from harness.openclaw.visual_analyzer import OpenClawVisualAnalyzer
-from scripts.check_openclaw_plan_gateway import validate_plan_response
+from scripts.check_openclaw_plan_gateway import (
+    validate_gateway_health,
+    validate_plan_response,
+)
 
 
 PROBE_PNG_BASE64 = (
@@ -73,15 +76,32 @@ def validate_visual_observations(
         raise ValueError("openclaw image capability returned an empty visual observation")
 
 
+def validate_visual_plan_response(data: Dict[str, Any]) -> None:
+    validate_plan_response(data)
+    runtime_metadata = data.get("runtime_metadata")
+    if not isinstance(runtime_metadata, dict):
+        raise ValueError("visual plan response missing runtime_metadata.visual_analysis")
+    visual_analysis = runtime_metadata.get("visual_analysis")
+    if not isinstance(visual_analysis, dict) or not visual_analysis.get("ran"):
+        raise ValueError("visual plan response missing runtime_metadata.visual_analysis.ran")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway_url", default="http://127.0.0.1:8011")
     parser.add_argument("--instruction", default="go to the kitchen and use visual memory")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--image_path", default="")
-    parser.add_argument("--model", default="qwen/qwen3.5-vl")
+    parser.add_argument("--model", default="qwen/qwen3.5-flash")
     parser.add_argument("--allow_empty_visual", action="store_true")
+    parser.add_argument("--require_service", default="openclaw_cli_plan_gateway")
     args = parser.parse_args()
+
+    session = requests.Session()
+    session.trust_env = False
+    health = session.get(f"{args.gateway_url.rstrip('/')}/health", timeout=args.timeout)
+    health.raise_for_status()
+    validate_gateway_health(health.json(), require_service=args.require_service)
 
     image_path = ensure_probe_image(args.image_path)
     analyzer = OpenClawVisualAnalyzer(
@@ -90,11 +110,6 @@ def main() -> None:
     )
     observations = analyzer.analyze([image_path])
     validate_visual_observations(observations, allow_empty_visual=args.allow_empty_visual)
-
-    session = requests.Session()
-    session.trust_env = False
-    health = session.get(f"{args.gateway_url.rstrip('/')}/health", timeout=args.timeout)
-    health.raise_for_status()
     response = session.post(
         f"{args.gateway_url.rstrip('/')}/plan",
         json=build_visual_probe_payload(args.instruction, image_path, observations),
@@ -102,7 +117,7 @@ def main() -> None:
     )
     response.raise_for_status()
     data = response.json()
-    validate_plan_response(data)
+    validate_visual_plan_response(data)
     print(
         json.dumps(
             {

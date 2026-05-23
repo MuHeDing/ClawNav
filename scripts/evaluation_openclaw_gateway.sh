@@ -13,7 +13,7 @@ fi
 
 OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://127.0.0.1:8011}
 OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-180}
-OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY:-/ssd/dingmuhe/Embodied-task/Navigation_Claw/ABot-Claw_Muhe/openclaw_layer/SERVICE.md}
+OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY-/ssd/dingmuhe/Embodied-task/Navigation_Claw/ABot-Claw_Muhe/openclaw_layer/SERVICE.md}
 OPENCLAW_SERVICE_HOST=${OPENCLAW_SERVICE_HOST:-127.0.0.1}
 NO_PROXY=${NO_PROXY:-127.0.0.1,localhost,::1}
 no_proxy=${no_proxy:-${NO_PROXY}}
@@ -68,8 +68,13 @@ EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
 DATA_PATH=${DATA_PATH:-}
 HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}
 MAX_STEPS=${MAX_STEPS:-400}
+if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_STEPS must be a positive integer; got '${MAX_STEPS}'" >&2
+  exit 2
+fi
 CHECK_GATEWAY=${CHECK_GATEWAY:-1}
 REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}
+REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}
 
 extra_args=()
 if [[ -n "${DATA_PATH}" ]]; then
@@ -83,6 +88,9 @@ if [[ -n "${HARNESS_EPISODE_KEYS}" ]]; then
 fi
 if [[ -n "${MEMORY_MANIFEST_PATH}" ]]; then
   extra_args+=(--memory_manifest_path "${MEMORY_MANIFEST_PATH}")
+fi
+if [[ -n "${OPENCLAW_SERVICE_REGISTRY}" ]]; then
+  extra_args+=(--openclaw_service_registry_path "${OPENCLAW_SERVICE_REGISTRY}")
 fi
 if [[ "${HARNESS_MEMORY_BACKEND}" == "spatial_http" ]]; then
   extra_args+=(--spatial_memory_url "${SPATIAL_MEMORY_URL}")
@@ -105,6 +113,7 @@ echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
 echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
 echo "OpenClaw critic/curator: ${OPENCLAW_ENABLE_SUBAGENT_CRITIC}/${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR}"
+echo "Require OpenClaw CLI adapter: ${REQUIRE_OPENCLAW_CLI_ADAPTER}"
 echo "Max episodes: ${HARNESS_DEBUG_MAX_EPISODES:-all}"
 echo "Episode keys: ${HARNESS_EPISODE_KEYS:-all}"
 echo "Max steps per episode: ${MAX_STEPS}"
@@ -115,10 +124,16 @@ echo "Torch processes: ${NPROC_PER_NODE}"
 export NO_PROXY no_proxy TOKENIZERS_PARALLELISM
 
 if [[ "${CHECK_GATEWAY}" == "1" ]]; then
+  gateway_check_args=(
+    --gateway_url "${OPENCLAW_GATEWAY_URL}"
+    --timeout "${OPENCLAW_GATEWAY_TIMEOUT}"
+  )
+  if [[ "${REQUIRE_OPENCLAW_CLI_ADAPTER}" == "1" ]]; then
+    gateway_check_args+=(--require_service openclaw_cli_plan_gateway)
+  fi
   if ! PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
     scripts/check_openclaw_plan_gateway.py \
-    --gateway_url "${OPENCLAW_GATEWAY_URL}" \
-    --timeout "${OPENCLAW_GATEWAY_TIMEOUT}"; then
+    "${gateway_check_args[@]}"; then
     if [[ "${REQUIRE_GATEWAY}" == "1" ]]; then
       echo "OpenClaw gateway preflight failed and REQUIRE_GATEWAY=1" >&2
       exit 2
@@ -148,6 +163,5 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
   --openclaw_gateway_url "${OPENCLAW_GATEWAY_URL}" \
   --openclaw_gateway_timeout "${OPENCLAW_GATEWAY_TIMEOUT}" \
   --openclaw_executor_backend "${OPENCLAW_EXECUTOR_BACKEND}" \
-  --openclaw_service_registry_path "${OPENCLAW_SERVICE_REGISTRY}" \
   --openclaw_service_host "${OPENCLAW_SERVICE_HOST}" \
   "${extra_args[@]}"

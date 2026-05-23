@@ -1,6 +1,11 @@
-from scripts.check_openclaw_plan_gateway import build_probe_payload, validate_plan_response
+from scripts.check_openclaw_plan_gateway import (
+    build_probe_payload,
+    validate_gateway_health,
+    validate_plan_response,
+)
 from scripts.check_openclaw_visual_plan_gateway import (
     build_visual_probe_payload,
+    validate_visual_plan_response,
     validate_visual_observations,
 )
 
@@ -29,6 +34,18 @@ def test_validate_plan_response_rejects_bad_response():
         validate_plan_response({"intent": "act"})
     except ValueError as exc:
         assert "tool_name" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_validate_gateway_health_rejects_wrong_adapter_service_when_required():
+    try:
+        validate_gateway_health(
+            {"ok": True, "service": "clawnav_openclaw_gateway"},
+            require_service="openclaw_cli_plan_gateway",
+        )
+    except ValueError as exc:
+        assert "openclaw_cli_plan_gateway" in str(exc)
     else:
         raise AssertionError("expected ValueError")
 
@@ -67,3 +84,26 @@ def test_validate_visual_observations_rejects_empty_or_failed_observation():
             pass
         else:
             raise AssertionError("expected ValueError")
+
+
+def test_validate_visual_plan_response_requires_adapter_visual_metadata():
+    response = {
+        "intent": "act",
+        "tool_name": "NavigationPolicySkill",
+        "arguments": {},
+        "reason": "ok",
+    }
+
+    try:
+        validate_visual_plan_response(response)
+    except ValueError as exc:
+        assert "visual_analysis" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+    validate_visual_plan_response(
+        {
+            **response,
+            "runtime_metadata": {"visual_analysis": {"ran": True, "failures": 0}},
+        }
+    )

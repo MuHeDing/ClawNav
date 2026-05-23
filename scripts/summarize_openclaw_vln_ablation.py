@@ -46,8 +46,39 @@ def _is_duplicate_skip(write: Dict[str, Any]) -> bool:
     )
 
 
+def _result_step_stats(path: Path) -> Dict[str, Any]:
+    result_path = path / "result.json"
+    if not result_path.exists():
+        return {
+            "result_episodes": 0,
+            "min_episode_steps": 0,
+            "max_episode_steps": 0,
+            "all_episodes_one_step": False,
+            "invalid_run_reason": "",
+        }
+
+    steps: List[int] = []
+    for line in result_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        value = record.get("steps")
+        if isinstance(value, int):
+            steps.append(value)
+
+    all_one_step = bool(steps) and all(step == 1 for step in steps)
+    return {
+        "result_episodes": len(steps),
+        "min_episode_steps": min(steps) if steps else 0,
+        "max_episode_steps": max(steps) if steps else 0,
+        "all_episodes_one_step": all_one_step,
+        "invalid_run_reason": "all_episodes_ended_after_one_step" if all_one_step else "",
+    }
+
+
 def summarize_run(path: Path) -> Dict[str, Any]:
     summary = json.loads((path / "summary.json").read_text(encoding="utf-8"))
+    result_step_stats = _result_step_stats(path)
     trace_path = path / "harness_traces" / "harness_trace_rank0.jsonl"
     trace_steps = 0
     memory_recall_steps = 0
@@ -153,6 +184,7 @@ def summarize_run(path: Path) -> Dict[str, Any]:
         "success": summary.get("sucs_all", 0.0),
         "spl": summary.get("spls_all", 0.0),
         "length": summary.get("length", 0),
+        **result_step_stats,
         "trace_steps": trace_steps,
         "memory_recall_steps": memory_recall_steps,
         "oracle_leakage_steps": oracle_leakage_steps,

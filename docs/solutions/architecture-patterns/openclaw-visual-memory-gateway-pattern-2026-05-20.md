@@ -55,7 +55,7 @@ Visual mode is enabled on the gateway, not inside the evaluation script:
 
 ```bash
 OPENCLAW_VISUAL_MODE=describe \
-OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-vl \
+OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-flash \
 OPENCLAW_VISUAL_MAX_IMAGES=2 \
 OPENCLAW_VISUAL_TIMEOUT_MS=90000 \
 HOST=127.0.0.1 PORT=8011 ./scripts/start_openclaw_cli_plan_gateway.sh

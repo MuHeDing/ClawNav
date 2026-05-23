@@ -52,6 +52,7 @@ def make_args(tmp_path, **overrides):
         "openclaw_enable_subagent_planner": False,
         "openclaw_enable_subagent_critic": False,
         "openclaw_enable_subagent_memory_curator": False,
+        "openclaw_allow_planner_action_override": False,
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -187,6 +188,7 @@ def test_proxy_payload_exposes_keyframe_candidate_without_image_object(tmp_path)
 
     payload = proxy._runtime_payload(["frame0"], step_id=0)
 
+    assert payload["run_id"] == str(tmp_path)
     assert payload["keyframe_candidate"]["step_id"] == 0
     assert "image" not in payload["keyframe_candidate"]
     assert payload["keyframe_candidate"]["reason"] == "interval"

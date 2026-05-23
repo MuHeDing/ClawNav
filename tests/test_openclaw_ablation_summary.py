@@ -137,6 +137,32 @@ def test_summarize_run_reports_write_gate_skips_and_namespace_distribution(tmp_p
     assert summary["visual_analysis_failures"] == 1
 
 
+def test_summarize_run_flags_all_one_step_results_as_invalid(tmp_path):
+    run = tmp_path / "run"
+    traces = run / "harness_traces"
+    traces.mkdir(parents=True)
+    (run / "summary.json").write_text(
+        json.dumps({"sucs_all": 0.0, "spls_all": 0.0, "length": 2}),
+        encoding="utf-8",
+    )
+    (run / "result.json").write_text(
+        "\n".join(
+            [
+                json.dumps({"episode_id": "1", "success": 0.0, "steps": 1}),
+                json.dumps({"episode_id": "2", "success": 0.0, "steps": 1}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (traces / "harness_trace_rank0.jsonl").write_text("", encoding="utf-8")
+
+    summary = summarize_run(run)
+
+    assert summary["all_episodes_one_step"] is True
+    assert summary["invalid_run_reason"] == "all_episodes_ended_after_one_step"
+
+
 def test_format_markdown_reports_core_ablation_metrics():
     markdown = format_markdown(
         [

@@ -20,6 +20,7 @@ class HarnessConfig:
     openclaw_enable_subagent_planner: bool = False
     openclaw_enable_subagent_critic: bool = False
     openclaw_enable_subagent_memory_curator: bool = False
+    openclaw_allow_planner_action_override: bool = False
     max_internal_calls_per_step: int = 3
     recall_interval_steps: int = 5
     max_replans_per_episode: int = 3

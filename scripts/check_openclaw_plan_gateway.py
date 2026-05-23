@@ -36,17 +36,35 @@ def validate_plan_response(data: Dict[str, Any]) -> None:
         raise ValueError("arguments must be an object")
 
 
+def validate_gateway_health(
+    data: Dict[str, Any],
+    require_service: str = "",
+) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("gateway health response must be an object")
+    if not data.get("ok"):
+        raise ValueError("gateway health is not ok")
+    if require_service:
+        service = str(data.get("service") or "")
+        if service != require_service:
+            raise ValueError(
+                f"gateway service must be {require_service}; got {service or '<missing>'}"
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway_url", default="http://127.0.0.1:8011")
     parser.add_argument("--instruction", default="go to kitchen")
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--require_service", default="")
     args = parser.parse_args()
 
     session = requests.Session()
     session.trust_env = False
     health = session.get(f"{args.gateway_url.rstrip('/')}/health", timeout=args.timeout)
     health.raise_for_status()
+    validate_gateway_health(health.json(), require_service=args.require_service)
     response = session.post(
         f"{args.gateway_url.rstrip('/')}/plan",
         json=build_probe_payload(args.instruction),

@@ -34,7 +34,7 @@ def test_visual_analyzer_describes_images_with_openclaw_capability():
     runner = FakeOpenClawRunner()
     analyzer = OpenClawVisualAnalyzer(
         run_openclaw=runner,
-        model="qwen/qwen3.5-vl",
+        model="qwen/qwen3.5-flash",
         timeout_ms=30000,
     )
 
@@ -52,7 +52,7 @@ def test_visual_analyzer_describes_images_with_openclaw_capability():
             "confidence": None,
             "analysis_metadata": {
                 "vlm_latency_ms": observations[0]["analysis_metadata"]["vlm_latency_ms"],
-                "visual_model": "qwen/qwen3.5-vl",
+                "visual_model": "qwen/qwen3.5-flash",
                 "visual_mode": "describe",
                 "cache_hit": False,
                 "error": False,
@@ -64,7 +64,7 @@ def test_visual_analyzer_describes_images_with_openclaw_capability():
     assert command[:4] == ["openclaw", "capability", "image", "describe-many"]
     assert command.count("--file") == 1
     assert "--json" in command
-    assert command[command.index("--model") + 1] == "qwen/qwen3.5-vl"
+    assert command[command.index("--model") + 1] == "qwen/qwen3.5-flash"
     assert command[command.index("--timeout-ms") + 1] == "30000"
 
 

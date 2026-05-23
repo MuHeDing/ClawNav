@@ -32,7 +32,7 @@ def test_visual_ablation_variants_declare_qwen_visual_gateway_configuration():
             continue
         args = " ".join(item["args"])
         assert "OPENCLAW_VISUAL_MODE=describe" in args
-        assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-vl}" in args
+        assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in args
         assert "OPENCLAW_VISUAL_TIMEOUT_MS=30000" in args
         assert "--openclaw_planner_backend gateway" in args
 

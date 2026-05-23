@@ -937,7 +937,7 @@ Only run when OpenClaw and Qwen credentials are configured:
 
 ```bash
 OPENCLAW_VISUAL_MODE=describe \
-OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-vl \
+OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-flash \
 HOST=127.0.0.1 PORT=8011 ./scripts/start_openclaw_cli_plan_gateway.sh
 ```
 
@@ -946,7 +946,7 @@ Then:
 ```bash
 PYTHONPATH=.:src python scripts/check_openclaw_visual_plan_gateway.py \
   --gateway_url http://127.0.0.1:8011 \
-  --model qwen/qwen3.5-vl \
+  --model qwen/qwen3.5-flash \
   --image_path /path/to/sample.png \
   --timeout 90
 ```
@@ -973,4 +973,3 @@ git commit -m "docs: plan visual memory completion work"
 - VLM analyzer latency is measured at `OpenClawVisualAnalyzer` and propagated separately from OpenClaw agent/runtime/tool latency.
 - Ablation summary reports VLM latency, novelty score, duplicate skips, action changes, and planner-intent changes.
 - Focused plan test suite passes.
-

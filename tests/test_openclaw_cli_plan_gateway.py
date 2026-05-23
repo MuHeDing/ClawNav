@@ -39,7 +39,7 @@ class FakeVisualAnalyzer:
                 "confidence": 0.8,
                 "analysis_metadata": {
                     "vlm_latency_ms": 12.5,
-                    "visual_model": "qwen/qwen3.5-vl",
+                    "visual_model": "qwen/qwen3.5-flash",
                     "visual_mode": "describe",
                     "cache_hit": path.endswith("key1.png"),
                     "error": False,
@@ -107,7 +107,7 @@ def test_cli_plan_gateway_agent_mode_calls_openclaw_agent_and_parses_json_text()
                         )
                     }
                 ],
-                "meta": {"agentMeta": {"provider": "qwen", "model": "qwen3.5-plus"}},
+                "meta": {"agentMeta": {"provider": "qwen", "model": "qwen3.5-flash"}},
             }
         )
     )
@@ -241,9 +241,117 @@ def test_cli_plan_gateway_agent_mode_uses_fresh_openclaw_session_per_planner():
     args_b = runner_b.calls[0][0]
     session_id_a = args_a[args_a.index("--session-id") + 1]
     session_id_b = args_b[args_b.index("--session-id") + 1]
-    assert session_id_a.startswith("clawnav-")
-    assert session_id_b.startswith("clawnav-")
-    assert session_id_a != session_id_b
+    assert session_id_a.startswith("clawnav-scene-")
+    assert session_id_b.startswith("clawnav-scene-")
+    assert len(session_id_a.rsplit("-", 1)[-1]) == 8
+
+
+def test_cli_plan_gateway_agent_mode_uses_fresh_session_per_plan_step():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "fresh request",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_session_id="base-session",
+        agent_session_timestamp="05221040",
+    )
+
+    planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go",
+                "step_id": 2,
+            },
+            "runtime_context": {"run_id": "results/run"},
+        }
+    )
+    planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go",
+                "step_id": 3,
+            },
+            "runtime_context": {"run_id": "results/run"},
+        }
+    )
+
+    first_args = runner.calls[0][0]
+    second_args = runner.calls[1][0]
+    first_session_id = first_args[first_args.index("--session-id") + 1]
+    second_session_id = second_args[second_args.index("--session-id") + 1]
+    assert first_session_id == "base-session-results_run-scene_A-ep:1-step_2-05221040"
+    assert second_session_id == "base-session-results_run-scene_A-ep:1-step_3-05221040"
+    assert first_session_id != second_session_id
+
+    first_message = first_args[first_args.index("--message") + 1]
+    first_payload = json.loads(first_message.split("Payload:\n", 1)[1])
+    assert first_payload["state"]["scene_id"] == "scene/A"
+    assert first_payload["state"]["episode_id"] == "ep:1"
+
+
+def test_cli_plan_gateway_agent_mode_isolates_session_by_scene():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "fresh request",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_session_id="base-session",
+        agent_session_timestamp="05221040",
+    )
+
+    payload = {
+        "state": {
+            "episode_id": "ep:1",
+            "instruction": "go",
+            "step_id": 2,
+        }
+    }
+    planner.plan_payload({"state": {**payload["state"], "scene_id": "scene/A"}})
+    planner.plan_payload({"state": {**payload["state"], "scene_id": "scene/B"}})
+
+    first_args = runner.calls[0][0]
+    second_args = runner.calls[1][0]
+    first_session_id = first_args[first_args.index("--session-id") + 1]
+    second_session_id = second_args[second_args.index("--session-id") + 1]
+    assert first_session_id == "base-session-scene_A-ep:1-step_2-05221040"
+    assert second_session_id == "base-session-scene_B-ep:1-step_2-05221040"
+    assert first_session_id != second_session_id
 
 
 def test_cli_plan_gateway_agent_mode_normalizes_action_text_argument():
@@ -510,7 +618,7 @@ def test_cli_plan_gateway_enriches_write_memory_with_visual_observation_defaults
     assert decision["arguments"]["landmarks"] == ["doorway"]
 
 
-def test_cli_plan_gateway_agent_prompt_uses_minimal_payload():
+def test_cli_plan_gateway_agent_prompt_uses_bounded_recall_context():
     runner = FakeOpenClawRunner(
         stdout=json.dumps(
             {
@@ -540,6 +648,7 @@ def test_cli_plan_gateway_agent_prompt_uses_minimal_payload():
                 "success": True,
             },
             "runtime_context": {
+                "run_id": "results/run",
                 "policy_action": "TURN_LEFT",
                 "current_image_path": "/tmp/current.png",
                 "recent_keyframe_paths": ["/tmp/key0.png"],
@@ -550,6 +659,7 @@ def test_cli_plan_gateway_agent_prompt_uses_minimal_payload():
                     "raw_frame": "x" * 2000,
                 },
                 "memory_context_text": "m" * 2000,
+                "memory_images": ["/tmp/memory0.png", "/tmp/memory1.png", "/tmp/memory2.png"],
                 "recent_frames": ["frame"] * 20,
                 "distance_to_goal": 1.0,
             },
@@ -573,13 +683,66 @@ def test_cli_plan_gateway_agent_prompt_uses_minimal_payload():
                 "step_id": 2,
             },
             "policy_action": "TURN_LEFT",
+            "run_id": "results/run",
             "recent_keyframe_paths": ["/tmp/key0.png"],
+            "memory_context_text": "m" * 300,
+            "memory_images": ["/tmp/memory0.png", "/tmp/memory1.png"],
         },
     }
-    assert len(message) < 1500
+    assert len(message) < 1900
     assert "distance_to_goal" not in message
-    assert "memory_context_text" not in message
     assert "raw_frame" not in message
+
+
+def test_cli_plan_gateway_agent_prompt_includes_bounded_context_engine_fields():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {},
+                                "reason": "ok",
+                            }
+                        )
+                    }
+                ]
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(run_openclaw=runner, planner_mode="agent")
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 3},
+            "runtime_context": {
+                "run_id": "results/run",
+                "task_state": {
+                    "scene_id": "s1",
+                    "episode_id": "e1",
+                    "instruction": "go",
+                    "current_step_id": 3,
+                    "last_action_text": "TURN_LEFT",
+                    "last_planner_reason": "r" * 1000,
+                    "unbounded_internal_note": "x" * 1000,
+                },
+                "recent_step_summary": "s" * 1000,
+                "retrieved_memory_ids": ["mem1", "mem2", "mem3", "mem4"],
+            },
+        }
+    )
+
+    message = runner.calls[0][0][runner.calls[0][0].index("--message") + 1]
+    payload_text = message.split("Payload:\n", 1)[1]
+    prompt_payload = json.loads(payload_text)
+    runtime_context = prompt_payload["runtime_context"]
+    assert runtime_context["task_state"]["last_action_text"] == "TURN_LEFT"
+    assert "unbounded_internal_note" not in runtime_context["task_state"]
+    assert len(runtime_context["recent_step_summary"]) == 500
+    assert runtime_context["retrieved_memory_ids"] == ["mem1", "mem2", "mem3"]
 
 
 def test_cli_plan_gateway_agent_mode_passes_openclaw_profile():
@@ -634,3 +797,100 @@ def test_cli_plan_gateway_agent_mode_falls_back_to_heuristic_when_agent_fails():
     assert decision["tool_name"] == "MemoryQuerySkill"
     assert decision["reason"] == "openclaw_cli_agent_fallback:openclaw_cli_interval_recall"
     assert "qwen unavailable" in decision["arguments"]["planner_error"]
+
+
+def test_cli_plan_gateway_agent_mode_stops_when_input_token_limit_is_reached():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "would move",
+                            }
+                        )
+                    }
+                ],
+                "usage": {"input": 10000, "output": 10, "totalTokens": 10010},
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_max_input_tokens=10000,
+    )
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+    second = planner.plan_payload({"state": {"instruction": "go", "step_id": 3}})
+
+    assert decision["intent"] == "act"
+    assert decision["tool_name"] == "NavigationPolicySkill"
+    assert decision["arguments"]["action_text"] == "STOP"
+    assert decision["reason"] == "openclaw_agent_input_token_limit"
+    assert decision["arguments"]["input_tokens"] == 10000
+    assert decision["arguments"]["max_input_tokens"] == 10000
+    assert decision["runtime_metadata"]["agent_token_guard"]["tripped"] is True
+    assert second["arguments"]["action_text"] == "STOP"
+    assert len(runner.calls) == 1
+
+
+def test_cli_plan_gateway_agent_mode_records_context_audit_metadata():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "use bounded context",
+                            }
+                        )
+                    }
+                ],
+                "usage": {"input": 900, "output": 12, "totalTokens": 912},
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_session_id="base-session",
+        agent_session_timestamp="05221040",
+        agent_max_input_tokens=10000,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go",
+                "step_id": 2,
+            },
+            "runtime_context": {"run_id": "results/run"},
+        }
+    )
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["context_profile"] == "plan"
+    assert audit["openclaw_session_mode"] == "fresh_per_step"
+    assert audit["openclaw_session_id"] == (
+        "base-session-results_run-scene_A-ep:1-step_2-05221040"
+    )
+    assert audit["history_tokens"] == 0
+    assert audit["assembled_prompt_tokens"] > 0
+    assert audit["provider_input_tokens"] == 900
+    assert audit["hidden_history_tokens_estimate"] == (
+        audit["provider_input_tokens"] - audit["assembled_prompt_tokens"]
+    )
+    assert audit["agent_max_input_tokens"] == 10000
+    assert audit["qwen_hard_max_input_tokens"] == 50000
+    assert audit["token_limit_exceeded"] is False

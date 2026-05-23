@@ -64,6 +64,31 @@ class RecordingMemorySkill(Skill):
         )
 
 
+class MemoryContextSkill(Skill):
+    name = "MemoryQuerySkill"
+    description = "Returns policy memory context."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        return SkillResult.ok_result(
+            "memory",
+            {
+                "memory_hits": [],
+                "query": payload.get("text", ""),
+                "step_id": payload.get("step_id", state.step_id),
+                "policy_context": {
+                    "memory_context_text": "remember the bright doorway",
+                    "memory_images": ["/tmp/doorway.png"],
+                },
+            },
+        )
+
+
 class FailingGatewayPlanner:
     def plan(self, state, runtime_context):
         raise OpenClawGatewayError("502 Server Error: Bad Gateway for url: http://gateway/plan")
@@ -75,6 +100,34 @@ class StaticPlanner:
 
     def plan(self, state, runtime_context):
         return self.decision
+
+
+class RecordingPlanner:
+    def __init__(self, decision):
+        self.decision = decision
+        self.payloads = []
+
+    def plan(self, state, runtime_context):
+        self.payloads.append(dict(runtime_context))
+        return self.decision
+
+
+class SequencePlanner:
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+        self.payloads = []
+
+    def plan(self, state, runtime_context):
+        self.payloads.append(dict(runtime_context))
+        if self.decisions:
+            return self.decisions.pop(0)
+        return OpenClawPlanDecision(
+            intent="act",
+            tool_name="NavigationPolicySkill",
+            arguments={"action_text": "TURN_LEFT"},
+            reason="default",
+            planner_backend="gateway",
+        )
 
 
 class RecallThenReplanPlanner:
@@ -224,6 +277,114 @@ def test_runtime_can_use_gateway_planner_client():
     assert result.runtime_metadata["planner_reason"] == "gateway_test"
 
 
+def test_runtime_preserves_gateway_context_audit_metadata():
+    registry = SkillRegistry()
+    registry.register(EchoNavigationSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=FakeOpenClawGatewayClient(
+            {
+                "intent": "act",
+                "tool_name": "NavigationPolicySkill",
+                "arguments": {},
+                "reason": "gateway_test",
+                "runtime_metadata": {
+                    "context_audit": {
+                        "openclaw_session_mode": "fresh_per_step",
+                        "provider_input_tokens": 900,
+                    }
+                },
+            }
+        ),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(make_state(step_id=1), payload={})
+
+    assert result.runtime_metadata["context_audit"]["openclaw_session_mode"] == (
+        "fresh_per_step"
+    )
+    assert result.runtime_metadata["context_audit"]["provider_input_tokens"] == 900
+
+
+def test_runtime_injects_bounded_context_engine_summary_on_next_step(tmp_path):
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "TURN_LEFT"},
+        reason="planner chose visible doorway",
+        planner_backend="gateway",
+    )
+    planner = RecordingPlanner(decision)
+    registry = SkillRegistry()
+    registry.register(RecordingNavigationSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    first = runtime.step(
+        make_state(step_id=0),
+        payload={"run_id": str(tmp_path), "current_image_path": "/tmp/step0.png"},
+    )
+    second = runtime.step(make_state(step_id=1), payload={"run_id": str(tmp_path)})
+
+    assert first.runtime_metadata["context_engine"]["recorded"] is True
+    assert second.runtime_metadata["context_engine"]["recorded"] is True
+    assert planner.payloads[0]["task_state"]["current_step_id"] == 0
+    assert "recent_step_summary" not in planner.payloads[0]
+    assert planner.payloads[1]["task_state"]["last_action_text"] == "TURN_LEFT"
+    assert "Step 0: TURN_LEFT" in planner.payloads[1]["recent_step_summary"]
+    assert (tmp_path / "openclaw_context_engine" / "running_summary.md").exists()
+
+
+def test_runtime_mirrors_memory_writes_into_context_engine_retrieval(tmp_path):
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="write_memory",
+                tool_name="MemoryWriteSkill",
+                arguments={
+                    "step_id": 0,
+                    "note": "blue doorway landmark",
+                    "caption": "blue doorway ahead",
+                },
+                reason="store landmark",
+                planner_backend="gateway",
+            ),
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="NavigationPolicySkill",
+                arguments={"action_text": "MOVE_FORWARD"},
+                reason="use recalled landmark",
+                planner_backend="gateway",
+            ),
+        ]
+    )
+    registry = SkillRegistry()
+    registry.register(RecordingNavigationSkill())
+    registry.register(MemoryWriteSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    first = runtime.step(make_state(step_id=0), payload={"run_id": str(tmp_path)})
+    second = runtime.step(
+        make_state(step_id=1),
+        payload={"run_id": str(tmp_path), "memory_query": "blue doorway"},
+    )
+
+    assert first.runtime_metadata["context_engine"]["mirrored_memory_ids"] == [
+        "mem_000001"
+    ]
+    assert second.runtime_metadata["context_engine"]["recorded"] is True
+    assert planner.payloads[1]["retrieved_memory_ids"] == ["mem_000001"]
+    assert "blue doorway ahead" in planner.payloads[1]["memory_context_text"]
+
+
 def test_runtime_falls_back_to_rule_planner_when_gateway_fails():
     registry = SkillRegistry()
     registry.register(EchoNavigationSkill())
@@ -331,6 +492,86 @@ def test_runtime_uses_planner_action_override_without_policy_action():
     assert result.executor_command["action_index"] == 1
     assert navigation.calls == []
     assert result.runtime_metadata["planner_action_override"] == "MOVE_FORWARD"
+
+
+def test_runtime_can_treat_planner_action_as_guidance_without_skipping_policy():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "MOVE_FORWARD", "active_subgoal": "follow the archway"},
+        reason="planner guidance",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(make_state(step_id=4), payload={})
+
+    assert result.ok is True
+    assert result.action_text == "TURN_LEFT"
+    assert navigation.calls[0]["active_subgoal"] == "follow the archway"
+    assert "planner_action_override" not in result.runtime_metadata
+    assert result.runtime_metadata["planner_action_guidance"] == "MOVE_FORWARD"
+
+
+def test_runtime_does_not_promote_planner_action_to_policy_subgoal():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "MOVE_FORWARD"},
+        reason="turn toward the doorway",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(make_state(step_id=4), payload={})
+
+    assert result.ok is True
+    assert "active_subgoal" not in navigation.calls[0]
+    assert result.runtime_metadata["planner_action_guidance"] == "MOVE_FORWARD"
+
+
+def test_runtime_filters_planner_stop_guidance_without_skipping_policy():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "STOP"},
+        reason="goal reached",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(make_state(step_id=4), payload={})
+
+    assert result.ok is True
+    assert result.action_text == "TURN_LEFT"
+    assert "active_subgoal" not in navigation.calls[0]
+    assert "planner_action_override" not in result.runtime_metadata
+    assert "policy_skipped" not in result.runtime_metadata
+    assert result.runtime_metadata["planner_action_guidance"] == "STOP"
 
 
 def test_runtime_records_image_paths_used_in_metadata():
@@ -515,6 +756,108 @@ def test_runtime_uses_planner_visual_analysis_latency_metadata():
     result = runtime.step(make_state(step_id=2), payload={})
 
     assert result.runtime_metadata["visual_analysis"]["vlm_latency_ms"] == 37.5
+
+
+def test_runtime_auto_writes_and_recalls_planner_visual_analysis_for_policy():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "MOVE_FORWARD"},
+        reason="visual doorway guidance",
+        planner_backend="gateway",
+        runtime_metadata={
+            "visual_analysis": {
+                "ran": True,
+                "image_paths": ["/tmp/current.png"],
+                "observations": [
+                    {
+                        "image_path": "/tmp/current.png",
+                        "caption": "A bright doorway next to the hall.",
+                        "visual_observation": "The doorway is a useful navigation landmark.",
+                        "landmarks": ["bright doorway"],
+                        "confidence": 0.9,
+                    }
+                ],
+            }
+        },
+    )
+    store = []
+    navigation = RecordingNavigationSkill()
+    memory = MemoryContextSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(memory)
+    registry.register(VisualMemoryCuratorSkill())
+    registry.register(MemoryWriteSkill(store=store))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(
+        make_state(step_id=0),
+        payload={"current_image_path": "/tmp/current.png"},
+    )
+
+    assert result.ok is True
+    assert store[0]["image_path"] == "/tmp/current.png"
+    assert result.runtime_metadata["tool_calls"][0]["tool_name"] == "VisualMemoryCuratorSkill"
+    assert result.runtime_metadata["tool_calls"][1]["tool_name"] == "MemoryWriteSkill"
+    assert result.runtime_metadata["tool_calls"][2]["tool_name"] == "MemoryQuerySkill"
+    assert result.runtime_metadata["memory_writes"][0]["written"] is True
+    assert result.runtime_metadata["recall_usage"][0]["used_by_policy"] is True
+    assert navigation.calls[0]["memory_context_text"] == "remember the bright doorway"
+    assert "memory_images" not in navigation.calls[0]
+
+
+def test_runtime_supplies_auto_recalled_visual_memory_to_next_planner_call():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"action_text": "MOVE_FORWARD"},
+        reason="visual doorway guidance",
+        planner_backend="gateway",
+        runtime_metadata={
+            "visual_analysis": {
+                "ran": True,
+                "image_paths": ["/tmp/current.png"],
+                "observations": [
+                    {
+                        "image_path": "/tmp/current.png",
+                        "caption": "A bright doorway next to the hall.",
+                        "visual_observation": "The doorway is a useful navigation landmark.",
+                        "landmarks": ["bright doorway"],
+                        "confidence": 0.9,
+                    }
+                ],
+            }
+        },
+    )
+    store = []
+    planner = RecordingPlanner(decision)
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(MemoryContextSkill())
+    registry.register(VisualMemoryCuratorSkill())
+    registry.register(MemoryWriteSkill(store=store))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+    )
+
+    runtime.step(make_state(step_id=0), payload={"current_image_path": "/tmp/current.png"})
+    runtime.step(make_state(step_id=1), payload={"current_image_path": "/tmp/next.png"})
+
+    assert planner.payloads[0].get("memory_context_text") is None
+    assert planner.payloads[1]["memory_context_text"] == "remember the bright doorway"
+    assert planner.payloads[1]["memory_images"] == ["/tmp/doorway.png"]
+    assert navigation.calls[1]["memory_context_text"] == "remember the bright doorway"
+    assert "memory_images" not in navigation.calls[1]
 
 
 def test_runtime_enriches_recall_memory_with_visual_observation_and_episode_namespace():

@@ -36,6 +36,9 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}" in contents
     assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
     assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-180}" in contents
+    assert "MAX_STEPS must be a positive integer" in contents
+    assert "REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}" in contents
+    assert "--require_service openclaw_cli_plan_gateway" in contents
     assert "--harness_debug_max_episodes" in contents
     assert "--max_steps" in contents
 
@@ -58,11 +61,14 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "OPENCLAW_GATEWAY_WS_URL" in contents
     assert "OPENCLAW_VISUAL_MODE" in contents
     assert "OPENCLAW_AGENT_TIMEOUT=${OPENCLAW_AGENT_TIMEOUT:-180}" in contents
+    assert "OPENCLAW_AGENT_MAX_INPUT_TOKENS=${OPENCLAW_AGENT_MAX_INPUT_TOKENS:-10000}" in contents
+    assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
     assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents
     assert "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}" in contents
     assert "--openclaw_visual_mode" in contents
     assert "--openclaw_visual_interval_steps" in contents
     assert "--openclaw_visual_model" in contents
+    assert "--agent_max_input_tokens" in contents
 
 
 def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():
@@ -71,9 +77,13 @@ def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():
     contents = script.read_text(encoding="utf-8")
 
     assert "OPENCLAW_VISUAL_MODE=${OPENCLAW_VISUAL_MODE:-describe}" in contents
-    assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-vl}" in contents
+    assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
+    assert "HARNESS_MEMORY_BACKEND=${HARNESS_MEMORY_BACKEND:-spatial_http}" in contents
+    assert "OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY-}" in contents
     assert "scripts/check_openclaw_visual_plan_gateway.py" in contents
     assert "REQUIRE_VISUAL_GATEWAY=${REQUIRE_VISUAL_GATEWAY:-1}" in contents
+    assert "REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-1}" in contents
+    assert "REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}" in contents
     assert "./scripts/evaluation_openclaw_gateway.sh" in contents
 
 
@@ -89,3 +99,13 @@ def test_openclaw_gateway_script_can_enable_visual_memory_curator_and_critic():
     )
     assert "--openclaw_enable_subagent_critic" in contents
     assert "--openclaw_enable_subagent_memory_curator" in contents
+
+
+def test_openclaw_gateway_script_respects_empty_service_registry_override():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY-" in contents
+    assert 'if [[ -n "${OPENCLAW_SERVICE_REGISTRY}" ]]; then' in contents
+    assert '--openclaw_service_registry_path "${OPENCLAW_SERVICE_REGISTRY}"' in contents

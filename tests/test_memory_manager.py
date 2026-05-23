@@ -85,6 +85,44 @@ def test_memory_manager_recall_uses_visual_fields_in_policy_context():
     assert result.executor_context["topological_anchor"] == "doorway"
 
 
+def test_memory_manager_compacts_visual_evidence_for_policy_context():
+    verbose_visual_memory = """
+The user wants a description of the image focused on navigation-relevant visual evidence.
+I need to break down the image into key components:
+1. Place Category: It is a large formal interior room.
+2. Spatial Layout: A clear central corridor leads directly to the central archway.
+3. Stable Landmarks: Wooden balcony above the archway and wall sconces flank the target.
+Drafting the description:
+The open floor in the middle is the primary forward path with no obstacle.
+"""
+    hit = MemoryHit(
+        memory_id="m1",
+        memory_type="place",
+        name=verbose_visual_memory,
+        confidence=0.82,
+        image_path="/tmp/keyframe.png",
+        metadata={
+            "visual_observation": verbose_visual_memory,
+            "memory_scope": "episode",
+            "memory_namespace": "episode:s1:e1",
+        },
+    )
+    manager = MemoryManager(
+        RecordingMemoryClient([hit]),
+        HarnessConfig(max_prompt_context_chars=1000),
+    )
+
+    result = manager.recall(text="wait at the archway", step_id=4)
+
+    context = result.policy_context["memory_context_text"]
+    assert "The user wants" not in context
+    assert "I need to" not in context
+    assert "Drafting the description" not in context
+    assert "central corridor leads directly to the central archway" in context
+    assert context.startswith("- place:")
+    assert len(context) < 260
+
+
 def test_memory_manager_recall_builds_query_from_visual_context_and_filters_namespace():
     matching = MemoryHit(
         memory_id="m1",
@@ -121,6 +159,27 @@ def test_memory_manager_recall_builds_query_from_visual_context_and_filters_name
     assert "sofa on right" in query_text
     assert "oscillation" in query_text
     assert [hit.memory_id for hit in result.hits] == ["m1"]
+
+
+def test_memory_manager_strict_scope_drops_hits_without_scope_metadata():
+    external_hit = MemoryHit(
+        memory_id="m1",
+        memory_type="semantic_frame",
+        name="doorway",
+        confidence=0.9,
+        evidence_text="A doorway beside the kitchen.",
+        metadata={},
+    )
+    manager = MemoryManager(RecordingMemoryClient([external_hit]), HarnessConfig())
+
+    result = manager.recall(
+        text="go to kitchen",
+        step_id=4,
+        allowed_scopes=["episode"],
+        memory_namespace="episode:s1:e1",
+    )
+
+    assert result.hits == []
 
 
 def test_memory_manager_passes_scope_filters_before_semantic_query():

@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+from harness.memory.context_engine import MemoryAwareContextEngine
 from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
 from harness.skill_registry import SkillRegistry
@@ -17,7 +19,6 @@ PRE_ACTION_INTENTS = {
 NAVIGATION_CONTEXT_KEYS = {
     "active_subgoal",
     "memory_context_text",
-    "memory_images",
     "recent_frames",
 }
 
@@ -63,13 +64,16 @@ class OpenClawVLNRuntime:
         planner: OpenClawPlannerProtocol,
         executor: HabitatOpenClawExecutor,
         fallback_planner: OpenClawPlannerProtocol = None,
+        allow_planner_action_override: bool = True,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
         self.executor = executor
         self.fallback_planner = fallback_planner
+        self.allow_planner_action_override = allow_planner_action_override
         self.recent_visual_memories: List[Dict[str, Any]] = []
         self.max_recent_visual_memories = 10
+        self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -81,26 +85,57 @@ class OpenClawVLNRuntime:
     ) -> OpenClawRuntimeStepResult:
         planner_error = ""
         planner_fallback = False
-        image_paths_used = self._image_paths_used(payload)
+        runtime_payload = dict(payload)
+        tool_calls: List[Dict[str, Any]] = []
+        context_engine = self._context_engine_for_payload(runtime_payload)
+
+        pre_planner_recall = self._auto_recall_memory(
+            state,
+            runtime_payload,
+            reason="pre_planner_visual_memory_recall",
+        )
+        if pre_planner_recall:
+            tool_calls.append(pre_planner_recall)
+            self._merge_tool_navigation_context(runtime_payload, pre_planner_recall)
+
+        if context_engine is not None:
+            self._merge_context_engine_plan_context(
+                context_engine,
+                state,
+                runtime_payload,
+            )
+
+        image_paths_used = self._image_paths_used(runtime_payload)
         try:
-            decision = self.planner.plan(state, runtime_context=payload)
+            decision = self.planner.plan(state, runtime_context=runtime_payload)
         except Exception as exc:
             planner_error = str(exc)
             if self.fallback_planner is None:
+                metadata = {
+                    "runtime_mode": "openclaw_bridge",
+                    "planner_fallback": False,
+                    "planner_error": planner_error,
+                }
+                self._record_context_engine_step(
+                    metadata,
+                    context_engine,
+                    state,
+                    runtime_payload,
+                    "STOP",
+                    planner_error,
+                    False,
+                    planner_error,
+                )
                 return OpenClawRuntimeStepResult(
                     ok=False,
                     action_text="STOP",
-                    runtime_metadata={
-                        "runtime_mode": "openclaw_bridge",
-                        "planner_fallback": False,
-                        "planner_error": planner_error,
-                    },
+                    runtime_metadata=metadata,
                     error=planner_error,
                 )
-            decision = self.fallback_planner.plan(state, runtime_context=payload)
+            decision = self.fallback_planner.plan(state, runtime_context=runtime_payload)
             planner_fallback = True
-        tool_calls: List[Dict[str, Any]] = []
         causal_recall: Dict[str, Any] = {}
+        self._merge_planner_visual_observations(runtime_payload, decision)
 
         if self._is_cli_agent_fallback_decision(decision):
             metadata = self._metadata(decision, tool_calls, image_paths_used)
@@ -109,6 +144,17 @@ class OpenClawVLNRuntime:
             planner_error = str(decision.arguments.get("planner_error") or decision.reason)
             if planner_error:
                 metadata["planner_error"] = planner_error
+            self._record_context_engine_step(
+                metadata,
+                context_engine,
+                state,
+                runtime_payload,
+                "STOP",
+                metadata.get("planner_reason", ""),
+                False,
+                planner_error or "openclaw_cli_agent_fallback",
+                tool_calls=tool_calls,
+            )
             return OpenClawRuntimeStepResult(
                 ok=False,
                 action_text="STOP",
@@ -117,15 +163,19 @@ class OpenClawVLNRuntime:
                 error=planner_error or "openclaw_cli_agent_fallback",
             )
 
-        nav_payload = self._navigation_payload(payload)
+        nav_payload = self._navigation_payload(runtime_payload)
 
         if decision.intent in PRE_ACTION_INTENTS:
             arguments = dict(decision.arguments)
-            self._merge_navigation_context(nav_payload, arguments)
+            self._merge_navigation_context(
+                nav_payload,
+                arguments,
+                include_memory_images=False,
+            )
             if decision.intent == "recall_memory":
-                arguments = self._memory_query_arguments(state, payload, arguments)
+                arguments = self._memory_query_arguments(state, runtime_payload, arguments)
             if decision.intent == "write_memory":
-                arguments = self._memory_write_arguments(payload, arguments)
+                arguments = self._memory_write_arguments(runtime_payload, arguments)
             if decision.intent == "write_memory":
                 arguments.setdefault(
                     "recent_visual_memories",
@@ -143,9 +193,13 @@ class OpenClawVLNRuntime:
             tool_calls.append(tool_result)
             if decision.intent == "write_memory":
                 self._remember_written_visual_memory(tool_result)
-            self._merge_tool_navigation_context(nav_payload, tool_result)
+            self._merge_tool_navigation_context(
+                nav_payload,
+                tool_result,
+                include_memory_images=False,
+            )
             if decision.intent == "recall_memory":
-                after_decision = self._after_recall_decision(state, payload, nav_payload)
+                after_decision = self._after_recall_decision(state, runtime_payload, nav_payload)
                 if after_decision is not None:
                     causal_recall = {
                         "before_decision": decision,
@@ -157,20 +211,51 @@ class OpenClawVLNRuntime:
                     }
                     if after_decision.intent in {"act", "replan"}:
                         decision = after_decision
-                        self._merge_navigation_context(nav_payload, decision.arguments)
+                        self._merge_navigation_context(
+                            nav_payload,
+                            decision.arguments,
+                            include_memory_images=False,
+                        )
 
-        self._merge_navigation_context(nav_payload, decision.arguments)
+        if decision.intent != "write_memory":
+            auto_write_calls = self._auto_write_visual_memory(state, runtime_payload, decision)
+            if auto_write_calls:
+                tool_calls.extend(auto_write_calls)
+                written = any(
+                    call.get("tool_name") == "MemoryWriteSkill"
+                    and bool((call.get("payload") or {}).get("written"))
+                    for call in auto_write_calls
+                )
+                if written:
+                    after_write_recall = self._auto_recall_memory(
+                        state,
+                        runtime_payload,
+                        reason="after_visual_memory_write_recall",
+                    )
+                    if after_write_recall:
+                        tool_calls.append(after_write_recall)
+                        self._merge_tool_navigation_context(
+                            nav_payload,
+                            after_write_recall,
+                            include_memory_images=False,
+                        )
+
+        self._merge_navigation_context(
+            nav_payload,
+            decision.arguments,
+            include_memory_images=False,
+        )
         if decision.intent == "replan" and not nav_payload.get("active_subgoal") and decision.reason:
             nav_payload["active_subgoal"] = decision.reason
 
         planned_action_text = self._planned_action_text(decision.arguments)
-        if planned_action_text:
+        if planned_action_text and self.allow_planner_action_override:
             metadata = self._metadata(
                 decision,
                 tool_calls,
                 image_paths_used,
                 state=state,
-                runtime_context=payload,
+                runtime_context=runtime_payload,
                 action_text=planned_action_text,
                 causal_recall=causal_recall,
             )
@@ -179,13 +264,22 @@ class OpenClawVLNRuntime:
             if planner_error:
                 metadata["planner_error"] = planner_error
             metadata["planner_fallback"] = planner_fallback
+            self._record_context_engine_step(
+                metadata,
+                context_engine,
+                state,
+                runtime_payload,
+                planned_action_text,
+                metadata.get("planner_reason", ""),
+                True,
+                tool_calls=tool_calls,
+            )
             return OpenClawRuntimeStepResult(
                 ok=True,
                 action_text=planned_action_text,
                 executor_command=self.executor.command_for_action(planned_action_text),
                 runtime_metadata=metadata,
             )
-
         nav_result = self.tool_adapter.call_tool(
             "NavigationPolicySkill",
             nav_payload,
@@ -199,14 +293,27 @@ class OpenClawVLNRuntime:
             tool_calls,
             image_paths_used,
             state=state,
-            runtime_context=payload,
+            runtime_context=runtime_payload,
             action_text=action_text,
             causal_recall=causal_recall,
         )
         if planner_error:
             metadata["planner_error"] = planner_error
         metadata["planner_fallback"] = planner_fallback
+        if planned_action_text and not self.allow_planner_action_override:
+            metadata["planner_action_guidance"] = planned_action_text
         if not nav_result.get("ok"):
+            self._record_context_engine_step(
+                metadata,
+                context_engine,
+                state,
+                runtime_payload,
+                "STOP",
+                metadata.get("planner_reason", ""),
+                False,
+                nav_result.get("error") or "navigation_failed",
+                tool_calls=tool_calls,
+            )
             return OpenClawRuntimeStepResult(
                 ok=False,
                 action_text="STOP",
@@ -214,12 +321,141 @@ class OpenClawVLNRuntime:
                 error=nav_result.get("error") or "navigation_failed",
             )
 
+        self._record_context_engine_step(
+            metadata,
+            context_engine,
+            state,
+            runtime_payload,
+            action_text,
+            metadata.get("planner_reason", ""),
+            True,
+            tool_calls=tool_calls,
+        )
         return OpenClawRuntimeStepResult(
             ok=True,
             action_text=action_text,
             executor_command=self.executor.command_for_action(action_text),
             runtime_metadata=metadata,
         )
+
+    def _context_engine_for_payload(
+        self,
+        payload: Dict[str, Any],
+    ) -> Optional[MemoryAwareContextEngine]:
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        root = Path(run_id) / "openclaw_context_engine"
+        key = str(root)
+        engine = self.context_engines.get(key)
+        if engine is None:
+            engine = MemoryAwareContextEngine(root)
+            self.context_engines[key] = engine
+        return engine
+
+    def _merge_context_engine_plan_context(
+        self,
+        context_engine: MemoryAwareContextEngine,
+        state: VLNState,
+        payload: Dict[str, Any],
+    ) -> None:
+        context = context_engine.prepare_plan_context(
+            run_id=str(payload.get("run_id") or ""),
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+            instruction=state.instruction,
+            step_id=state.step_id,
+            payload=payload,
+        )
+        for key in ("task_state", "recent_step_summary", "retrieved_memory_ids"):
+            value = context.get(key)
+            if value:
+                payload[key] = value
+        memory_context_text = context.get("memory_context_text")
+        if memory_context_text and not payload.get("memory_context_text"):
+            payload["memory_context_text"] = memory_context_text
+
+    def _record_context_engine_step(
+        self,
+        metadata: Dict[str, Any],
+        context_engine: Optional[MemoryAwareContextEngine],
+        state: VLNState,
+        payload: Dict[str, Any],
+        action_text: str,
+        planner_reason: str,
+        ok: bool,
+        error: str = "",
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        if context_engine is None:
+            return
+        mirrored_memory_ids = self._mirror_memory_writes_to_context_engine(
+            context_engine,
+            state,
+            tool_calls or [],
+        )
+        record = context_engine.record_step(
+            run_id=str(payload.get("run_id") or ""),
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+            instruction=state.instruction,
+            step_id=state.step_id,
+            payload=payload,
+            action_text=action_text,
+            planner_reason=planner_reason,
+            ok=ok,
+            error=error,
+        )
+        if mirrored_memory_ids:
+            record["mirrored_memory_ids"] = mirrored_memory_ids
+        if state.step_id > 0 and state.step_id % context_engine.review_interval_steps == 0:
+            record["review"] = context_engine.review_and_compact(
+                current_step_id=state.step_id
+            )
+        metadata["context_engine"] = record
+
+    def _mirror_memory_writes_to_context_engine(
+        self,
+        context_engine: MemoryAwareContextEngine,
+        state: VLNState,
+        tool_calls: List[Dict[str, Any]],
+    ) -> List[str]:
+        memory_ids: List[str] = []
+        for call in tool_calls:
+            if call.get("tool_name") != "MemoryWriteSkill":
+                continue
+            payload = call.get("payload")
+            if not isinstance(payload, dict) or not payload.get("written"):
+                continue
+            record = payload.get("record")
+            if not isinstance(record, dict):
+                continue
+            text = str(
+                record.get("retrieval_text")
+                or record.get("visual_observation")
+                or record.get("caption")
+                or record.get("note")
+                or ""
+            )
+            if not text:
+                continue
+            tags = []
+            for key in ("objects", "landmarks", "spatial_cues"):
+                values = record.get(key)
+                if isinstance(values, list):
+                    tags.extend(str(value) for value in values if str(value))
+            memory_ids.append(
+                context_engine.add_memory(
+                    text=text,
+                    scene_id=str(record.get("scene_id") or state.scene_id),
+                    episode_id=str(record.get("episode_id") or state.episode_id),
+                    step_id=int(record.get("step_id") or state.step_id),
+                    image_path=str(record.get("image_path") or ""),
+                    tags=tags,
+                    importance=0.5,
+                )
+            )
+        return memory_ids
 
     def _metadata(
         self,
@@ -242,6 +478,11 @@ class OpenClawVLNRuntime:
         if image_paths_used:
             metadata["image_paths_used"] = image_paths_used
         planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        if isinstance(planner_runtime_metadata, dict):
+            for key in ("context_audit", "agent_token_guard"):
+                value = planner_runtime_metadata.get(key)
+                if isinstance(value, dict):
+                    metadata[key] = value
         planner_visual_analysis = {}
         if isinstance(planner_runtime_metadata, dict):
             candidate = planner_runtime_metadata.get("visual_analysis")
@@ -317,6 +558,110 @@ class OpenClawVLNRuntime:
         if isinstance(write_gate, dict):
             enriched["write_gate"] = write_gate
         return enriched
+
+    def _merge_planner_visual_observations(self, payload: Dict[str, Any], decision) -> None:
+        planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        if not isinstance(planner_runtime_metadata, dict):
+            return
+        visual_analysis = planner_runtime_metadata.get("visual_analysis") or {}
+        if not isinstance(visual_analysis, dict):
+            return
+        observations = visual_analysis.get("observations") or []
+        if not isinstance(observations, list) or not observations:
+            return
+        existing = payload.get("visual_observations")
+        if isinstance(existing, list) and existing:
+            return
+        payload["visual_observations"] = [
+            observation
+            for observation in observations
+            if isinstance(observation, dict)
+        ]
+
+    def _auto_write_visual_memory(
+        self,
+        state: VLNState,
+        payload: Dict[str, Any],
+        decision,
+    ) -> List[Dict[str, Any]]:
+        if self.tool_adapter.get_tool_schema("MemoryWriteSkill") is None:
+            return []
+        if not self._planner_visual_analysis_ran(decision):
+            return []
+        observation = self._matching_visual_observation(
+            payload,
+            str(payload.get("current_image_path") or ""),
+        )
+        if not observation:
+            return []
+        arguments = self._memory_write_arguments(
+            payload,
+            {
+                "memory_source": "episode-local",
+                "note": str(getattr(decision, "reason", "") or ""),
+                "write_gate": {
+                    "candidate_reason": "openclaw_visual_analysis",
+                    "curator_decision": "write",
+                    "curator_reason": str(
+                        observation.get("navigation_relevance")
+                        or observation.get("visual_observation")
+                        or observation.get("caption")
+                        or "OpenClaw visual analysis"
+                    ),
+                    "confidence": observation.get("confidence"),
+                },
+            },
+        )
+        arguments.setdefault("recent_visual_memories", list(self.recent_visual_memories))
+        tool_calls: List[Dict[str, Any]] = []
+        curator_result = self._curate_memory_write(state, arguments)
+        if curator_result:
+            tool_calls.append(curator_result)
+            arguments = self._apply_curator_result(arguments, curator_result)
+        write_result = self.tool_adapter.call_tool(
+            "MemoryWriteSkill",
+            arguments,
+            state=state,
+        )
+        tool_calls.append(write_result)
+        self._remember_written_visual_memory(write_result)
+        return tool_calls
+
+    def _auto_recall_memory(
+        self,
+        state: VLNState,
+        payload: Dict[str, Any],
+        reason: str,
+    ) -> Optional[Dict[str, Any]]:
+        if self.tool_adapter.get_tool_schema("MemoryQuerySkill") is None:
+            return None
+        if not self.recent_visual_memories:
+            return None
+        arguments = self._memory_query_arguments(
+            state,
+            payload,
+            {
+                "text": state.instruction,
+                "step_id": state.step_id,
+                "reason": reason,
+                "n_results": 3,
+                "planner_reason": str(payload.get("active_subgoal") or ""),
+            },
+        )
+        return self.tool_adapter.call_tool(
+            "MemoryQuerySkill",
+            arguments,
+            state=state,
+        )
+
+    def _planner_visual_analysis_ran(self, decision) -> bool:
+        planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        if not isinstance(planner_runtime_metadata, dict):
+            return False
+        visual_analysis = planner_runtime_metadata.get("visual_analysis") or {}
+        if not isinstance(visual_analysis, dict):
+            return False
+        return bool(visual_analysis.get("ran"))
 
     def _image_paths_used(self, payload: Dict[str, Any]) -> List[str]:
         paths: List[str] = []
@@ -444,27 +789,37 @@ class OpenClawVLNRuntime:
         self,
         nav_payload: Dict[str, Any],
         context: Dict[str, Any],
+        include_memory_images: bool = True,
     ) -> None:
         for key in ("active_subgoal", "memory_context_text"):
             value = context.get(key)
             if value:
                 nav_payload[key] = value
         memory_images = context.get("memory_images")
-        if memory_images:
+        if include_memory_images and memory_images:
             nav_payload["memory_images"] = memory_images
 
     def _merge_tool_navigation_context(
         self,
         nav_payload: Dict[str, Any],
         tool_result: Dict[str, Any],
+        include_memory_images: bool = True,
     ) -> None:
         payload = tool_result.get("payload")
         if not isinstance(payload, dict):
             return
-        self._merge_navigation_context(nav_payload, payload)
+        self._merge_navigation_context(
+            nav_payload,
+            payload,
+            include_memory_images=include_memory_images,
+        )
         policy_context = payload.get("policy_context")
         if isinstance(policy_context, dict):
-            self._merge_navigation_context(nav_payload, policy_context)
+            self._merge_navigation_context(
+                nav_payload,
+                policy_context,
+                include_memory_images=include_memory_images,
+            )
 
     def _planned_action_text(self, arguments: Dict[str, Any]) -> Optional[str]:
         for key in ACTION_ARGUMENT_KEYS:

@@ -1,6 +1,8 @@
 import importlib
 import sys
 
+import pytest
+
 
 def test_evaluation_harness_import_has_no_side_effects(monkeypatch):
     calls = []
@@ -44,6 +46,23 @@ def test_parser_helper_includes_harness_args():
     assert args.memory_manifest_path == ""
     assert args.harness_debug_max_episodes == 1
     assert args.harness_episode_keys == "2azQ1b91cZZ:11,zsNo4HB9uLZ:2"
+
+
+def test_parser_rejects_non_positive_max_steps():
+    module = importlib.import_module("evaluation_harness")
+    parser = module.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--model_path",
+                "model",
+                "--output_path",
+                "out",
+                "--max_steps",
+                "0",
+            ]
+        )
 
 
 def test_filter_harness_episodes_by_scene_episode_keys():

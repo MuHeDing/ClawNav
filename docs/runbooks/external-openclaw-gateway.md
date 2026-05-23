@@ -29,7 +29,8 @@ openclaw models auth --agent main login \
   --provider qwen \
   --method standard-api-key-cn \
   --set-default
-openclaw models --agent main set qwen/qwen3.5-plus
+openclaw models set qwen/qwen3.5-flash
+openclaw models set-image qwen/qwen3.5-flash
 openclaw gateway restart
 openclaw agent --agent main --json --message '只回复 OK' --timeout 60
 ```
@@ -40,7 +41,7 @@ on a saved frame:
 ```bash
 openclaw capability image describe \
   --file /path/to/sample.png \
-  --model "${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-vl}" \
+  --model "${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" \
   --json
 ```
 
@@ -48,9 +49,10 @@ Then start the adapter with visual describe mode:
 
 ```bash
 OPENCLAW_VISUAL_MODE=describe \
-OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-vl \
+OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-flash \
 OPENCLAW_VISUAL_MAX_IMAGES=2 \
 OPENCLAW_VISUAL_TIMEOUT_MS=30000 \
+OPENCLAW_AGENT_MAX_INPUT_TOKENS=10000 \
 HOST=127.0.0.1 PORT=8011 ./scripts/start_openclaw_cli_plan_gateway.sh
 ```
 
@@ -82,7 +84,7 @@ For visual-memory runs, verify both OpenClaw's Qwen image capability and a
 ```bash
 PYTHONPATH=.:src python scripts/check_openclaw_visual_plan_gateway.py \
   --gateway_url http://127.0.0.1:8011 \
-  --model "${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-vl}" \
+  --model "${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" \
   --image_path /path/to/sample.png \
   --timeout 90
 ```
@@ -104,7 +106,7 @@ For the visual-memory smoke, start the adapter with
 ```bash
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:8011 \
 OPENCLAW_GATEWAY_TIMEOUT=90 \
-OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-vl \
+OPENCLAW_VISUAL_MODEL=qwen/qwen3.5-flash \
 HARNESS_DEBUG_MAX_EPISODES=5 \
 ./scripts/evaluation_openclaw_visual_memory.sh
 ```

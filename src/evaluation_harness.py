@@ -31,6 +31,13 @@ ACTIONS2IDX = {
 }
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ClawNav OpenClaw-style harness evaluation")
     parser.add_argument("--model_path", type=str, required=True)
@@ -43,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_pixels", type=int, default=28 * 28)
     parser.add_argument("--kv_start_size", type=int, default=8)
     parser.add_argument("--kv_recent_size", type=int, default=24)
-    parser.add_argument("--max_steps", type=int, default=400)
+    parser.add_argument("--max_steps", type=positive_int, default=400)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--world_size", default=1, type=int)
@@ -90,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
     )
+    parser.add_argument("--openclaw_allow_planner_action_override", action="store_true", default=False)
     return parser
 
 
@@ -154,6 +162,11 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         openclaw_enable_subagent_planner=args.openclaw_enable_subagent_planner,
         openclaw_enable_subagent_critic=args.openclaw_enable_subagent_critic,
         openclaw_enable_subagent_memory_curator=args.openclaw_enable_subagent_memory_curator,
+        openclaw_allow_planner_action_override=getattr(
+            args,
+            "openclaw_allow_planner_action_override",
+            False,
+        ),
     )
     if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
         from harness.openclaw.service_registry import OpenClawServiceRegistry
@@ -262,6 +275,7 @@ def build_harness_components(
             fallback_planner=RuleOpenClawPlanner(
                 recall_interval_steps=config.recall_interval_steps,
             ),
+            allow_planner_action_override=config.openclaw_allow_planner_action_override,
         )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",
@@ -335,6 +349,7 @@ class HarnessModelProxy:
         payload = {
             "recent_frames": list(images[:-1]),
             "policy_action": self.last_action_text,
+            "run_id": str(self.components.get("output_path") or ""),
         }
         if self.components["working_memory"].should_promote_keyframe(step_id):
             image_path = self._save_keyframe_if_needed(current_image, step_id)

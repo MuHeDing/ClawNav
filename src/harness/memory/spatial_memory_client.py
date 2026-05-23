@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -165,11 +166,72 @@ class SpatialMemoryHttpClient(BaseSpatialMemoryClient):
     def ingest_semantic(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         response = requests.post(
             f"{self.base_url}/memory/semantic/ingest",
-            json=payload,
+            json=self._semantic_ingest_payload(payload),
             timeout=self.timeout,
         )
         response.raise_for_status()
         return response.json()
+
+    def _semantic_ingest_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        note_parts = []
+        for key in (
+            "retrieval_text",
+            "caption",
+            "visual_observation",
+            "navigation_relevance",
+            "note",
+        ):
+            value = payload.get(key)
+            if value:
+                note_parts.append(str(value))
+        scene_id = payload.get("scene_id")
+        episode_id = payload.get("episode_id")
+        step_id = payload.get("step_id")
+        if scene_id or episode_id or step_id is not None:
+            note_parts.append(
+                f"scene={scene_id or ''} episode={episode_id or ''} step={step_id}"
+            )
+
+        tags = []
+        for key in ("objects", "landmarks", "spatial_cues"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                tags.extend(str(value) for value in values if str(value))
+
+        pose = payload.get("robot_pose")
+        if not isinstance(pose, dict):
+            pose = {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 0.0,
+                "frame_id": "map",
+            }
+
+        return {
+            "robot_id": str(payload.get("robot_id") or "clawnav"),
+            "robot_type": str(payload.get("robot_type") or "habitat_vln"),
+            "robot_pose": pose,
+            "source": str(payload.get("memory_source") or self.memory_source),
+            "task_id": str(payload.get("memory_namespace") or ""),
+            "tags": tags,
+            "note": "\n".join(note_parts),
+            "timestamp": payload.get("timestamp"),
+            "image": self._image_input(payload),
+        }
+
+    def _image_input(self, payload: Dict[str, Any]) -> str:
+        image = str(payload.get("image") or payload.get("image_path") or "")
+        if not image:
+            return ""
+        if image.startswith(("data:", "http://", "https://")):
+            return image
+        path = Path(image)
+        if path.exists():
+            return str(path.resolve())
+        return image
 
     def _post_query(self, endpoint: str, payload: Dict[str, Any]) -> List[MemoryHit]:
         response = requests.post(

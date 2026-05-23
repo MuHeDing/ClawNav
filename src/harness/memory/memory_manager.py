@@ -6,6 +6,33 @@ from harness.memory.spatial_memory_client import BaseSpatialMemoryClient
 from harness.types import MemoryHit, MemoryRecallResult
 
 
+MAX_POLICY_EVIDENCE_CHARS = 180
+MAX_POLICY_EVIDENCE_SEGMENTS = 2
+META_EVIDENCE_PREFIXES = (
+    "the user wants",
+    "i need to",
+    "drafting the description",
+    "based on the visual evidence",
+    "on the visual evidence",
+    "here is a description",
+)
+NAVIGATION_TERMS = {
+    "arch",
+    "archway",
+    "corridor",
+    "door",
+    "doorway",
+    "forward",
+    "hallway",
+    "left",
+    "obstacle",
+    "path",
+    "right",
+    "route",
+    "turn",
+}
+
+
 class MemoryManager:
     def __init__(
         self,
@@ -93,7 +120,13 @@ class MemoryManager:
             visual_evidence = self._visual_evidence_text(hit)
             evidence = visual_evidence or hit.evidence_text or hit.note or hit.name
             if evidence:
-                texts.append(f"- {hit.name}: {evidence} (confidence={hit.confidence:.2f})")
+                compact_evidence = self._compact_policy_evidence(evidence)
+                if compact_evidence:
+                    hit_name = self._policy_hit_name(hit)
+                    texts.append(
+                        f"- {hit_name}: {compact_evidence} "
+                        f"(confidence={hit.confidence:.2f})"
+                    )
             if hit.image_path:
                 image_paths.append(hit.image_path)
         memory_context_text = "\n".join(texts)
@@ -157,9 +190,9 @@ class MemoryManager:
             metadata = hit.metadata or {}
             scope = metadata.get("memory_scope")
             namespace = metadata.get("memory_namespace")
-            if allowed and scope not in allowed:
+            if allowed and (not scope or scope not in allowed):
                 continue
-            if memory_namespace and namespace != memory_namespace:
+            if memory_namespace and (not namespace or namespace != memory_namespace):
                 continue
             filtered.append(hit)
         return filtered
@@ -230,10 +263,10 @@ class MemoryManager:
         metadata = hit.metadata or {}
         parts = []
         for key in (
-            "caption",
-            "visual_observation",
-            "place_category",
             "navigation_relevance",
+            "visual_observation",
+            "caption",
+            "place_category",
         ):
             value = metadata.get(key)
             if value:
@@ -243,6 +276,94 @@ class MemoryManager:
             if isinstance(values, list) and values:
                 parts.append(", ".join(str(value) for value in values if str(value)))
         return " | ".join(parts)
+
+    def _compact_policy_evidence(self, evidence: str) -> str:
+        segments: List[str] = []
+        for segment in self._evidence_segments(evidence):
+            cleaned = self._clean_policy_segment(segment)
+            if not cleaned:
+                continue
+            if self._looks_like_meta_reasoning(cleaned):
+                continue
+            segments.append(cleaned)
+            if len(segments) >= MAX_POLICY_EVIDENCE_SEGMENTS:
+                break
+        compact = "; ".join(segments)
+        if not compact:
+            compact = self._clean_policy_segment(evidence)
+        if len(compact) > MAX_POLICY_EVIDENCE_CHARS:
+            compact = compact[:MAX_POLICY_EVIDENCE_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:.")
+        return compact
+
+    def _policy_hit_name(self, hit: MemoryHit) -> str:
+        for candidate in (
+            self._best_landmark(hit),
+            hit.name,
+            hit.memory_type,
+            hit.memory_id,
+        ):
+            cleaned = self._clean_policy_segment(candidate)
+            if not cleaned:
+                continue
+            if len(cleaned) > 80:
+                continue
+            if self._looks_like_meta_reasoning(cleaned):
+                continue
+            return cleaned
+        return "memory"
+
+    def _evidence_segments(self, evidence: str) -> List[str]:
+        parts = []
+        for line in str(evidence).splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            cleaned = re.sub(r"^[*\-\d.)\s]+", "", cleaned).strip()
+            cleaned = cleaned.strip("|")
+            if cleaned:
+                parts.extend(
+                    segment.strip()
+                    for segment in re.split(r"(?<=[.!?])\s+|\s+\|\s+", cleaned)
+                    if segment.strip()
+                )
+        nav_segments = [
+            segment
+            for segment in parts
+            if self._contains_navigation_term(segment)
+            and not self._looks_like_meta_reasoning(segment)
+            and not self._looks_like_heading(segment)
+        ]
+        if nav_segments:
+            return nav_segments
+        return [
+            segment
+            for segment in parts
+            if not self._looks_like_meta_reasoning(segment)
+            and not self._looks_like_heading(segment)
+        ]
+
+    def _clean_policy_segment(self, segment: str) -> str:
+        cleaned = re.sub(r"\*\*", "", str(segment))
+        cleaned = re.sub(r"`", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:;")
+        return cleaned
+
+    def _looks_like_meta_reasoning(self, segment: str) -> bool:
+        lowered = segment.lower().strip()
+        return any(lowered.startswith(prefix) for prefix in META_EVIDENCE_PREFIXES)
+
+    def _looks_like_heading(self, segment: str) -> bool:
+        cleaned = self._clean_policy_segment(segment)
+        words = self._term_set(cleaned)
+        if len(words) > 5:
+            return False
+        if any(term in words for term in NAVIGATION_TERMS):
+            return False
+        return ":" not in cleaned and not cleaned.endswith((".", "!", "?"))
+
+    def _contains_navigation_term(self, segment: str) -> bool:
+        terms = self._term_set(segment)
+        return bool(terms.intersection(NAVIGATION_TERMS))
 
     def _best_landmark(self, hit: Optional[MemoryHit]) -> str:
         if hit is None:
