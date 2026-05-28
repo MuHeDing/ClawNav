@@ -635,6 +635,44 @@ def test_runtime_stops_on_openclaw_cli_agent_fallback_without_policy_call():
     assert result.runtime_metadata["tool_calls"] == []
 
 
+def test_runtime_stops_on_openclaw_cli_model_fallback_without_policy_call():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"planner_error": "qwen request timed out"},
+        reason="openclaw_cli_model_fallback:openclaw_cli_default_act",
+        planner_backend="gateway",
+        runtime_metadata={
+            "context_audit": {
+                "planner_step_mode": "fast_text",
+                "qwen_api_called": True,
+            }
+        },
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+    )
+
+    result = runtime.step(make_state(step_id=22), payload={})
+
+    assert result.ok is False
+    assert result.action_text == "STOP"
+    assert result.error == "qwen request timed out"
+    assert navigation.calls == []
+    assert result.runtime_metadata["planner_model_fallback"] is True
+    assert result.runtime_metadata["planner_fallback"] is True
+    assert result.runtime_metadata["planner_reason"] == (
+        "openclaw_cli_model_fallback:openclaw_cli_default_act"
+    )
+    assert result.runtime_metadata["context_audit"]["planner_step_mode"] == "fast_text"
+    assert result.runtime_metadata["tool_calls"] == []
+
+
 def test_runtime_passes_memory_context_to_navigation_policy():
     decision = OpenClawPlanDecision(
         intent="recall_memory",

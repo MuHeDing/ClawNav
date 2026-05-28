@@ -35,10 +35,12 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
 
     assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}" in contents
     assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
-    assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-180}" in contents
+    assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-300}" in contents
+    assert "OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}" in contents
     assert "MAX_STEPS must be a positive integer" in contents
     assert "REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}" in contents
     assert "--require_service openclaw_cli_plan_gateway" in contents
+    assert "--enforce_timeout_budget" in contents
     assert "--harness_debug_max_episodes" in contents
     assert "--max_steps" in contents
 
@@ -63,11 +65,23 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "OPENCLAW_AGENT_TIMEOUT=${OPENCLAW_AGENT_TIMEOUT:-180}" in contents
     assert "OPENCLAW_AGENT_MAX_INPUT_TOKENS=${OPENCLAW_AGENT_MAX_INPUT_TOKENS:-10000}" in contents
     assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
+    assert "OPENCLAW_MODEL=${OPENCLAW_MODEL:-qwen/qwen3.5-flash}" in contents
+    assert "OPENCLAW_MODEL_PROVIDER=${OPENCLAW_MODEL_PROVIDER:-qwen_api}" in contents
+    assert "OPENCLAW_MODEL_MAX_IMAGES=${OPENCLAW_MODEL_MAX_IMAGES:-3}" in contents
+    assert "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-10}" in contents
+    assert "OPENCLAW_MODEL_FAST_MODE=${OPENCLAW_MODEL_FAST_MODE:-qwen_text_only}" in contents
+    assert "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT=${OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT:-1}" in contents
     assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents
     assert "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}" in contents
     assert "--openclaw_visual_mode" in contents
     assert "--openclaw_visual_interval_steps" in contents
     assert "--openclaw_visual_model" in contents
+    assert "--openclaw_model_provider" in contents
+    assert "--openclaw_model" in contents
+    assert "--openclaw_model_max_images" in contents
+    assert "--openclaw_model_image_interval_steps" in contents
+    assert "--openclaw_model_fast_mode" in contents
+    assert "--openclaw_model_fast_use_memory_context" in contents
     assert "--agent_max_input_tokens" in contents
 
 

@@ -37,6 +37,7 @@ ACTION_ARGUMENT_KEYS = (
 )
 
 OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX = "openclaw_cli_agent_fallback:"
+OPENCLAW_CLI_MODEL_FALLBACK_REASON_PREFIX = "openclaw_cli_model_fallback:"
 
 
 @dataclass
@@ -137,10 +138,11 @@ class OpenClawVLNRuntime:
         causal_recall: Dict[str, Any] = {}
         self._merge_planner_visual_observations(runtime_payload, decision)
 
-        if self._is_cli_agent_fallback_decision(decision):
+        cli_fallback_kind = self._cli_fallback_kind(decision)
+        if cli_fallback_kind:
             metadata = self._metadata(decision, tool_calls, image_paths_used)
-            metadata["planner_agent_fallback"] = True
-            metadata["planner_fallback"] = planner_fallback
+            metadata[f"planner_{cli_fallback_kind}_fallback"] = True
+            metadata["planner_fallback"] = True
             planner_error = str(decision.arguments.get("planner_error") or decision.reason)
             if planner_error:
                 metadata["planner_error"] = planner_error
@@ -152,7 +154,7 @@ class OpenClawVLNRuntime:
                 "STOP",
                 metadata.get("planner_reason", ""),
                 False,
-                planner_error or "openclaw_cli_agent_fallback",
+                planner_error or f"openclaw_cli_{cli_fallback_kind}_fallback",
                 tool_calls=tool_calls,
             )
             return OpenClawRuntimeStepResult(
@@ -160,7 +162,7 @@ class OpenClawVLNRuntime:
                 action_text="STOP",
                 executor_command=self.executor.command_for_action("STOP"),
                 runtime_metadata=metadata,
-                error=planner_error or "openclaw_cli_agent_fallback",
+                error=planner_error or f"openclaw_cli_{cli_fallback_kind}_fallback",
             )
 
         nav_payload = self._navigation_payload(runtime_payload)
@@ -771,12 +773,15 @@ class OpenClawVLNRuntime:
             "confidence": visual_observation.get("confidence"),
         }
 
-    def _is_cli_agent_fallback_decision(self, decision) -> bool:
+    def _cli_fallback_kind(self, decision) -> str:
         reason = getattr(decision, "reason", "")
-        return (
-            isinstance(reason, str)
-            and reason.startswith(OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX)
-        )
+        if not isinstance(reason, str):
+            return ""
+        if reason.startswith(OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX):
+            return "agent"
+        if reason.startswith(OPENCLAW_CLI_MODEL_FALLBACK_REASON_PREFIX):
+            return "model"
+        return ""
 
     def _navigation_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {

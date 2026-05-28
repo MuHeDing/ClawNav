@@ -1,10 +1,16 @@
 import argparse
+import base64
 import json
+import mimetypes
+import os
 import re
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+import requests
 
 from harness.openclaw.gateway_server import make_gateway_server
 from harness.openclaw.visual_analyzer import OpenClawVisualAnalyzer
@@ -67,6 +73,272 @@ MAX_PROMPT_RETRIEVED_MEMORY_IDS = 3
 PLAN_MAX_TOTAL_TOKENS = 6000
 QWEN_HARD_MAX_INPUT_TOKENS = 50000
 OPENCLAW_SESSION_MODE = "fresh_per_step"
+LOCAL_POLICY_FAST_MODES = {"memory_guided_policy_fast", "local_policy"}
+
+
+class QwenApiModelClient:
+    def __init__(
+        self,
+        api_key: str = "",
+        base_url: str = "",
+        run_openclaw: Optional[OpenClawRunner] = None,
+        openclaw_profile: str = "",
+        max_retries: Optional[int] = None,
+        retry_backoff_s: Optional[float] = None,
+    ) -> None:
+        self.api_key = api_key
+        self.base_url = base_url
+        self.run_openclaw = run_openclaw or run_openclaw_command
+        self.openclaw_profile = openclaw_profile
+        self.session = requests.Session()
+        self._loaded_openclaw_config = False
+        self.max_retries = self._retry_int(
+            max_retries,
+            "OPENCLAW_QWEN_API_RETRIES",
+            0,
+        )
+        self.retry_backoff_s = self._retry_float(
+            retry_backoff_s,
+            "OPENCLAW_QWEN_API_RETRY_BACKOFF_S",
+            1.0,
+        )
+
+    def run(
+        self,
+        prompt: str,
+        image_paths: List[str],
+        model: str,
+        timeout_s: float,
+    ) -> Dict[str, Any]:
+        self._ensure_config(timeout_s)
+        if not self.api_key:
+            raise RuntimeError(
+                "Qwen API key is not configured; set OPENCLAW_QWEN_API_KEY, "
+                "DASHSCOPE_API_KEY, QWEN_API_KEY, or configure OpenClaw provider qwen"
+            )
+        endpoint = self.base_url.rstrip("/") + "/chat/completions"
+        request_json = {
+            "model": self._api_model_name(model),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": self._message_content(prompt, image_paths),
+                }
+            ],
+            "temperature": 0,
+        }
+        attempts = self.max_retries + 1
+        last_error = ""
+        for attempt_index in range(attempts):
+            try:
+                response = self.session.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_json,
+                    timeout=timeout_s,
+                )
+            except requests.exceptions.RequestException as exc:
+                last_error = str(exc)
+                if attempt_index >= self.max_retries:
+                    raise RuntimeError(
+                        "Qwen API request failed after "
+                        f"{attempt_index + 1} attempt(s): {last_error}"
+                    ) from exc
+                self._sleep_before_retry(attempt_index)
+                continue
+            if response.status_code >= 400:
+                message = f"HTTP {response.status_code} {response.text}"
+                last_error = message
+                if self._retryable_status(response.status_code) and attempt_index < self.max_retries:
+                    self._sleep_before_retry(attempt_index)
+                    continue
+                raise RuntimeError(f"Qwen API request failed: {message}")
+            normalized = self._normalize_response(response.json())
+            normalized["request_attempts"] = attempt_index + 1
+            normalized["retry_count"] = attempt_index
+            return normalized
+        raise RuntimeError(f"Qwen API request failed after {attempts} attempt(s): {last_error}")
+
+    def _sleep_before_retry(self, attempt_index: int) -> None:
+        if self.retry_backoff_s <= 0:
+            return
+        time.sleep(self.retry_backoff_s * (attempt_index + 1))
+
+    @staticmethod
+    def _retryable_status(status_code: int) -> bool:
+        return status_code == 429 or status_code >= 500
+
+    @staticmethod
+    def _retry_int(value: Optional[int], env_name: str, default: int) -> int:
+        raw = os.environ.get(env_name) if value is None else value
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _retry_float(value: Optional[float], env_name: str, default: float) -> float:
+        raw = os.environ.get(env_name) if value is None else value
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def _ensure_config(self, timeout_s: float) -> None:
+        if not self.base_url:
+            self.base_url = os.environ.get(
+                "OPENCLAW_QWEN_BASE_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+        if not self.api_key:
+            self.api_key = (
+                os.environ.get("OPENCLAW_QWEN_API_KEY")
+                or os.environ.get("DASHSCOPE_API_KEY")
+                or os.environ.get("QWEN_API_KEY")
+                or ""
+            )
+        if self.api_key or self._loaded_openclaw_config:
+            return
+        self.api_key = self._openclaw_auth_store_api_key()
+        if self.api_key:
+            return
+        self._loaded_openclaw_config = True
+        provider = self._openclaw_qwen_provider(timeout_s)
+        if not isinstance(provider, dict):
+            return
+        self.base_url = str(provider.get("baseUrl") or provider.get("base_url") or self.base_url)
+        api_key = provider.get("apiKey") or provider.get("api_key") or provider.get("key") or ""
+        self.api_key = self._resolve_secret_value(str(api_key)) if api_key else self.api_key
+        if not self.api_key:
+            self.api_key = self._openclaw_auth_store_api_key()
+
+    @staticmethod
+    def _openclaw_auth_store_api_key() -> str:
+        store_path = Path(
+            os.environ.get(
+                "OPENCLAW_AUTH_PROFILES_PATH",
+                str(Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"),
+            )
+        )
+        if not store_path.exists():
+            return ""
+        try:
+            data = json.loads(store_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        profiles = data.get("profiles") if isinstance(data, dict) else None
+        if not isinstance(profiles, dict):
+            return ""
+        preferred = profiles.get("qwen:default")
+        key = QwenApiModelClient._api_key_from_auth_profile(preferred)
+        if key:
+            return key
+        for profile in profiles.values():
+            key = QwenApiModelClient._api_key_from_auth_profile(profile)
+            if key:
+                return key
+        return ""
+
+    @staticmethod
+    def _api_key_from_auth_profile(profile: Any) -> str:
+        if not isinstance(profile, dict):
+            return ""
+        if profile.get("provider") not in (None, "qwen"):
+            return ""
+        key = profile.get("key") or profile.get("apiKey") or profile.get("api_key") or ""
+        return str(key).strip()
+
+    def _openclaw_qwen_provider(self, timeout_s: float) -> Dict[str, Any]:
+        command = ["openclaw"]
+        if self.openclaw_profile:
+            command.extend(["--profile", self.openclaw_profile])
+        command.extend(["config", "get", "models.providers.qwen", "--json"])
+        result = self.run_openclaw(command, min(timeout_s, 10.0))
+        if result.returncode != 0:
+            return {}
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(data, dict) and isinstance(data.get("value"), dict):
+            return data["value"]
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _resolve_secret_value(value: str) -> str:
+        stripped = value.strip()
+        if stripped.startswith("${") and stripped.endswith("}"):
+            return os.environ.get(stripped[2:-1], "")
+        if stripped.startswith("$") and len(stripped) > 1:
+            return os.environ.get(stripped[1:], "")
+        return stripped
+
+    @staticmethod
+    def _api_model_name(model: str) -> str:
+        if model.startswith("qwen/"):
+            return model.split("/", 1)[1]
+        return model
+
+    def _message_content(self, prompt: str, image_paths: List[str]) -> List[Dict[str, Any]]:
+        content: List[Dict[str, Any]] = []
+        for image_path in image_paths:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._image_data_url(image_path)},
+                }
+            )
+        content.append({"type": "text", "text": prompt})
+        return content
+
+    @staticmethod
+    def _image_data_url(image_path: str) -> str:
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        encoded = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _normalize_response(data: Dict[str, Any]) -> Dict[str, Any]:
+        text = ""
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "\n".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and isinstance(item.get("text"), str)
+                    )
+        usage = data.get("usage") if isinstance(data, dict) else {}
+        normalized_usage: Dict[str, Any] = {}
+        if isinstance(usage, dict):
+            normalized_usage = {
+                "input": usage.get("prompt_tokens") or usage.get("input") or usage.get("input_tokens"),
+                "output": (
+                    usage.get("completion_tokens")
+                    or usage.get("output")
+                    or usage.get("output_tokens")
+                ),
+                "totalTokens": (
+                    usage.get("total_tokens")
+                    or usage.get("totalTokens")
+                    or usage.get("total_tokens")
+                ),
+            }
+            normalized_usage = {key: value for key, value in normalized_usage.items() if value is not None}
+        return {
+            "ok": True,
+            "outputs": [{"text": text}],
+            "usage": normalized_usage,
+            "raw": data,
+        }
 
 
 def run_openclaw_command(args: List[str], timeout_s: float) -> subprocess.CompletedProcess:
@@ -90,6 +362,13 @@ class OpenClawCliPlanPlanner:
         agent_id: str = "main",
         agent_timeout_s: float = 60.0,
         openclaw_profile: str = "",
+        openclaw_model: str = "",
+        openclaw_model_provider: str = "qwen_api",
+        openclaw_model_max_images: int = 3,
+        openclaw_model_image_interval_steps: int = 10,
+        openclaw_model_fast_mode: str = "qwen_text_only",
+        openclaw_model_fast_use_memory_context: bool = True,
+        model_client: Any = None,
         agent_session_id: str = "",
         openclaw_visual_mode: str = "path",
         openclaw_visual_max_images: int = 2,
@@ -109,6 +388,17 @@ class OpenClawCliPlanPlanner:
         self.agent_id = agent_id
         self.agent_timeout_s = agent_timeout_s
         self.openclaw_profile = openclaw_profile
+        self.openclaw_model = openclaw_model
+        self.openclaw_model_provider = openclaw_model_provider or "qwen_api"
+        self.openclaw_model_max_images = max(0, int(openclaw_model_max_images or 0))
+        self.openclaw_model_image_interval_steps = max(
+            1,
+            int(openclaw_model_image_interval_steps or 1),
+        )
+        self.openclaw_model_fast_mode = openclaw_model_fast_mode or "qwen_text_only"
+        self.openclaw_model_fast_use_memory_context = bool(openclaw_model_fast_use_memory_context)
+        self.model_client = model_client
+        self._visual_memory_cache: Dict[str, Dict[str, Any]] = {}
         self.agent_session_id = agent_session_id or "clawnav"
         self.agent_session_timestamp = (
             self._safe_session_part(agent_session_timestamp)
@@ -138,10 +428,67 @@ class OpenClawCliPlanPlanner:
             "agent_id": self.agent_id,
             "agent_max_input_tokens": self.agent_max_input_tokens,
             "agent_token_guard": self._agent_token_guard,
+            "timeout_budget": self._timeout_budget_payload(),
             "openclaw_gateway": health,
         }
 
+    def _timeout_budget_payload(self) -> Dict[str, Any]:
+        uses_direct_qwen = (
+            self.planner_mode == "model" and self.openclaw_model_provider == "qwen_api"
+        )
+        qwen_retries = self._qwen_api_retries() if uses_direct_qwen else 0
+        qwen_retry_backoff_s = self._qwen_api_retry_backoff_s() if uses_direct_qwen else 0.0
+        qwen_attempts = qwen_retries + 1
+        retry_backoff_total_s = qwen_retry_backoff_s * (
+            qwen_retries * (qwen_retries + 1) / 2
+        )
+        estimated_qwen_wall_timeout_s = (
+            self.agent_timeout_s * qwen_attempts + retry_backoff_total_s
+        )
+        recommended_gateway_timeout_s = int(
+            max(240.0, estimated_qwen_wall_timeout_s + 60.0) + 0.999
+        )
+        return {
+            "planner_mode": self.planner_mode,
+            "model_provider": self.openclaw_model_provider,
+            "agent_timeout_s": self.agent_timeout_s,
+            "qwen_api_retries": qwen_retries,
+            "qwen_api_retry_backoff_s": qwen_retry_backoff_s,
+            "estimated_qwen_wall_timeout_s": int(estimated_qwen_wall_timeout_s)
+            if estimated_qwen_wall_timeout_s.is_integer()
+            else estimated_qwen_wall_timeout_s,
+            "recommended_gateway_timeout_s": recommended_gateway_timeout_s,
+        }
+
+    def _qwen_api_retries(self) -> int:
+        if isinstance(self.model_client, QwenApiModelClient):
+            return self.model_client.max_retries
+        raw = os.environ.get("OPENCLAW_QWEN_API_RETRIES")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
+
+    def _qwen_api_retry_backoff_s(self) -> float:
+        if isinstance(self.model_client, QwenApiModelClient):
+            return self.model_client.retry_backoff_s
+        raw = os.environ.get("OPENCLAW_QWEN_API_RETRY_BACKOFF_S")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 1.0
+
     def plan_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if self.planner_mode == "model":
+            try:
+                return self._model_plan(payload)
+            except Exception as exc:
+                fallback = self._heuristic_plan(payload)
+                fallback["reason"] = f"openclaw_cli_model_fallback:{fallback['reason']}"
+                fallback["arguments"] = dict(fallback.get("arguments") or {})
+                fallback["arguments"]["planner_error"] = str(exc)
+                return fallback
+
         if self.planner_mode == "agent":
             try:
                 return self._agent_plan(payload)
@@ -154,6 +501,224 @@ class OpenClawCliPlanPlanner:
 
         self._gateway_health()
         return self._heuristic_plan(payload)
+
+    def _model_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        prompt_payload = self._prompt_payload(payload)
+        step_mode = self._planner_step_mode(prompt_payload)
+        self._apply_model_step_context(prompt_payload, step_mode)
+        model_images = self._model_image_files(prompt_payload, step_mode["planner_step_mode"])
+        prompt = self._model_prompt_from_prompt_payload(prompt_payload)
+        assembled_prompt_tokens = self._estimate_tokens(prompt)
+        if self._should_use_local_policy_fast_step(step_mode):
+            return self._memory_guided_policy_fast_decision(
+                prompt_payload,
+                step_mode,
+                prompt,
+                model_images,
+                assembled_prompt_tokens,
+            )
+        if assembled_prompt_tokens > QWEN_HARD_MAX_INPUT_TOKENS:
+            context_audit = self._context_audit(
+                prompt=prompt,
+                usage={},
+                session_id="",
+                assembled_prompt_tokens=assembled_prompt_tokens,
+                context_profile="plan_model",
+                session_mode="stateless_model",
+                model_images=model_images,
+            )
+            self._update_context_audit_for_model_step(context_audit, step_mode)
+            context_audit["model_provider"] = self.openclaw_model_provider
+            token_guard = {
+                "tripped": True,
+                "input_tokens": assembled_prompt_tokens,
+                "max_input_tokens": QWEN_HARD_MAX_INPUT_TOKENS,
+                "total_tokens": assembled_prompt_tokens,
+                "output_tokens": 0,
+                "qwen_hard_limit_exceeded": True,
+            }
+            return self._agent_token_limit_decision(
+                token_guard,
+                context_audit=context_audit,
+            )
+
+        try:
+            model_stdout = self._model_run_stdout(prompt, model_images)
+        except Exception as exc:
+            context_audit = self._context_audit(
+                prompt=prompt,
+                usage={},
+                session_id="",
+                assembled_prompt_tokens=assembled_prompt_tokens,
+                context_profile="plan_model",
+                session_mode="stateless_model",
+                model_images=model_images,
+            )
+            self._update_context_audit_for_model_step(context_audit, step_mode)
+            context_audit["model_provider"] = self.openclaw_model_provider
+            context_audit["visual_memory_update_status"] = self._mark_visual_memory_error(
+                prompt_payload,
+                step_mode,
+                str(exc),
+            )
+            return self._model_fallback_decision(
+                payload,
+                str(exc),
+                context_audit=context_audit,
+            )
+        usage = self._agent_usage_metadata(model_stdout)
+        context_audit = self._context_audit(
+            prompt=prompt,
+            usage=usage,
+            session_id="",
+            assembled_prompt_tokens=assembled_prompt_tokens,
+            context_profile="plan_model",
+            session_mode="stateless_model",
+            model_images=model_images,
+        )
+        self._update_context_audit_for_model_step(context_audit, step_mode)
+        context_audit["model_provider"] = self.openclaw_model_provider
+        context_audit.update(self._model_request_metadata(model_stdout))
+        model_text = self._model_visible_text(model_stdout)
+        try:
+            decision = self._extract_json_object(model_text)
+            normalized = self._normalize_decision(decision)
+        except RuntimeError as exc:
+            context_audit["visual_memory_update_status"] = self._mark_visual_memory_error(
+                prompt_payload,
+                step_mode,
+                str(exc),
+            )
+            return self._model_fallback_decision(
+                payload,
+                str(exc),
+                context_audit=context_audit,
+            )
+        self._enrich_write_memory_with_visual_observation(normalized, prompt_payload)
+        context_audit["visual_memory_update_status"] = self._update_visual_memory_cache(
+            prompt_payload,
+            normalized,
+            model_images,
+            step_mode,
+        )
+        visual_analysis = self._visual_analysis_metadata(prompt_payload)
+        runtime_metadata = dict(normalized.get("runtime_metadata") or {})
+        if visual_analysis:
+            runtime_metadata["visual_analysis"] = visual_analysis
+        runtime_metadata["context_audit"] = context_audit
+        normalized["runtime_metadata"] = runtime_metadata
+        return normalized
+
+    def _model_fallback_decision(
+        self,
+        payload: Dict[str, Any],
+        error: str,
+        context_audit: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        fallback = self._heuristic_plan(payload)
+        fallback["reason"] = f"openclaw_cli_model_fallback:{fallback['reason']}"
+        fallback["arguments"] = dict(fallback.get("arguments") or {})
+        fallback["arguments"]["planner_error"] = error
+        if context_audit is not None:
+            fallback["runtime_metadata"] = {"context_audit": context_audit}
+        return fallback
+
+    def _should_use_local_policy_fast_step(self, step_mode: Dict[str, Any]) -> bool:
+        return (
+            step_mode.get("planner_step_mode") == "fast_text"
+            and self.openclaw_model_fast_mode in LOCAL_POLICY_FAST_MODES
+        )
+
+    def _memory_guided_policy_fast_decision(
+        self,
+        prompt_payload: Dict[str, Any],
+        step_mode: Dict[str, Any],
+        prompt: str,
+        model_images: Dict[str, Any],
+        assembled_prompt_tokens: int,
+    ) -> Dict[str, Any]:
+        context_audit = self._context_audit(
+            prompt=prompt,
+            usage={},
+            session_id="",
+            assembled_prompt_tokens=assembled_prompt_tokens,
+            context_profile="plan_model_fast_skip",
+            session_mode="local_policy_fast",
+            model_images=model_images,
+        )
+        self._update_context_audit_for_model_step(context_audit, step_mode)
+        context_audit["model_provider"] = self.openclaw_model_provider
+        context_audit["planner_authority"] = "local_policy"
+        context_audit["qwen_api_called"] = False
+        context_audit["model_call_skipped"] = True
+        context_audit["model_skip_reason"] = "memory_guided_policy_fast"
+        context_audit["fast_policy_mode"] = self.openclaw_model_fast_mode
+        context_audit["provider_usage_source"] = "not_called"
+        return {
+            "intent": "act",
+            "tool_name": "NavigationPolicySkill",
+            "arguments": self._memory_guided_policy_arguments(prompt_payload, step_mode),
+            "reason": "openclaw_memory_guided_policy_fast",
+            "runtime_metadata": {"context_audit": context_audit},
+        }
+
+    def _memory_guided_policy_arguments(
+        self,
+        prompt_payload: Dict[str, Any],
+        step_mode: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        memory = step_mode.get("visual_memory")
+        if not isinstance(memory, dict):
+            memory = {}
+        arguments: Dict[str, Any] = {}
+        subgoal = str(memory.get("last_suggested_subgoal") or "").strip()
+        if subgoal:
+            arguments["active_subgoal"] = subgoal
+        lines: List[str] = []
+        summary = str(memory.get("last_visual_summary") or "").strip()
+        if summary:
+            lines.append(f"Cached visual memory: {summary}")
+        if subgoal:
+            lines.append(f"Suggested subgoal: {subgoal}")
+        reason = str(memory.get("last_qwen_reason") or "").strip()
+        if reason:
+            lines.append(f"Last Qwen reason: {reason}")
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if isinstance(runtime_context, dict):
+            context_note = str(runtime_context.get("memory_context_text") or "").strip()
+            if context_note:
+                lines.append(f"Retrieved memory: {context_note}")
+        if lines:
+            arguments["memory_context_text"] = "\n".join(lines)[:MAX_PROMPT_MEMORY_CONTEXT_CHARS]
+        return arguments
+
+    def _model_run_stdout(self, prompt: str, model_images: Dict[str, Any]) -> str:
+        image_paths = list(model_images.get("paths") or [])
+        if self.openclaw_model_provider == "qwen_api":
+            if self.model_client is None:
+                self.model_client = QwenApiModelClient(
+                    run_openclaw=self.run_openclaw,
+                    openclaw_profile=self.openclaw_profile,
+                )
+            response = self.model_client.run(
+                prompt=prompt,
+                image_paths=image_paths,
+                model=self.openclaw_model,
+                timeout_s=self.agent_timeout_s,
+            )
+            return json.dumps(response, ensure_ascii=True)
+
+        args = self._openclaw_args("capability", "model", "run", "--json")
+        if self.openclaw_model:
+            args.extend(["--model", self.openclaw_model])
+        for image_path in image_paths:
+            args.extend(["--file", image_path])
+        args.extend(["--prompt", prompt])
+        result = self.run_openclaw(args, self.agent_timeout_s)
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "openclaw model run failed").strip()
+            raise RuntimeError(message)
+        return result.stdout or ""
 
     def _heuristic_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         state = payload.get("state") or {}
@@ -186,6 +751,25 @@ class OpenClawCliPlanPlanner:
         prompt = self._agent_prompt_from_prompt_payload(prompt_payload)
         session_id = self._agent_session_id_for_payload(prompt_payload)
         assembled_prompt_tokens = self._estimate_tokens(prompt)
+        if assembled_prompt_tokens > QWEN_HARD_MAX_INPUT_TOKENS:
+            context_audit = self._context_audit(
+                prompt=prompt,
+                usage={},
+                session_id=session_id,
+                assembled_prompt_tokens=assembled_prompt_tokens,
+            )
+            token_guard = {
+                "tripped": True,
+                "input_tokens": assembled_prompt_tokens,
+                "max_input_tokens": QWEN_HARD_MAX_INPUT_TOKENS,
+                "total_tokens": assembled_prompt_tokens,
+                "output_tokens": 0,
+                "qwen_hard_limit_exceeded": True,
+            }
+            return self._agent_token_limit_decision(
+                token_guard,
+                context_audit=context_audit,
+            )
         args = self._openclaw_args(
             "agent",
             "--agent",
@@ -217,8 +801,16 @@ class OpenClawCliPlanPlanner:
             self._agent_token_guard = token_guard
             return self._agent_token_limit_decision(token_guard, context_audit=context_audit)
         agent_text = self._agent_visible_text(result.stdout or "")
-        decision = self._extract_json_object(agent_text)
-        normalized = self._normalize_decision(decision)
+        try:
+            decision = self._extract_json_object(agent_text)
+            normalized = self._normalize_decision(decision)
+        except RuntimeError as exc:
+            fallback = self._heuristic_plan(payload)
+            fallback["reason"] = f"openclaw_cli_agent_fallback:{fallback['reason']}"
+            fallback["arguments"] = dict(fallback.get("arguments") or {})
+            fallback["arguments"]["planner_error"] = str(exc)
+            fallback["runtime_metadata"] = {"context_audit": context_audit}
+            return fallback
         self._enrich_write_memory_with_visual_observation(normalized, prompt_payload)
         visual_analysis = self._visual_analysis_metadata(prompt_payload)
         runtime_metadata = dict(normalized.get("runtime_metadata") or {})
@@ -233,8 +825,25 @@ class OpenClawCliPlanPlanner:
             data = json.loads(stdout)
         except json.JSONDecodeError:
             return {}
+        last_call_usage = self._agent_last_call_usage(data)
+        if last_call_usage:
+            return last_call_usage
         usage = self._find_usage_dict(data)
         return dict(usage) if usage else {}
+
+    def _agent_last_call_usage(self, data: Any) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            return {}
+        agent_meta = meta.get("agentMeta")
+        if not isinstance(agent_meta, dict):
+            return {}
+        usage = agent_meta.get("lastCallUsage")
+        if isinstance(usage, dict):
+            return dict(usage)
+        return {}
 
     def _find_usage_dict(self, value: Any) -> Dict[str, Any]:
         if isinstance(value, dict):
@@ -363,6 +972,293 @@ class OpenClawCliPlanPlanner:
             ]
         )
 
+    def _model_prompt_from_prompt_payload(self, prompt_payload: Dict[str, Any]) -> str:
+        compact_payload = json.dumps(prompt_payload, ensure_ascii=True, sort_keys=True)
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        planner_step_mode = ""
+        if isinstance(runtime_context, dict):
+            planner_step_mode = str(runtime_context.get("planner_step_mode") or "")
+        image_instruction = (
+            "No image is attached for this step. Use the cached visual summary from the last visual_update as visual memory."
+            if planner_step_mode == "fast_text"
+            else "Attached image files correspond to payload image paths. If images are attached, refresh arguments.visual_summary and arguments.suggested_subgoal when useful."
+        )
+        return "\n".join(
+            [
+                "Return one JSON object for ClawNav navigation planning.",
+                'Schema: {"intent":"act|recall_memory|write_memory|verify_progress|replan","tool_name":"...","arguments":{},"reason":"short"}',
+                "For act/replan set arguments.action_text to STOP, MOVE_FORWARD, TURN_LEFT, or TURN_RIGHT when known.",
+                image_instruction,
+                "Payload:",
+                compact_payload,
+            ]
+        )
+
+    def _planner_step_mode(self, prompt_payload: Dict[str, Any]) -> Dict[str, Any]:
+        state = prompt_payload.get("state") or {}
+        if not isinstance(state, dict):
+            state = {}
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if not isinstance(runtime_context, dict):
+            runtime_context = {}
+        step_id = self._step_id(state)
+        cache_key = self._visual_memory_cache_key(prompt_payload)
+        memory = self._visual_memory_cache.get(cache_key) if cache_key else None
+        age_steps = self._visual_memory_age_steps(step_id, memory)
+        mode = "visual_update"
+        reason = "every_step_visual_update"
+        if step_id == 0:
+            reason = "initial_step"
+        elif self._has_keyframe_candidate(runtime_context):
+            reason = "keyframe_candidate"
+        elif not self._model_fast_mode_enabled():
+            reason = "fast_mode_disabled"
+        elif not memory:
+            reason = "missing_visual_memory"
+        elif memory.get("last_update_error"):
+            reason = "previous_visual_update_failed"
+        elif age_steps >= self.openclaw_model_image_interval_steps:
+            reason = "image_interval"
+        else:
+            mode = "fast_text"
+            reason = "cached_visual_memory"
+        return {
+            "planner_step_mode": mode,
+            "fast_break_reason": reason,
+            "cache_key": cache_key,
+            "visual_memory": memory or {},
+            "visual_memory_age_steps": age_steps,
+            "visual_memory_valid_until_step": (
+                memory.get("valid_until_step")
+                if isinstance(memory, dict)
+                else None
+            ),
+            "memory_context_used": bool(
+                mode == "fast_text"
+                and self.openclaw_model_fast_use_memory_context
+                and isinstance(memory, dict)
+                and memory.get("last_visual_summary")
+            ),
+        }
+
+    def _model_fast_mode_enabled(self) -> bool:
+        return self.openclaw_model_fast_mode == "qwen_text_only" or (
+            self.openclaw_model_fast_mode in LOCAL_POLICY_FAST_MODES
+        )
+
+    def _apply_model_step_context(
+        self,
+        prompt_payload: Dict[str, Any],
+        step_mode: Dict[str, Any],
+    ) -> None:
+        runtime_context = prompt_payload.setdefault("runtime_context", {})
+        if not isinstance(runtime_context, dict):
+            return
+        runtime_context["planner_step_mode"] = step_mode["planner_step_mode"]
+        runtime_context["visual_memory_backend"] = "adapter_episode_local"
+        runtime_context["visual_memory_age_steps"] = step_mode.get("visual_memory_age_steps")
+        if step_mode.get("visual_memory_valid_until_step") is not None:
+            runtime_context["visual_memory_valid_until_step"] = step_mode.get(
+                "visual_memory_valid_until_step"
+            )
+        if step_mode["planner_step_mode"] != "fast_text":
+            return
+        runtime_context.pop("current_image_path", None)
+        runtime_context.pop("recent_keyframe_paths", None)
+        runtime_context.pop("keyframe_candidate", None)
+        runtime_context.pop("memory_images", None)
+        runtime_context["model_visual_context_note"] = (
+            "No image is attached for this step. Use cached visual memory from the last visual_update."
+        )
+        if not self.openclaw_model_fast_use_memory_context:
+            return
+        memory = step_mode.get("visual_memory")
+        if not isinstance(memory, dict) or not memory.get("last_visual_summary"):
+            return
+        runtime_context["cached_visual_memory"] = {
+            "last_visual_step_id": memory.get("last_visual_step_id"),
+            "last_visual_summary": memory.get("last_visual_summary"),
+            "last_suggested_subgoal": memory.get("last_suggested_subgoal"),
+            "last_qwen_reason": memory.get("last_qwen_reason"),
+            "last_action_text": memory.get("last_action_text"),
+            "valid_until_step": memory.get("valid_until_step"),
+            "source_image_paths": memory.get("source_image_paths") or [],
+        }
+
+    def _model_image_files(
+        self,
+        prompt_payload: Dict[str, Any],
+        planner_step_mode: str = "visual_update",
+    ) -> Dict[str, Any]:
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if not isinstance(runtime_context, dict) or self.openclaw_model_max_images <= 0:
+            return {"paths": [], "missing_paths": []}
+        if planner_step_mode == "fast_text":
+            return {"paths": [], "missing_paths": []}
+        candidates = self._model_visual_update_image_paths(runtime_context)[
+            : self.openclaw_model_max_images
+        ]
+        paths: List[str] = []
+        missing_paths: List[str] = []
+        for image_path in candidates:
+            if Path(image_path).is_file():
+                paths.append(image_path)
+            else:
+                missing_paths.append(image_path)
+        return {"paths": paths, "missing_paths": missing_paths}
+
+    def _model_visual_update_image_paths(self, runtime_context: Dict[str, Any]) -> List[str]:
+        selected: List[str] = []
+        current_image_path = runtime_context.get("current_image_path")
+        if isinstance(current_image_path, str) and current_image_path:
+            selected.append(current_image_path)
+        keyframe_candidate = runtime_context.get("keyframe_candidate")
+        if isinstance(keyframe_candidate, dict):
+            candidate_path = keyframe_candidate.get("image_path")
+            if isinstance(candidate_path, str) and candidate_path:
+                selected.append(candidate_path)
+        recent_keyframe_paths = runtime_context.get("recent_keyframe_paths") or []
+        if isinstance(recent_keyframe_paths, list):
+            selected.extend(
+                path
+                for path in reversed(recent_keyframe_paths)
+                if isinstance(path, str) and path
+            )
+        deduped: List[str] = []
+        for path in selected:
+            if path not in deduped:
+                deduped.append(path)
+        return deduped
+
+    def _update_context_audit_for_model_step(
+        self,
+        context_audit: Dict[str, Any],
+        step_mode: Dict[str, Any],
+    ) -> None:
+        context_audit["planner_step_mode"] = step_mode.get("planner_step_mode")
+        context_audit["planner_authority"] = "qwen"
+        context_audit["qwen_api_called"] = self.openclaw_model_provider == "qwen_api"
+        context_audit["visual_memory_backend"] = "adapter_episode_local"
+        context_audit["visual_memory_age_steps"] = step_mode.get("visual_memory_age_steps")
+        context_audit["visual_memory_valid_until_step"] = step_mode.get(
+            "visual_memory_valid_until_step"
+        )
+        context_audit["memory_context_used"] = bool(step_mode.get("memory_context_used"))
+        context_audit["fast_break_reason"] = step_mode.get("fast_break_reason")
+        context_audit["visual_memory_update_status"] = "not_applicable"
+
+    def _update_visual_memory_cache(
+        self,
+        prompt_payload: Dict[str, Any],
+        decision: Dict[str, Any],
+        model_images: Dict[str, Any],
+        step_mode: Dict[str, Any],
+    ) -> str:
+        if step_mode.get("planner_step_mode") != "visual_update":
+            return "not_applicable"
+        cache_key = step_mode.get("cache_key")
+        if not isinstance(cache_key, str) or not cache_key:
+            return "missing_cache_key"
+        state = prompt_payload.get("state") or {}
+        step_id = self._step_id(state if isinstance(state, dict) else {})
+        arguments = decision.get("arguments") if isinstance(decision, dict) else {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        summary = self._visual_summary_from_decision(decision, arguments)
+        if not summary:
+            self._visual_memory_cache[cache_key] = {
+                "last_visual_step_id": step_id,
+                "last_update_error": "missing_summary",
+            }
+            return "missing_summary"
+        self._visual_memory_cache[cache_key] = {
+            "last_visual_step_id": step_id,
+            "last_visual_summary": summary,
+            "last_suggested_subgoal": (
+                arguments.get("suggested_subgoal")
+                or arguments.get("active_subgoal")
+                or arguments.get("subgoal")
+                or ""
+            ),
+            "last_qwen_reason": decision.get("reason") or "",
+            "last_action_text": arguments.get("action_text") or "",
+            "valid_until_step": step_id + self.openclaw_model_image_interval_steps,
+            "source_image_paths": list(model_images.get("paths") or []),
+            "last_update_error": "",
+        }
+        return "updated"
+
+    def _mark_visual_memory_error(
+        self,
+        prompt_payload: Dict[str, Any],
+        step_mode: Dict[str, Any],
+        error: str,
+    ) -> str:
+        if step_mode.get("planner_step_mode") != "visual_update":
+            return "not_applicable"
+        cache_key = step_mode.get("cache_key")
+        if not isinstance(cache_key, str) or not cache_key:
+            return "missing_cache_key"
+        state = prompt_payload.get("state") or {}
+        step_id = self._step_id(state if isinstance(state, dict) else {})
+        self._visual_memory_cache[cache_key] = {
+            "last_visual_step_id": step_id,
+            "last_update_error": error or "visual_update_failed",
+        }
+        return "error"
+
+    def _visual_summary_from_decision(
+        self,
+        decision: Dict[str, Any],
+        arguments: Dict[str, Any],
+    ) -> str:
+        for key in ("visual_summary", "visual_observation", "caption", "summary"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        reason = decision.get("reason") if isinstance(decision, dict) else ""
+        return str(reason).strip() if reason else ""
+
+    def _visual_memory_cache_key(self, prompt_payload: Dict[str, Any]) -> str:
+        state = prompt_payload.get("state") or {}
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if not isinstance(state, dict):
+            state = {}
+        if not isinstance(runtime_context, dict):
+            runtime_context = {}
+        return "|".join(
+            [
+                str(runtime_context.get("run_id") or ""),
+                str(state.get("scene_id") or ""),
+                str(state.get("episode_id") or ""),
+            ]
+        )
+
+    def _visual_memory_age_steps(
+        self,
+        step_id: int,
+        memory: Optional[Dict[str, Any]],
+    ) -> Optional[int]:
+        if not isinstance(memory, dict) or memory.get("last_visual_step_id") is None:
+            return None
+        try:
+            return max(0, step_id - int(memory.get("last_visual_step_id")))
+        except (TypeError, ValueError):
+            return None
+
+    def _has_keyframe_candidate(self, runtime_context: Dict[str, Any]) -> bool:
+        keyframe_candidate = runtime_context.get("keyframe_candidate")
+        return bool(
+            isinstance(keyframe_candidate, dict)
+            and keyframe_candidate.get("image_path")
+        )
+
+    def _step_id(self, state: Dict[str, Any]) -> int:
+        try:
+            return int(state.get("step_id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _agent_session_id_for_payload(self, prompt_payload: Dict[str, Any]) -> str:
         state = prompt_payload.get("state") or {}
         if not isinstance(state, dict):
@@ -393,6 +1289,9 @@ class OpenClawCliPlanPlanner:
         usage: Dict[str, Any],
         session_id: str,
         assembled_prompt_tokens: Optional[int] = None,
+        context_profile: str = "plan",
+        session_mode: str = OPENCLAW_SESSION_MODE,
+        model_images: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         assembled = (
             int(assembled_prompt_tokens)
@@ -417,19 +1316,47 @@ class OpenClawCliPlanPlanner:
                 and provider_input >= self.agent_max_input_tokens
             )
         )
-        return {
-            "context_profile": "plan",
+        qwen_hard_limit_exceeded = bool(
+            assembled > QWEN_HARD_MAX_INPUT_TOKENS
+            or (
+                provider_input is not None
+                and provider_input > QWEN_HARD_MAX_INPUT_TOKENS
+            )
+        )
+        provider_usage_source = "reported" if provider_input is not None else "unavailable"
+        audit = {
+            "context_profile": context_profile,
             "assembled_prompt_tokens": assembled,
+            "estimated_provider_input_tokens": assembled,
             "provider_input_tokens": provider_input,
+            "provider_usage_source": provider_usage_source,
             "hidden_history_tokens_estimate": hidden_history,
             "max_total_tokens": PLAN_MAX_TOTAL_TOKENS,
             "agent_max_input_tokens": self.agent_max_input_tokens,
             "qwen_hard_max_input_tokens": QWEN_HARD_MAX_INPUT_TOKENS,
+            "prompt_char_count": len(prompt),
+            "profile_budget_exceeded": assembled > PLAN_MAX_TOTAL_TOKENS,
+            "qwen_hard_limit_exceeded": qwen_hard_limit_exceeded,
             "token_limit_exceeded": token_limit_exceeded,
             "history_tokens": 0,
-            "openclaw_session_mode": OPENCLAW_SESSION_MODE,
+            "openclaw_session_mode": session_mode,
             "openclaw_session_id": session_id,
         }
+        if model_images is not None:
+            image_paths = [
+                str(path)
+                for path in model_images.get("paths", [])
+                if isinstance(path, str) and path
+            ]
+            missing_paths = [
+                str(path)
+                for path in model_images.get("missing_paths", [])
+                if isinstance(path, str) and path
+            ]
+            audit["model_image_count"] = len(image_paths)
+            audit["model_image_paths"] = image_paths
+            audit["model_missing_image_paths"] = missing_paths
+        return audit
 
     def _estimate_tokens(self, text: str) -> int:
         if not text:
@@ -714,6 +1641,51 @@ class OpenClawCliPlanPlanner:
                 return joined
         return stdout
 
+    def _model_visible_text(self, stdout: str) -> str:
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return stdout
+        if not isinstance(data, dict):
+            return stdout
+        outputs = data.get("outputs")
+        if isinstance(outputs, list):
+            texts = [
+                item.get("text", "")
+                for item in outputs
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+            joined = "\n".join(text for text in texts if text.strip())
+            if joined.strip():
+                return joined
+        for key in ("text", "finalAssistantVisibleText", "finalAssistantRawText"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return stdout
+
+    def _model_request_metadata(self, stdout: str) -> Dict[str, Any]:
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        metadata: Dict[str, Any] = {}
+        request_attempts = data.get("request_attempts")
+        retry_count = data.get("retry_count")
+        if request_attempts is not None:
+            try:
+                metadata["qwen_api_request_attempts"] = int(request_attempts)
+            except (TypeError, ValueError):
+                pass
+        if retry_count is not None:
+            try:
+                metadata["qwen_api_retry_count"] = int(retry_count)
+            except (TypeError, ValueError):
+                pass
+        return metadata
+
     def _extract_json_object(self, text: str) -> Dict[str, Any]:
         stripped = text.strip()
         if stripped.startswith("```"):
@@ -829,11 +1801,21 @@ def main() -> None:
     parser.add_argument("--recall_interval_steps", type=int, default=5)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--openclaw_gateway_url", default="")
-    parser.add_argument("--planner_mode", choices=("heuristic", "agent"), default="heuristic")
+    parser.add_argument("--planner_mode", choices=("heuristic", "agent", "model"), default="heuristic")
     parser.add_argument("--agent_id", default="main")
     parser.add_argument("--agent_timeout", type=float, default=60.0)
     parser.add_argument("--agent_max_input_tokens", type=int, default=10000)
     parser.add_argument("--openclaw_profile", default="")
+    parser.add_argument("--openclaw_model", default="")
+    parser.add_argument(
+        "--openclaw_model_provider",
+        choices=("qwen_api", "openclaw_cli"),
+        default="qwen_api",
+    )
+    parser.add_argument("--openclaw_model_max_images", type=int, default=3)
+    parser.add_argument("--openclaw_model_image_interval_steps", type=int, default=10)
+    parser.add_argument("--openclaw_model_fast_mode", default="qwen_text_only")
+    parser.add_argument("--openclaw_model_fast_use_memory_context", type=int, default=1)
     parser.add_argument("--agent_session_id", default="")
     parser.add_argument("--openclaw_visual_mode", choices=("path", "describe"), default="path")
     parser.add_argument("--openclaw_visual_max_images", type=int, default=2)
@@ -851,6 +1833,12 @@ def main() -> None:
         agent_timeout_s=args.agent_timeout,
         agent_max_input_tokens=args.agent_max_input_tokens,
         openclaw_profile=args.openclaw_profile,
+        openclaw_model=args.openclaw_model,
+        openclaw_model_provider=args.openclaw_model_provider,
+        openclaw_model_max_images=args.openclaw_model_max_images,
+        openclaw_model_image_interval_steps=args.openclaw_model_image_interval_steps,
+        openclaw_model_fast_mode=args.openclaw_model_fast_mode,
+        openclaw_model_fast_use_memory_context=bool(args.openclaw_model_fast_use_memory_context),
         agent_session_id=args.agent_session_id,
         openclaw_visual_mode=args.openclaw_visual_mode,
         openclaw_visual_max_images=args.openclaw_visual_max_images,

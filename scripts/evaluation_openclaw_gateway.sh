@@ -12,7 +12,8 @@ if [[ -z "${NPROC_PER_NODE:-}" ]]; then
 fi
 
 OPENCLAW_GATEWAY_URL=${OPENCLAW_GATEWAY_URL:-http://127.0.0.1:8011}
-OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-180}
+OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-300}
+OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}
 OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY-/ssd/dingmuhe/Embodied-task/Navigation_Claw/ABot-Claw_Muhe/openclaw_layer/SERVICE.md}
 OPENCLAW_SERVICE_HOST=${OPENCLAW_SERVICE_HOST:-127.0.0.1}
 NO_PROXY=${NO_PROXY:-127.0.0.1,localhost,::1}
@@ -130,6 +131,9 @@ if [[ "${CHECK_GATEWAY}" == "1" ]]; then
   )
   if [[ "${REQUIRE_OPENCLAW_CLI_ADAPTER}" == "1" ]]; then
     gateway_check_args+=(--require_service openclaw_cli_plan_gateway)
+  fi
+  if [[ "${OPENCLAW_ENFORCE_TIMEOUT_BUDGET}" == "1" ]]; then
+    gateway_check_args+=(--enforce_timeout_budget)
   fi
   if ! PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
     scripts/check_openclaw_plan_gateway.py \

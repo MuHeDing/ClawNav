@@ -1,7 +1,9 @@
 import json
 import subprocess
 
-from harness.openclaw.openclaw_cli_plan_gateway import OpenClawCliPlanPlanner
+import requests
+
+from harness.openclaw.openclaw_cli_plan_gateway import OpenClawCliPlanPlanner, QwenApiModelClient
 
 
 class FakeOpenClawRunner:
@@ -47,6 +49,99 @@ class FakeVisualAnalyzer:
             }
             for path in image_paths
         ]
+
+
+class FakeHttpResponse:
+    def __init__(self, data, status_code=200, text=""):
+        self._data = data
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return self._data
+
+
+class SequenceSession:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.posts = []
+
+    def post(self, *args, **kwargs):
+        self.posts.append({"args": args, "kwargs": kwargs})
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class FakeModelClient:
+    def __init__(self, response=None):
+        self.responses = list(response) if isinstance(response, list) else None
+        self.response = response or {
+            "ok": True,
+            "outputs": [
+                {
+                    "text": json.dumps(
+                        {
+                            "intent": "act",
+                            "tool_name": "NavigationPolicySkill",
+                            "arguments": {"action_text": "TURN_RIGHT"},
+                            "reason": "direct qwen api",
+                        }
+                    )
+                }
+            ],
+            "usage": {"input": 321, "output": 12, "totalTokens": 333},
+        }
+        self.calls = []
+
+    def run(self, prompt, image_paths, model, timeout_s):
+        response = self.responses.pop(0) if self.responses else self.response
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "image_paths": list(image_paths),
+                "model": model,
+                "timeout_s": timeout_s,
+            }
+        )
+        return response
+
+
+class FailingModelClient:
+    def __init__(self, error="qwen request timed out"):
+        self.error = error
+        self.calls = []
+
+    def run(self, prompt, image_paths, model, timeout_s):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "image_paths": list(image_paths),
+                "model": model,
+                "timeout_s": timeout_s,
+            }
+        )
+        raise RuntimeError(self.error)
+
+
+def model_response(arguments=None, reason="direct qwen api"):
+    return {
+        "ok": True,
+        "outputs": [
+            {
+                "text": json.dumps(
+                    {
+                        "intent": "act",
+                        "tool_name": "NavigationPolicySkill",
+                        "arguments": arguments or {"action_text": "TURN_RIGHT"},
+                        "reason": reason,
+                    }
+                )
+            }
+        ],
+        "usage": {"input": 321, "output": 12, "totalTokens": 333},
+    }
 
 
 def test_cli_plan_gateway_health_uses_openclaw_gateway_call():
@@ -129,6 +224,673 @@ def test_cli_plan_gateway_agent_mode_calls_openclaw_agent_and_parses_json_text()
     assert decision["arguments"]["summary"] == "saw a kitchen"
     assert runner.calls[0][0][:5] == ["openclaw", "agent", "--agent", "main", "--json"]
     assert "--session-id" in runner.calls[0][0]
+
+
+def test_cli_plan_gateway_model_mode_calls_openclaw_model_run_and_parses_json_text():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "capability": "model.run",
+                "provider": "qwen",
+                "model": "qwen3.5-flash",
+                "outputs": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "forward"},
+                                "reason": "stateless model",
+                            }
+                        )
+                    }
+                ],
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="model",
+        openclaw_model_provider="openclaw_cli",
+        openclaw_model="qwen/qwen3.5-flash",
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 3,
+            },
+            "runtime_context": {
+                "run_id": "results/run",
+                "current_image_path": "/tmp/current.png",
+            },
+        }
+    )
+
+    assert decision["intent"] == "act"
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+    args = runner.calls[0][0]
+    assert args[:5] == ["openclaw", "capability", "model", "run", "--json"]
+    assert args[args.index("--model") + 1] == "qwen/qwen3.5-flash"
+    prompt = args[args.index("--prompt") + 1]
+    assert "Payload:" in prompt
+    assert "Allowed intents and tools:" not in prompt
+    assert "openclaw_session" not in " ".join(args)
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["context_profile"] == "plan_model"
+    assert audit["openclaw_session_mode"] == "stateless_model"
+    assert audit["openclaw_session_id"] == ""
+    assert audit["provider_input_tokens"] is None
+    assert audit["provider_usage_source"] == "unavailable"
+    assert audit["estimated_provider_input_tokens"] == audit["assembled_prompt_tokens"]
+
+
+def test_cli_plan_gateway_model_mode_can_call_direct_qwen_api_without_openclaw_cli(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_bytes(b"not-a-real-png-for-command-shape-test")
+    runner = FakeOpenClawRunner()
+    model_client = FakeModelClient()
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 3,
+            },
+            "runtime_context": {"current_image_path": str(current)},
+        }
+    )
+
+    assert decision["intent"] == "act"
+    assert decision["arguments"]["action_text"] == "TURN_RIGHT"
+    assert runner.calls == []
+    assert model_client.calls[0]["model"] == "qwen/qwen3.5-flash"
+    assert model_client.calls[0]["image_paths"] == [str(current)]
+    assert "Payload:" in model_client.calls[0]["prompt"]
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["model_provider"] == "qwen_api"
+    assert audit["context_profile"] == "plan_model"
+    assert audit["openclaw_session_mode"] == "stateless_model"
+    assert audit["openclaw_session_id"] == ""
+    assert audit["provider_input_tokens"] == 321
+    assert audit["provider_usage_source"] == "reported"
+
+
+def test_qwen_api_model_client_reads_openclaw_auth_store_without_cli(tmp_path, monkeypatch):
+    auth_dir = tmp_path / ".openclaw" / "agents" / "main" / "agent"
+    auth_dir.mkdir(parents=True)
+    (auth_dir / "auth-profiles.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "qwen:default": {
+                        "type": "api_key",
+                        "provider": "qwen",
+                        "key": "sk-test",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("OPENCLAW_QWEN_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("QWEN_API_KEY", raising=False)
+    runner = FakeOpenClawRunner()
+    client = QwenApiModelClient(run_openclaw=runner)
+
+    client._ensure_config(5)
+
+    assert client.api_key == "sk-test"
+    assert runner.calls == []
+
+
+def test_qwen_api_model_client_retries_dashscope_read_timeout():
+    session = SequenceSession(
+        [
+            requests.exceptions.ReadTimeout("read timed out"),
+            FakeHttpResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "intent": "act",
+                                        "tool_name": "NavigationPolicySkill",
+                                        "arguments": {"action_text": "MOVE_FORWARD"},
+                                        "reason": "retry success",
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+                }
+            ),
+        ]
+    )
+    client = QwenApiModelClient(
+        api_key="sk-test",
+        base_url="https://dashscope.example/v1",
+        max_retries=1,
+        retry_backoff_s=0,
+    )
+    client.session = session
+
+    response = client.run(
+        prompt="return json",
+        image_paths=[],
+        model="qwen/qwen3.5-flash",
+        timeout_s=90,
+    )
+
+    assert len(session.posts) == 2
+    assert response["request_attempts"] == 2
+    assert response["retry_count"] == 1
+    assert response["usage"]["input"] == 12
+    assert "MOVE_FORWARD" in response["outputs"][0]["text"]
+
+
+def test_cli_plan_gateway_health_reports_recommended_timeout_budget(monkeypatch):
+    monkeypatch.setenv("OPENCLAW_QWEN_API_RETRIES", "1")
+    monkeypatch.setenv("OPENCLAW_QWEN_API_RETRY_BACKOFF_S", "2")
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=FakeOpenClawRunner(stdout=json.dumps({"ok": True})),
+        planner_mode="model",
+        agent_timeout_s=90,
+        openclaw_model_provider="qwen_api",
+    )
+
+    health = planner.health_payload()
+
+    budget = health["timeout_budget"]
+    assert budget["agent_timeout_s"] == 90
+    assert budget["qwen_api_retries"] == 1
+    assert budget["qwen_api_retry_backoff_s"] == 2
+    assert budget["estimated_qwen_wall_timeout_s"] == 182
+    assert budget["recommended_gateway_timeout_s"] == 242
+    assert budget["recommended_gateway_timeout_s"] > 120
+
+
+def test_cli_plan_gateway_model_mode_records_reported_usage_when_available():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "outputs": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "TURN_LEFT"},
+                                "reason": "reported usage",
+                            }
+                        )
+                    }
+                ],
+                "usage": {"input": 1200, "output": 20, "totalTokens": 1220},
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="model",
+        openclaw_model_provider="openclaw_cli",
+        openclaw_model="qwen/qwen3.5-flash",
+    )
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert decision["arguments"]["action_text"] == "TURN_LEFT"
+    assert audit["provider_input_tokens"] == 1200
+    assert audit["provider_usage_source"] == "reported"
+    assert audit["hidden_history_tokens_estimate"] == (
+        audit["provider_input_tokens"] - audit["assembled_prompt_tokens"]
+    )
+
+
+def test_cli_plan_gateway_model_mode_attaches_existing_visual_image_files(tmp_path):
+    current = tmp_path / "current.png"
+    key0 = tmp_path / "key0.png"
+    key1 = tmp_path / "key1.png"
+    missing = tmp_path / "missing.png"
+    for path in (current, key0, key1):
+        path.write_bytes(b"not-a-real-png-for-command-shape-test")
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "outputs": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "uses attached images",
+                            }
+                        )
+                    }
+                ],
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="model",
+        openclaw_model_provider="openclaw_cli",
+        openclaw_model="qwen/qwen3.5-flash",
+        openclaw_model_max_images=3,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 2},
+            "runtime_context": {
+                "current_image_path": str(current),
+                "recent_keyframe_paths": [str(missing), str(key0), str(key1)],
+            },
+        }
+    )
+
+    args = runner.calls[0][0]
+    file_paths = [
+        args[index + 1]
+        for index, arg in enumerate(args)
+        if arg == "--file"
+    ]
+    assert file_paths == [str(current), str(key1), str(key0)]
+    prompt = args[args.index("--prompt") + 1]
+    assert "Attached image files correspond to payload image paths." in prompt
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["model_image_count"] == 3
+    assert audit["model_image_paths"] == [str(current), str(key1), str(key0)]
+    assert audit["model_missing_image_paths"] == []
+
+
+def test_cli_plan_gateway_model_mode_does_not_attach_missing_image_files(tmp_path):
+    missing = tmp_path / "missing.png"
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "ok": True,
+                "outputs": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "missing image skipped",
+                            }
+                        )
+                    }
+                ],
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="model",
+        openclaw_model_provider="openclaw_cli",
+        openclaw_model="qwen/qwen3.5-flash",
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 2},
+            "runtime_context": {"current_image_path": str(missing)},
+        }
+    )
+
+    args = runner.calls[0][0]
+    assert "--file" not in args
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["model_image_count"] == 0
+    assert audit["model_image_paths"] == []
+    assert audit["model_missing_image_paths"] == [str(missing)]
+
+
+def test_cli_plan_gateway_model_mode_gates_images_and_uses_cached_visual_memory(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient(
+        response=[
+            model_response(
+                {
+                    "action_text": "TURN_RIGHT",
+                    "visual_summary": "red hallway with doorway ahead",
+                    "suggested_subgoal": "continue toward the doorway",
+                },
+                reason="visual update",
+            ),
+            model_response({"action_text": "MOVE_FORWARD"}, reason="fast text"),
+        ]
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        openclaw_model_max_images=2,
+        openclaw_model_image_interval_steps=8,
+        openclaw_model_fast_mode="qwen_text_only",
+        model_client=model_client,
+    )
+
+    first = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 0,
+            },
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    second = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 1,
+            },
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    assert first["arguments"]["action_text"] == "TURN_RIGHT"
+    assert second["arguments"]["action_text"] == "MOVE_FORWARD"
+    assert model_client.calls[0]["image_paths"] == [str(current0)]
+    assert model_client.calls[1]["image_paths"] == []
+    assert "red hallway with doorway ahead" in model_client.calls[1]["prompt"]
+    assert "No image is attached for this step." in model_client.calls[1]["prompt"]
+
+    first_audit = first["runtime_metadata"]["context_audit"]
+    second_audit = second["runtime_metadata"]["context_audit"]
+    assert first_audit["planner_step_mode"] == "visual_update"
+    assert first_audit["planner_authority"] == "qwen"
+    assert first_audit["qwen_api_called"] is True
+    assert first_audit["model_image_count"] == 1
+    assert first_audit["visual_memory_backend"] == "adapter_episode_local"
+    assert first_audit["visual_memory_update_status"] == "updated"
+    assert second_audit["planner_step_mode"] == "fast_text"
+    assert second_audit["planner_authority"] == "qwen"
+    assert second_audit["qwen_api_called"] is True
+    assert second_audit["model_image_count"] == 0
+    assert second_audit["memory_context_used"] is True
+    assert second_audit["visual_memory_age_steps"] == 1
+
+
+def test_cli_plan_gateway_model_mode_records_qwen_retry_metadata():
+    response = model_response({"action_text": "MOVE_FORWARD"}, reason="retry metadata")
+    response["request_attempts"] = 2
+    response["retry_count"] = 1
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        model_client=FakeModelClient(response=response),
+    )
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 0}})
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["qwen_api_request_attempts"] == 2
+    assert audit["qwen_api_retry_count"] == 1
+
+
+def test_cli_plan_gateway_model_mode_memory_guided_policy_fast_skips_qwen_on_fast_steps(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient(
+        response=[
+            model_response(
+                {
+                    "action_text": "TURN_RIGHT",
+                    "visual_summary": "red hallway with doorway ahead",
+                    "suggested_subgoal": "continue toward the doorway",
+                },
+                reason="visual update",
+            ),
+        ]
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        openclaw_model_max_images=2,
+        openclaw_model_image_interval_steps=10,
+        openclaw_model_fast_mode="memory_guided_policy_fast",
+        model_client=model_client,
+    )
+
+    first = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 0,
+            },
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    second = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 1,
+            },
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    assert first["arguments"]["action_text"] == "TURN_RIGHT"
+    assert len(model_client.calls) == 1
+    assert model_client.calls[0]["image_paths"] == [str(current0)]
+    assert second["intent"] == "act"
+    assert second["tool_name"] == "NavigationPolicySkill"
+    assert "action_text" not in second["arguments"]
+    assert second["arguments"]["active_subgoal"] == "continue toward the doorway"
+    assert "red hallway with doorway ahead" in second["arguments"]["memory_context_text"]
+
+    audit = second["runtime_metadata"]["context_audit"]
+    assert audit["planner_step_mode"] == "fast_text"
+    assert audit["planner_authority"] == "local_policy"
+    assert audit["qwen_api_called"] is False
+    assert audit["model_call_skipped"] is True
+    assert audit["model_image_count"] == 0
+    assert audit["memory_context_used"] is True
+    assert audit["fast_policy_mode"] == "memory_guided_policy_fast"
+
+
+def test_cli_plan_gateway_model_mode_preserves_context_audit_on_model_error(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FailingModelClient("qwen request timed out")
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        openclaw_model_max_images=2,
+        openclaw_model_image_interval_steps=10,
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go to kitchen",
+                "step_id": 0,
+            },
+            "runtime_context": {"current_image_path": str(current), "run_id": "run-a"},
+        }
+    )
+
+    assert decision["reason"] == "openclaw_cli_model_fallback:openclaw_cli_initial_recall"
+    assert decision["arguments"]["planner_error"] == "qwen request timed out"
+    assert model_client.calls[0]["image_paths"] == [str(current)]
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["planner_step_mode"] == "visual_update"
+    assert audit["fast_break_reason"] == "initial_step"
+    assert audit["model_image_count"] == 1
+    assert audit["model_provider"] == "qwen_api"
+    assert audit["qwen_api_called"] is True
+    assert audit["visual_memory_update_status"] == "error"
+
+
+def test_cli_plan_gateway_model_mode_keyframe_forces_visual_update_with_current_and_keyframe(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    keyframe = tmp_path / "keyframe.png"
+    for path in (current0, current1, keyframe):
+        path.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient(
+        response=[
+            model_response(
+                {"action_text": "TURN_RIGHT", "visual_summary": "cached hallway"},
+                reason="visual update",
+            ),
+            model_response(
+                {"action_text": "MOVE_FORWARD", "visual_summary": "new doorway"},
+                reason="keyframe update",
+            ),
+        ]
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_max_images=2,
+        openclaw_model_image_interval_steps=8,
+        openclaw_model_fast_mode="qwen_text_only",
+        model_client=model_client,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 1},
+            "runtime_context": {
+                "current_image_path": str(current1),
+                "recent_keyframe_paths": [str(keyframe)],
+                "keyframe_candidate": {
+                    "step_id": 1,
+                    "reason": "novel view",
+                    "image_path": str(keyframe),
+                },
+                "run_id": "run-a",
+            },
+        }
+    )
+
+    assert model_client.calls[1]["image_paths"] == [str(current1), str(keyframe)]
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["planner_step_mode"] == "visual_update"
+    assert audit["fast_break_reason"] == "keyframe_candidate"
+    assert audit["model_image_count"] == 2
+
+
+def test_cli_plan_gateway_model_mode_visual_memory_is_episode_local(tmp_path):
+    ep1_image = tmp_path / "ep1.png"
+    ep2_image = tmp_path / "ep2.png"
+    ep1_image.write_bytes(b"not-a-real-png-for-command-shape-test")
+    ep2_image.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient(
+        response=[
+            model_response(
+                {"action_text": "TURN_RIGHT", "visual_summary": "episode one memory"},
+                reason="visual update",
+            ),
+            model_response(
+                {"action_text": "MOVE_FORWARD", "visual_summary": "episode two memory"},
+                reason="missing memory update",
+            ),
+        ]
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_image_interval_steps=8,
+        openclaw_model_fast_mode="qwen_text_only",
+        model_client=model_client,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(ep1_image), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:2", "step_id": 1},
+            "runtime_context": {"current_image_path": str(ep2_image), "run_id": "run-a"},
+        }
+    )
+
+    assert model_client.calls[1]["image_paths"] == [str(ep2_image)]
+    assert "episode one memory" not in model_client.calls[1]["prompt"]
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["planner_step_mode"] == "visual_update"
+    assert audit["fast_break_reason"] == "missing_visual_memory"
+
+
+def test_cli_plan_gateway_model_prompt_is_shorter_than_agent_prompt():
+    planner = OpenClawCliPlanPlanner(planner_mode="model")
+    prompt_payload = planner._prompt_payload(
+        {
+            "state": {"instruction": "go to kitchen", "step_id": 2},
+            "runtime_context": {
+                "run_id": "results/run",
+                "current_image_path": "/tmp/current.png",
+                "memory_context_text": "m" * 300,
+            },
+        }
+    )
+
+    agent_prompt = planner._agent_prompt_from_prompt_payload(prompt_payload)
+    model_prompt = planner._model_prompt_from_prompt_payload(prompt_payload)
+
+    assert len(model_prompt) < len(agent_prompt)
+    assert "Allowed intents and tools:" in agent_prompt
+    assert "Allowed intents and tools:" not in model_prompt
+    assert "write_gate" not in model_prompt
 
 
 def test_cli_plan_gateway_skips_visual_describe_between_interval_steps():
@@ -270,6 +1032,7 @@ def test_cli_plan_gateway_agent_mode_uses_fresh_session_per_plan_step():
         planner_mode="agent",
         agent_session_id="base-session",
         agent_session_timestamp="05221040",
+        agent_max_input_tokens=50000,
     )
 
     planner.plan_payload(
@@ -333,6 +1096,7 @@ def test_cli_plan_gateway_agent_mode_isolates_session_by_scene():
         planner_mode="agent",
         agent_session_id="base-session",
         agent_session_timestamp="05221040",
+        agent_max_input_tokens=50000,
     )
 
     payload = {
@@ -799,6 +1563,53 @@ def test_cli_plan_gateway_agent_mode_falls_back_to_heuristic_when_agent_fails():
     assert "qwen unavailable" in decision["arguments"]["planner_error"]
 
 
+def test_cli_plan_gateway_agent_mode_preserves_context_audit_on_parse_fallback():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [{"text": "I cannot act as a navigation planner."}],
+                "meta": {
+                    "agentMeta": {
+                        "lastCallUsage": {
+                            "input": 16273,
+                            "output": 293,
+                            "totalTokens": 16566,
+                        }
+                    }
+                },
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_session_id="base-session",
+        agent_session_timestamp="05221040",
+        agent_max_input_tokens=50000,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene/A",
+                "episode_id": "ep:1",
+                "instruction": "go",
+                "step_id": 50,
+            },
+            "runtime_context": {"run_id": "results/run"},
+        }
+    )
+
+    assert decision["reason"] == "openclaw_cli_agent_fallback:openclaw_cli_interval_recall"
+    assert "openclaw agent did not return a JSON object" in decision["arguments"]["planner_error"]
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["provider_input_tokens"] == 16273
+    assert audit["openclaw_session_mode"] == "fresh_per_step"
+    assert audit["openclaw_session_id"] == (
+        "base-session-results_run-scene_A-ep:1-step_50-05221040"
+    )
+
+
 def test_cli_plan_gateway_agent_mode_stops_when_input_token_limit_is_reached():
     runner = FakeOpenClawRunner(
         stdout=json.dumps(
@@ -837,6 +1648,88 @@ def test_cli_plan_gateway_agent_mode_stops_when_input_token_limit_is_reached():
     assert decision["runtime_metadata"]["agent_token_guard"]["tripped"] is True
     assert second["arguments"]["action_text"] == "STOP"
     assert len(runner.calls) == 1
+
+
+def test_cli_plan_gateway_agent_mode_refuses_prompt_above_qwen_hard_limit(monkeypatch):
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "should not be called",
+                            }
+                        )
+                    }
+                ],
+                "usage": {"input": 10, "output": 1, "totalTokens": 11},
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_max_input_tokens=0,
+    )
+    monkeypatch.setattr(planner, "_estimate_tokens", lambda text: 50001)
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    assert decision["intent"] == "act"
+    assert decision["tool_name"] == "NavigationPolicySkill"
+    assert decision["arguments"]["action_text"] == "STOP"
+    assert decision["reason"] == "openclaw_agent_input_token_limit"
+    assert decision["arguments"]["input_tokens"] == 50001
+    assert decision["arguments"]["max_input_tokens"] == 50000
+    assert runner.calls == []
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["assembled_prompt_tokens"] == 50001
+    assert audit["provider_input_tokens"] is None
+    assert audit["token_limit_exceeded"] is True
+    assert audit["qwen_hard_limit_exceeded"] is True
+
+
+def test_cli_plan_gateway_agent_mode_records_profile_budget_overrun(monkeypatch):
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "budget audit",
+                            }
+                        )
+                    }
+                ],
+                "usage": {"input": 7100, "output": 12, "totalTokens": 7112},
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_max_input_tokens=10000,
+    )
+    monkeypatch.setattr(planner, "_estimate_tokens", lambda text: 7000)
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 2}})
+
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+    assert len(runner.calls) == 1
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["assembled_prompt_tokens"] == 7000
+    assert audit["provider_input_tokens"] == 7100
+    assert audit["profile_budget_exceeded"] is True
+    assert audit["qwen_hard_limit_exceeded"] is False
+    assert audit["token_limit_exceeded"] is False
 
 
 def test_cli_plan_gateway_agent_mode_records_context_audit_metadata():
@@ -894,3 +1787,51 @@ def test_cli_plan_gateway_agent_mode_records_context_audit_metadata():
     assert audit["agent_max_input_tokens"] == 10000
     assert audit["qwen_hard_max_input_tokens"] == 50000
     assert audit["token_limit_exceeded"] is False
+
+
+def test_cli_plan_gateway_agent_mode_prefers_last_call_usage_for_context_audit():
+    runner = FakeOpenClawRunner(
+        stdout=json.dumps(
+            {
+                "payloads": [
+                    {
+                        "text": json.dumps(
+                            {
+                                "intent": "act",
+                                "tool_name": "NavigationPolicySkill",
+                                "arguments": {"action_text": "MOVE_FORWARD"},
+                                "reason": "last call usage",
+                            }
+                        )
+                    }
+                ],
+                "meta": {
+                    "agentMeta": {
+                        "usage": {
+                            "input": 83000,
+                            "output": 300,
+                            "totalTokens": 83300,
+                        },
+                        "lastCallUsage": {
+                            "input": 17000,
+                            "output": 40,
+                            "totalTokens": 17040,
+                        },
+                    }
+                },
+            }
+        )
+    )
+    planner = OpenClawCliPlanPlanner(
+        run_openclaw=runner,
+        planner_mode="agent",
+        agent_max_input_tokens=50000,
+    )
+
+    decision = planner.plan_payload({"state": {"instruction": "go", "step_id": 10}})
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["provider_input_tokens"] == 17000
+    assert audit["qwen_hard_limit_exceeded"] is False
+    assert audit["token_limit_exceeded"] is False
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"

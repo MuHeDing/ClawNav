@@ -39,6 +39,8 @@ def validate_plan_response(data: Dict[str, Any]) -> None:
 def validate_gateway_health(
     data: Dict[str, Any],
     require_service: str = "",
+    client_timeout_s: float = 0.0,
+    enforce_timeout_budget: bool = False,
 ) -> None:
     if not isinstance(data, dict):
         raise ValueError("gateway health response must be an object")
@@ -50,6 +52,20 @@ def validate_gateway_health(
             raise ValueError(
                 f"gateway service must be {require_service}; got {service or '<missing>'}"
             )
+    if enforce_timeout_budget:
+        budget = data.get("timeout_budget") if isinstance(data.get("timeout_budget"), dict) else {}
+        recommended = budget.get("recommended_gateway_timeout_s")
+        if recommended is None:
+            return
+        try:
+            recommended_timeout_s = float(recommended)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeout_budget.recommended_gateway_timeout_s must be numeric") from exc
+        if client_timeout_s < recommended_timeout_s:
+            raise ValueError(
+                "OPENCLAW_GATEWAY_TIMEOUT is below the adapter timeout budget: "
+                f"{client_timeout_s:g}s < recommended {recommended_timeout_s:g}s"
+            )
 
 
 def main() -> None:
@@ -58,13 +74,19 @@ def main() -> None:
     parser.add_argument("--instruction", default="go to kitchen")
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--require_service", default="")
+    parser.add_argument("--enforce_timeout_budget", action="store_true")
     args = parser.parse_args()
 
     session = requests.Session()
     session.trust_env = False
     health = session.get(f"{args.gateway_url.rstrip('/')}/health", timeout=args.timeout)
     health.raise_for_status()
-    validate_gateway_health(health.json(), require_service=args.require_service)
+    validate_gateway_health(
+        health.json(),
+        require_service=args.require_service,
+        client_timeout_s=args.timeout,
+        enforce_timeout_budget=args.enforce_timeout_budget,
+    )
     response = session.post(
         f"{args.gateway_url.rstrip('/')}/plan",
         json=build_probe_payload(args.instruction),

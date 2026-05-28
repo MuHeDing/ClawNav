@@ -50,6 +50,25 @@ def test_validate_gateway_health_rejects_wrong_adapter_service_when_required():
         raise AssertionError("expected ValueError")
 
 
+def test_validate_gateway_health_rejects_low_timeout_budget_when_enforced():
+    try:
+        validate_gateway_health(
+            {
+                "ok": True,
+                "service": "openclaw_cli_plan_gateway",
+                "timeout_budget": {"recommended_gateway_timeout_s": 242},
+            },
+            require_service="openclaw_cli_plan_gateway",
+            client_timeout_s=120,
+            enforce_timeout_budget=True,
+        )
+    except ValueError as exc:
+        assert "OPENCLAW_GATEWAY_TIMEOUT" in str(exc)
+        assert "242" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
 def test_build_visual_probe_payload_passes_image_content_summary_not_oracle_metrics():
     observations = [
         {
