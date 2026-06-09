@@ -49,6 +49,7 @@ from evaluation_debug_utils import (
     build_episode_qualitative_record,
     build_model_step_record,
     canonical_scene_id,
+    format_episode_progress_line,
     format_ratio,
     multi_goal_overlay_pad_meters,
     normalize_vln_dataset_json_text,
@@ -616,16 +617,46 @@ class VLNEvaluator:
                         oss.append(res['os'])
                         ones.append(res['ne'])
         
+        total_assigned_episodes = sum(
+            len(episodes[idx::self.env_num]) for episodes in scene_episode_dict.values()
+        )
+        episode_progress_index = 0
+
         for scene in sorted(scene_episode_dict.keys()):
             episodes = scene_episode_dict[scene]
             scene_id = scene.split('/')[-2]
+            assigned_episodes = episodes[idx::self.env_num]
 
-            process_bar = tqdm.tqdm(range(len(episodes[idx::self.env_num])), desc=f"scene {scene_id}")
-            for episode in episodes[idx::self.env_num]:
+            process_bar = tqdm.tqdm(range(len(assigned_episodes)), desc=f"scene {scene_id}")
+            for episode in assigned_episodes:
                 episode_instruction = episode.instruction.instruction_text if 'objectnav' not in self.config_path else episode.object_category
                 episode_id = episode.episode_id
+                episode_progress_index += 1
                 if [scene_id, episode_id, episode_instruction] in done_res:
+                    print(
+                        format_episode_progress_line(
+                            status="skip",
+                            rank=idx,
+                            current=episode_progress_index,
+                            total=total_assigned_episodes,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                        ),
+                        flush=True,
+                    )
+                    process_bar.update(1)
                     continue
+                print(
+                    format_episode_progress_line(
+                        status="start",
+                        rank=idx,
+                        current=episode_progress_index,
+                        total=total_assigned_episodes,
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                    ),
+                    flush=True,
+                )
                 
                 self.current_episode_normalized = False
 
@@ -793,7 +824,19 @@ class VLNEvaluator:
                 oss.append(metrics['oracle_success'])
                 ones.append(metrics['distance_to_goal'])
                 
-                print(f"scene_episode {scene_id}_{episode_id} success: {metrics['success']}, spl: {metrics['spl']}, os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']}")
+                print(
+                    format_episode_progress_line(
+                        status="finish",
+                        rank=idx,
+                        current=episode_progress_index,
+                        total=total_assigned_episodes,
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        steps=step_id,
+                        metrics=metrics,
+                    ),
+                    flush=True,
+                )
 
                 result = {
                     "scene_id": scene_id,

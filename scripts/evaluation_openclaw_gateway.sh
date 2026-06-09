@@ -61,7 +61,8 @@ HARNESS_SELECTED_EPISODES=(
   "zsNo4HB9uLZ:247"
   "zsNo4HB9uLZ:251"
 )
-if [[ -z "${HARNESS_EPISODE_KEYS:-}" ]]; then
+HARNESS_USE_DEFAULT_EPISODE_KEYS=${HARNESS_USE_DEFAULT_EPISODE_KEYS:-1}
+if [[ -z "${HARNESS_EPISODE_KEYS:-}" && "${HARNESS_USE_DEFAULT_EPISODE_KEYS}" == "1" ]]; then
   HARNESS_EPISODE_KEYS=$(IFS=,; echo "${HARNESS_SELECTED_EPISODES[*]}")
 fi
 
@@ -84,7 +85,7 @@ fi
 if [[ -n "${HARNESS_DEBUG_MAX_EPISODES}" ]]; then
   extra_args+=(--harness_debug_max_episodes "${HARNESS_DEBUG_MAX_EPISODES}")
 fi
-if [[ -n "${HARNESS_EPISODE_KEYS}" ]]; then
+if [[ -n "${HARNESS_EPISODE_KEYS:-}" ]]; then
   extra_args+=(--harness_episode_keys "${HARNESS_EPISODE_KEYS}")
 fi
 if [[ -n "${MEMORY_MANIFEST_PATH}" ]]; then
@@ -116,6 +117,7 @@ echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
 echo "OpenClaw critic/curator: ${OPENCLAW_ENABLE_SUBAGENT_CRITIC}/${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR}"
 echo "Require OpenClaw CLI adapter: ${REQUIRE_OPENCLAW_CLI_ADAPTER}"
 echo "Max episodes: ${HARNESS_DEBUG_MAX_EPISODES:-all}"
+echo "Use default episode keys: ${HARNESS_USE_DEFAULT_EPISODE_KEYS}"
 echo "Episode keys: ${HARNESS_EPISODE_KEYS:-all}"
 echo "Max steps per episode: ${MAX_STEPS}"
 echo "Output path: ${OUTPUT_PATH}"

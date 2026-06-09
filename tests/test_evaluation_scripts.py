@@ -1,3 +1,6 @@
+import gzip
+import json
+from collections import Counter
 from pathlib import Path
 
 
@@ -34,6 +37,7 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     contents = script.read_text(encoding="utf-8")
 
     assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}" in contents
+    assert "HARNESS_USE_DEFAULT_EPISODE_KEYS=${HARNESS_USE_DEFAULT_EPISODE_KEYS:-1}" in contents
     assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
     assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-300}" in contents
     assert "OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}" in contents
@@ -43,6 +47,68 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     assert "--enforce_timeout_budget" in contents
     assert "--harness_debug_max_episodes" in contents
     assert "--max_steps" in contents
+
+
+def test_openclaw_gateway_script_can_disable_default_episode_keys_for_custom_data():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert (
+        '[[ -z "${HARNESS_EPISODE_KEYS:-}" && "${HARNESS_USE_DEFAULT_EPISODE_KEYS}" == "1" ]]'
+        in contents
+    )
+    assert 'echo "Use default episode keys: ${HARNESS_USE_DEFAULT_EPISODE_KEYS}"' in contents
+    assert 'if [[ -n "${HARNESS_EPISODE_KEYS:-}" ]]; then' in contents
+
+
+def test_400_val_unseen_launcher_runs_directly_without_screen_management():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_memory_guided_fast_400_val_unseen_screen.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "screen -dmS" not in contents
+    assert "screen -ls" not in contents
+    assert "CLAWNAV_SCREEN_CHILD" not in contents
+    assert "SCREEN_NAME" not in contents
+    assert "400_val_unseen.json.gz" in contents
+    assert "EPISODES=${EPISODES:-400}" in contents
+    assert "IMAGE_INTERVAL_STEPS=${IMAGE_INTERVAL_STEPS:-20}" in contents
+    assert "SMOKE_EPISODE_KEY=${SMOKE_EPISODE_KEY:-zsNo4HB9uLZ:1}" in contents
+    assert "--smoke-episode-key" in contents
+    assert "--data-path" in contents
+    assert "run_memory_guided_fast_large_eval.py" in contents
+
+
+def test_100_val_unseen_launcher_uses_100_episode_dataset():
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dataset = Path(
+        "/ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/val_unseen/400_val_unseen.json.gz"
+    )
+    dataset = repo_root / "data/datasets/r2r/val_unseen/100_val_unseen.json.gz"
+    script = repo_root / "scripts" / "run_memory_guided_fast_100_val_unseen_screen.sh"
+
+    with gzip.open(source_dataset, "rt", encoding="utf-8") as file:
+        source_payload = json.load(file)
+    with gzip.open(dataset, "rt", encoding="utf-8") as file:
+        payload = json.load(file)
+    contents = script.read_text(encoding="utf-8")
+
+    source_scenes = {episode["scene_id"] for episode in source_payload["episodes"]}
+    scene_counts = Counter(episode["scene_id"] for episode in payload["episodes"])
+
+    assert len(payload["episodes"]) == 100
+    assert set(scene_counts) == source_scenes
+    assert max(scene_counts.values()) - min(scene_counts.values()) <= 1
+    assert "100_val_unseen.json.gz" in contents
+    assert "EPISODES=${EPISODES:-100}" in contents
+    assert "IMAGE_INTERVAL_STEPS=${IMAGE_INTERVAL_STEPS:-20}" in contents
+    assert "ABORT_ON_INVALID=${ABORT_ON_INVALID:-1}" in contents.splitlines()
+    assert "SKIP_SMOKE=${SKIP_SMOKE:-1}" in contents
+    assert "SMOKE_EPISODE_KEY=${SMOKE_EPISODE_KEY:-zsNo4HB9uLZ:1}" in contents
+    assert "--smoke-episode-key" in contents
+    assert "clawnav_openclaw_qwen_memory_guided_fast_100_val_unseen_" in contents
+    assert "run_memory_guided_fast_large_eval.py" in contents
 
 
 def test_openclaw_gateway_script_allows_runtime_fallback_after_preflight_failure():
@@ -68,7 +134,7 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "OPENCLAW_MODEL=${OPENCLAW_MODEL:-qwen/qwen3.5-flash}" in contents
     assert "OPENCLAW_MODEL_PROVIDER=${OPENCLAW_MODEL_PROVIDER:-qwen_api}" in contents
     assert "OPENCLAW_MODEL_MAX_IMAGES=${OPENCLAW_MODEL_MAX_IMAGES:-3}" in contents
-    assert "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-10}" in contents
+    assert "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-20}" in contents
     assert "OPENCLAW_MODEL_FAST_MODE=${OPENCLAW_MODEL_FAST_MODE:-qwen_text_only}" in contents
     assert "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT=${OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT:-1}" in contents
     assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents

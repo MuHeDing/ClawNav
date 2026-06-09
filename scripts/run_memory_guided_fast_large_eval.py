@@ -15,6 +15,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,11 +42,12 @@ class LargeEvalConfig:
     port: int = 8011
     episodes: int = 30
     max_steps: int = 400
+    data_path: Optional[str] = None
     model_path: str = DEFAULT_MODEL_PATH
     model: str = "qwen/qwen3.5-flash"
     model_provider: str = "qwen_api"
     fast_mode: str = "memory_guided_policy_fast"
-    image_interval_steps: int = 10
+    image_interval_steps: int = 20
     model_max_images: int = 2
     qwen_retries: int = 1
     qwen_retry_backoff_s: float = 2.0
@@ -137,6 +139,10 @@ def build_eval_env(
     }
     if episode_keys:
         env["HARNESS_EPISODE_KEYS"] = episode_keys
+    if config.data_path:
+        env["DATA_PATH"] = config.data_path
+        if not episode_keys:
+            env["HARNESS_USE_DEFAULT_EPISODE_KEYS"] = 0
     return _stringify_env(env)
 
 
@@ -166,6 +172,7 @@ def collect_run_summary(
     fallback_examples: List[Dict[str, Any]] = []
     planner_fallback_examples: List[Dict[str, Any]] = []
     cli_fallback_examples: List[Dict[str, Any]] = []
+    runtime_error_examples: List[Dict[str, Any]] = []
     fast_qwen_examples: List[Dict[str, Any]] = []
     fast_not_local_policy_examples: List[Dict[str, Any]] = []
     fast_model_not_skipped_examples: List[Dict[str, Any]] = []
@@ -185,6 +192,7 @@ def collect_run_summary(
     fallback_count = 0
     planner_fallback_count = 0
     cli_fallback_count = 0
+    runtime_error_count = 0
 
     for row in trace_rows:
         audit = row.get("context_audit") if isinstance(row.get("context_audit"), dict) else {}
@@ -210,6 +218,9 @@ def collect_run_summary(
         if is_cli_fallback:
             cli_fallback_count += 1
             _append_example(cli_fallback_examples, row)
+        if _is_openclaw_runtime_error(row, planner_reason):
+            runtime_error_count += 1
+            _append_example(runtime_error_examples, row)
 
         assembled_tokens = _coerce_float(audit.get("assembled_prompt_tokens"))
         provider_tokens = _coerce_float(audit.get("provider_input_tokens"))
@@ -259,6 +270,7 @@ def collect_run_summary(
         "fallback_count": fallback_count,
         "planner_fallback_count": planner_fallback_count,
         "cli_fallback_count": cli_fallback_count,
+        "runtime_error_count": runtime_error_count,
         "qwen_api_called": qwen_api_called,
         "fast_qwen_api_called": fast_qwen_api_called,
         "visual_qwen_api_called": visual_qwen_api_called,
@@ -275,6 +287,7 @@ def collect_run_summary(
         "fallback_examples": fallback_examples,
         "planner_fallback_examples": planner_fallback_examples,
         "cli_fallback_examples": cli_fallback_examples,
+        "runtime_error_examples": runtime_error_examples,
         "fast_qwen_examples": fast_qwen_examples,
         "fast_not_local_policy_examples": fast_not_local_policy_examples,
         "fast_model_not_skipped_examples": fast_model_not_skipped_examples,
@@ -310,6 +323,14 @@ def validate_large_eval_gate(
                 "trace_path": summary.get("trace_path", ""),
             }
         )
+    _append_count_failure(
+        failures,
+        summary,
+        key="runtime_error_count",
+        code="openclaw_runtime_error",
+        message="openclaw_runtime_error rows were present; stop the eval immediately",
+        examples_key="runtime_error_examples",
+    )
     _append_count_failure(
         failures,
         summary,
@@ -427,7 +448,8 @@ def render_markdown_report(summary: Dict[str, Any], *, label: str) -> str:
             "Fallbacks: "
             f"runtime={summary.get('fallback_count')}, "
             f"planner={summary.get('planner_fallback_count')}, "
-            f"cli={summary.get('cli_fallback_count')}"
+            f"cli={summary.get('cli_fallback_count')}, "
+            f"runtime_errors={summary.get('runtime_error_count', 0)}"
         ),
         (
             "Qwen calls: "
@@ -586,10 +608,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8011)
     parser.add_argument("--episodes", type=int, default=30)
     parser.add_argument("--max-steps", type=int, default=400)
+    parser.add_argument("--data-path", default=None)
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--model", default="qwen/qwen3.5-flash")
     parser.add_argument("--model-max-images", type=int, default=2)
-    parser.add_argument("--image-interval-steps", type=int, default=10)
+    parser.add_argument("--image-interval-steps", type=int, default=20)
     parser.add_argument("--qwen-retries", type=int, default=1)
     parser.add_argument("--qwen-retry-backoff-s", type=float, default=2.0)
     parser.add_argument("--agent-timeout-s", type=int, default=90)
@@ -612,12 +635,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def config_from_args(args: argparse.Namespace) -> LargeEvalConfig:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    gpu_tag = _safe_tag(args.gpu)
     smoke_output = args.smoke_output or Path(
-        f"results/clawnav_openclaw_qwen_memory_guided_fast_smoke_{timestamp}_gpu{gpu_tag}"
+        f"results/clawnav_openclaw_qwen_memory_guided_fast_smoke_{timestamp}"
     )
     eval_output = args.eval_output or Path(
-        f"results/clawnav_openclaw_qwen_memory_guided_fast_{args.episodes}_{timestamp}_gpu{gpu_tag}"
+        f"results/clawnav_openclaw_qwen_memory_guided_fast_{args.episodes}_{timestamp}"
     )
     return LargeEvalConfig(
         gpu=args.gpu,
@@ -625,6 +647,7 @@ def config_from_args(args: argparse.Namespace) -> LargeEvalConfig:
         port=args.port,
         episodes=args.episodes,
         max_steps=args.max_steps,
+        data_path=args.data_path,
         model_path=args.model_path,
         model=args.model,
         image_interval_steps=args.image_interval_steps,
@@ -683,8 +706,16 @@ def _run_eval_phase(
         master_port=master_port,
         episode_keys=episode_keys,
     )
-    process = _launch_process(build_eval_command(), env, log_path=log_path, label=label)
+    process = _launch_process(
+        build_eval_command(),
+        env,
+        log_path=log_path,
+        label=label,
+        mirror_stdout=True,
+        mirror_line_substrings=("episode_progress",),
+    )
     aborted = False
+    abort_code = ""
     try:
         while process.poll() is None:
             time.sleep(config.poll_seconds)
@@ -695,8 +726,12 @@ def _run_eval_phase(
                 allow_partial_jsonl=True,
             )
             failures = validate_large_eval_gate(summary, require_complete=False)
-            if failures and config.abort_on_invalid:
+            has_runtime_error = any(
+                failure.get("code") == "openclaw_runtime_error" for failure in failures
+            )
+            if has_runtime_error or (failures and config.abort_on_invalid):
                 aborted = True
+                abort_code = "openclaw_runtime_error" if has_runtime_error else "invalid_trace"
                 _terminate_process(process)
                 break
         returncode = process.poll()
@@ -714,11 +749,18 @@ def _run_eval_phase(
     )
     failures = validate_large_eval_gate(summary)
     if aborted:
+        runtime_abort = abort_code == "openclaw_runtime_error"
         failures.insert(
             0,
             {
-                "code": "aborted_on_invalid_trace",
-                "message": "runner stopped the phase after live trace gate failure",
+                "code": "aborted_on_runtime_error"
+                if runtime_abort
+                else "aborted_on_invalid_trace",
+                "message": (
+                    "runner stopped the phase after openclaw_runtime_error appeared in the live trace"
+                    if runtime_abort
+                    else "runner stopped the phase after live trace gate failure"
+                ),
                 "count": 1,
             },
         )
@@ -740,7 +782,13 @@ def _run_eval_phase(
 
 
 def _launch_process(
-    command: List[str], env_updates: Dict[str, str], *, log_path: Path, label: str
+    command: List[str],
+    env_updates: Dict[str, str],
+    *,
+    log_path: Path,
+    label: str,
+    mirror_stdout: bool = False,
+    mirror_line_substrings: Optional[Tuple[str, ...]] = None,
 ) -> subprocess.Popen[Any]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -751,7 +799,7 @@ def _launch_process(
             command,
             cwd=Path(__file__).resolve().parents[1],
             env=env,
-            stdout=log_file,
+            stdout=subprocess.PIPE if mirror_stdout else log_file,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid if hasattr(os, "setsid") else None,
         )
@@ -759,8 +807,50 @@ def _launch_process(
         log_file.close()
         raise
     process._clawnav_log_file = log_file  # type: ignore[attr-defined]
+    if mirror_stdout:
+        if process.stdout is None:
+            log_file.close()
+            raise RuntimeError(f"failed to capture {label} stdout for mirroring")
+        thread = threading.Thread(
+            target=_mirror_process_output,
+            args=(process.stdout, log_file, mirror_line_substrings),
+            daemon=True,
+        )
+        thread.start()
+        process._clawnav_output_thread = thread  # type: ignore[attr-defined]
     print(f"Started {label}: pid={process.pid}, log={log_path}")
     return process
+
+
+def _mirror_process_output(
+    stream: Any,
+    log_file: Any,
+    mirror_line_substrings: Optional[Tuple[str, ...]],
+) -> None:
+    for line in iter(stream.readline, b""):
+        log_file.write(line)
+        log_file.flush()
+        if _should_mirror_line(line, mirror_line_substrings):
+            _write_stdout_bytes(line)
+
+
+def _should_mirror_line(
+    line: bytes,
+    mirror_line_substrings: Optional[Tuple[str, ...]],
+) -> bool:
+    if mirror_line_substrings is None:
+        return True
+    return any(token.encode("utf-8") in line for token in mirror_line_substrings)
+
+
+def _write_stdout_bytes(chunk: bytes) -> None:
+    stdout_buffer = getattr(sys.stdout, "buffer", None)
+    if stdout_buffer is not None:
+        stdout_buffer.write(chunk)
+        stdout_buffer.flush()
+        return
+    sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+    sys.stdout.flush()
 
 
 def _terminate_process(process: subprocess.Popen[Any], *, grace_s: float = 20.0) -> None:
@@ -784,6 +874,12 @@ def _terminate_process(process: subprocess.Popen[Any], *, grace_s: float = 20.0)
 
 
 def _close_process_log(process: subprocess.Popen[Any]) -> None:
+    output_thread = getattr(process, "_clawnav_output_thread", None)
+    if output_thread is not None:
+        output_thread.join(timeout=5)
+    stdout_pipe = getattr(process, "stdout", None)
+    if stdout_pipe is not None and not stdout_pipe.closed:
+        stdout_pipe.close()
     log_file = getattr(process, "_clawnav_log_file", None)
     if log_file is not None and not log_file.closed:
         log_file.close()
@@ -875,6 +971,17 @@ def _append_example_failure(
     )
 
 
+def _is_openclaw_runtime_error(row: Dict[str, Any], planner_reason: str) -> bool:
+    error_type = str(row.get("error_type") or "")
+    if error_type == "openclaw_runtime_error":
+        return True
+    runtime_status = str(row.get("runtime_status") or "")
+    return (
+        runtime_status == "failed"
+        and planner_reason.startswith("openclaw_cli_model_fallback:")
+    )
+
+
 def _append_example(examples: List[Dict[str, Any]], row: Dict[str, Any], *, limit: int = 5) -> None:
     if len(examples) >= limit:
         return
@@ -888,6 +995,8 @@ def _row_example(row: Dict[str, Any]) -> Dict[str, Any]:
         "episode_id": row.get("episode_id"),
         "step_id": row.get("step_id"),
         "planner_reason": row.get("planner_reason") or row.get("reason", ""),
+        "runtime_status": row.get("runtime_status"),
+        "error_type": row.get("error_type"),
         "planner_error": audit.get("planner_error")
         or audit.get("error")
         or audit.get("model_error")

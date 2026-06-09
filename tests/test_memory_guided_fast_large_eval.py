@@ -1,11 +1,16 @@
 import json
+import sys
 from pathlib import Path
 
 from scripts.run_memory_guided_fast_large_eval import (
     LargeEvalConfig,
+    _close_process_log,
+    _launch_process,
     build_adapter_env,
     build_eval_env,
     collect_run_summary,
+    config_from_args,
+    parse_args,
     render_markdown_report,
     validate_large_eval_gate,
 )
@@ -116,6 +121,45 @@ def test_gate_rejects_planner_fallback_and_keeps_context(tmp_path):
     assert "Qwen API read timeout" in planner_failure["examples"][0]["planner_error"]
 
 
+def test_gate_rejects_openclaw_runtime_error_as_stop_signal(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(
+        run_dir / "harness_traces" / "harness_trace_rank0.jsonl",
+        [
+            _trace_row("visual_update", step_id=0),
+            _trace_row(
+                "visual_update",
+                step_id=20,
+                episode_id="43",
+                planner_fallback=True,
+                planner_reason="openclaw_cli_model_fallback:openclaw_cli_interval_recall",
+                runtime_status="failed",
+                error_type="openclaw_runtime_error",
+                context_audit={
+                    "visual_memory_update_status": "error",
+                    "planner_error": "Qwen API read timeout",
+                },
+            ),
+        ],
+    )
+    _write_jsonl(
+        run_dir / "result.json",
+        [{"scene_id": "2azQ1b91cZZ", "episode_id": 11, "success": 1.0, "spl": 1.0}],
+    )
+
+    summary = collect_run_summary(run_dir, expected_episodes=2, model_max_images=2)
+    failures = validate_large_eval_gate(summary, require_complete=False)
+
+    assert summary["runtime_error_count"] == 1
+    runtime_failure = next(
+        failure for failure in failures if failure["code"] == "openclaw_runtime_error"
+    )
+    assert runtime_failure["count"] == 1
+    assert runtime_failure["examples"][0]["planner_reason"] == (
+        "openclaw_cli_model_fallback:openclaw_cli_interval_recall"
+    )
+
+
 def test_gate_rejects_fast_qwen_calls_and_visual_image_over_budget(tmp_path):
     run_dir = tmp_path / "run"
     _write_jsonl(
@@ -192,6 +236,95 @@ def test_command_env_defaults_lock_memory_guided_fast_contract(tmp_path):
     assert smoke_env["HARNESS_EPISODE_KEYS"] == "2azQ1b91cZZ:11"
     assert eval_env["HARNESS_DEBUG_MAX_EPISODES"] == "30"
     assert "HARNESS_EPISODE_KEYS" not in eval_env
+    assert "DATA_PATH" not in eval_env
+    assert "HARNESS_USE_DEFAULT_EPISODE_KEYS" not in eval_env
+
+
+def test_custom_data_path_runs_dataset_order_instead_of_fixed_episode_keys(tmp_path):
+    config = LargeEvalConfig(
+        gpu="4",
+        port=8011,
+        episodes=400,
+        data_path="/data/r2r/val_unseen/400_val_unseen.json.gz",
+        smoke_output=tmp_path / "smoke",
+        eval_output=tmp_path / "eval",
+    )
+
+    smoke_env = build_eval_env(
+        config,
+        output_path=config.smoke_output,
+        episodes=1,
+        master_port=20601,
+        episode_keys=config.smoke_episode_key,
+    )
+    eval_env = build_eval_env(
+        config,
+        output_path=config.eval_output,
+        episodes=config.episodes,
+        master_port=20602,
+    )
+
+    assert smoke_env["DATA_PATH"] == "/data/r2r/val_unseen/400_val_unseen.json.gz"
+    assert smoke_env["HARNESS_EPISODE_KEYS"] == "2azQ1b91cZZ:11"
+    assert "HARNESS_USE_DEFAULT_EPISODE_KEYS" not in smoke_env
+    assert eval_env["DATA_PATH"] == "/data/r2r/val_unseen/400_val_unseen.json.gz"
+    assert eval_env["HARNESS_DEBUG_MAX_EPISODES"] == "400"
+    assert eval_env["HARNESS_USE_DEFAULT_EPISODE_KEYS"] == "0"
+    assert "HARNESS_EPISODE_KEYS" not in eval_env
+
+
+def test_default_output_paths_do_not_include_gpu_tag():
+    args = parse_args(["--gpu", "3", "--episodes", "30"])
+
+    config = config_from_args(args)
+    eval_env = build_eval_env(
+        config,
+        output_path=config.eval_output,
+        episodes=config.episodes,
+        master_port=config.master_port_eval,
+    )
+
+    assert eval_env["CUDA_VISIBLE_DEVICES"] == "3"
+    assert "_gpu3" not in str(config.smoke_output)
+    assert "_gpu3" not in str(config.eval_output)
+    assert str(config.smoke_output).startswith(
+        "results/clawnav_openclaw_qwen_memory_guided_fast_smoke_"
+    )
+    assert str(config.eval_output).startswith(
+        "results/clawnav_openclaw_qwen_memory_guided_fast_30_"
+    )
+
+
+def test_eval_process_mirrors_episode_progress_to_cli_and_keeps_full_log(tmp_path, capfd):
+    log_path = tmp_path / "runner_logs" / "eval.log"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "print('habitat noisy line')\n"
+            "print('episode_progress status=finish rank=0 episode=15/100 "
+            "scene_id=s episode_id=e steps=3 success=1.0 spl=1.0 os=1.0 ne=0.5')\n"
+        ),
+    ]
+
+    process = _launch_process(
+        command,
+        {},
+        log_path=log_path,
+        label="eval",
+        mirror_stdout=True,
+        mirror_line_substrings=("episode_progress",),
+    )
+    assert process.wait(timeout=10) == 0
+    _close_process_log(process)
+
+    captured = capfd.readouterr()
+    log_text = log_path.read_text(encoding="utf-8")
+
+    assert "episode_progress status=finish" in captured.out
+    assert "habitat noisy line" not in captured.out
+    assert "episode_progress status=finish" in log_text
+    assert "habitat noisy line" in log_text
 
 
 def test_report_marks_invalid_runs_as_diagnostic_only(tmp_path):

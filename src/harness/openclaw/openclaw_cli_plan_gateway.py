@@ -365,7 +365,7 @@ class OpenClawCliPlanPlanner:
         openclaw_model: str = "",
         openclaw_model_provider: str = "qwen_api",
         openclaw_model_max_images: int = 3,
-        openclaw_model_image_interval_steps: int = 10,
+        openclaw_model_image_interval_steps: int = 20,
         openclaw_model_fast_mode: str = "qwen_text_only",
         openclaw_model_fast_use_memory_context: bool = True,
         model_client: Any = None,
@@ -1813,7 +1813,7 @@ def main() -> None:
         default="qwen_api",
     )
     parser.add_argument("--openclaw_model_max_images", type=int, default=3)
-    parser.add_argument("--openclaw_model_image_interval_steps", type=int, default=10)
+    parser.add_argument("--openclaw_model_image_interval_steps", type=int, default=20)
     parser.add_argument("--openclaw_model_fast_mode", default="qwen_text_only")
     parser.add_argument("--openclaw_model_fast_use_memory_context", type=int, default=1)
     parser.add_argument("--agent_session_id", default="")

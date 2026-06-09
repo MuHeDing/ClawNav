@@ -114,6 +114,40 @@ def format_ratio(value: Optional[float]) -> str:
     return f"{float(value):.2f}"
 
 
+def format_episode_progress_line(
+    *,
+    status: str,
+    rank: int,
+    current: int,
+    total: int,
+    scene_id: Any,
+    episode_id: Any,
+    steps: Optional[int] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> str:
+    parts = [
+        "episode_progress",
+        f"status={status}",
+        f"rank={int(rank)}",
+        f"episode={int(current)}/{int(total)}",
+        f"scene_id={scene_id}",
+        f"episode_id={episode_id}",
+    ]
+    if steps is not None:
+        parts.append(f"steps={int(steps)}")
+    if metrics:
+        metric_fields = [
+            ("success", "success"),
+            ("spl", "spl"),
+            ("oracle_success", "os"),
+            ("distance_to_goal", "ne"),
+        ]
+        for source_key, output_key in metric_fields:
+            if source_key in metrics:
+                parts.append(f"{output_key}={metrics[source_key]}")
+    return " ".join(parts)
+
+
 def extract_multi_goal_positions(episode: Dict[str, Any]) -> List[List[float]]:
     positions: List[List[float]] = []
     for goal_item in episode.get("multi_goals", []):
