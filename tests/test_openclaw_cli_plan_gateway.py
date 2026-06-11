@@ -733,6 +733,232 @@ def test_cli_plan_gateway_model_mode_memory_guided_policy_fast_skips_qwen_on_fas
     assert audit["fast_policy_mode"] == "memory_guided_policy_fast"
 
 
+def test_memory_guided_fast_respects_fast_use_memory_context_off(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_image_interval_steps=10,
+        openclaw_model_fast_mode="memory_guided_policy_fast",
+        openclaw_model_fast_use_memory_context=False,
+        model_client=FakeModelClient(
+            response=[
+                model_response(
+                    {
+                        "action_text": "TURN_RIGHT",
+                        "visual_summary": "red hallway with doorway ahead",
+                        "suggested_subgoal": "continue toward the doorway",
+                    },
+                    reason="visual update",
+                ),
+            ]
+        ),
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 1},
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    assert decision["arguments"] == {}
+    assert decision["runtime_metadata"]["memory_gate"]["mode"] == "off"
+    assert decision["runtime_metadata"]["memory_gate"]["policy_context_used"] is False
+
+
+def test_safe_cue_mode_does_not_include_last_qwen_reason(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_image_interval_steps=10,
+        openclaw_model_fast_mode="memory_guided_policy_fast",
+        openclaw_model_memory_policy_mode="safe_cue",
+        openclaw_model_filter_stop_semantics=True,
+        model_client=FakeModelClient(
+            response=[
+                model_response(
+                    {
+                        "action_text": "TURN_RIGHT",
+                        "visual_summary": "A hallway continues forward toward the arched doorway.",
+                        "suggested_subgoal": "continue toward the arched doorway",
+                    },
+                    reason="Last Qwen reason should stay out",
+                ),
+            ]
+        ),
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 1},
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    text = decision["arguments"]["memory_context_text"]
+    assert "arched doorway" in text
+    assert "Last Qwen reason" not in text
+    assert "reason should stay out" not in text
+    assert decision["runtime_metadata"]["memory_gate"]["raw_reason_included"] is False
+
+
+def test_safe_cue_mode_filters_stop_semantics(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_image_interval_steps=10,
+        openclaw_model_fast_mode="memory_guided_policy_fast",
+        openclaw_model_memory_policy_mode="safe_cue",
+        openclaw_model_filter_stop_semantics=True,
+        model_client=FakeModelClient(
+            response=[
+                model_response(
+                    {
+                        "action_text": "STOP",
+                        "visual_summary": "Reached destination. Hallway forward toward the doorway.",
+                        "suggested_subgoal": "stop at the final location",
+                    },
+                    reason="visual update",
+                ),
+            ]
+        ),
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 1},
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    text = decision["arguments"].get("memory_context_text", "")
+    assert "destination" not in text.lower()
+    assert "stop" not in text.lower()
+    gate = decision["runtime_metadata"]["memory_gate"]
+    assert gate["stop_semantics_filtered"] is True
+    assert set(gate["filtered_terms"]) >= {"destination", "stop"}
+
+
+def test_no_reason_mode_keeps_summary_but_removes_reason(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_image_interval_steps=10,
+        openclaw_model_fast_mode="memory_guided_policy_fast",
+        openclaw_model_memory_policy_mode="no_reason",
+        model_client=FakeModelClient(
+            response=[
+                model_response(
+                    {
+                        "action_text": "TURN_RIGHT",
+                        "visual_summary": "red hallway with doorway ahead",
+                        "suggested_subgoal": "continue toward the doorway",
+                    },
+                    reason="therefore raw reason",
+                ),
+            ]
+        ),
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 1},
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    text = decision["arguments"]["memory_context_text"]
+    assert "Cached visual memory: red hallway" in text
+    assert "Suggested subgoal: continue toward the doorway" in text
+    assert "Last Qwen reason" not in text
+
+
+def test_raw_mode_ignores_stop_semantic_filter_flag(tmp_path):
+    current0 = tmp_path / "current0.png"
+    current1 = tmp_path / "current1.png"
+    current0.write_bytes(b"not-a-real-png-for-command-shape-test")
+    current1.write_bytes(b"not-a-real-png-for-command-shape-test")
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model_image_interval_steps=10,
+        openclaw_model_fast_mode="memory_guided_policy_fast",
+        openclaw_model_memory_policy_mode="raw",
+        openclaw_model_filter_stop_semantics=True,
+        model_client=FakeModelClient(
+            response=[
+                model_response(
+                    {
+                        "action_text": "STOP",
+                        "visual_summary": "reached the destination",
+                        "suggested_subgoal": "stop here",
+                    },
+                    reason="I think stop is correct",
+                ),
+            ]
+        ),
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 0},
+            "runtime_context": {"current_image_path": str(current0), "run_id": "run-a"},
+        }
+    )
+    decision = planner.plan_payload(
+        {
+            "state": {"scene_id": "scene/A", "episode_id": "ep:1", "step_id": 1},
+            "runtime_context": {"current_image_path": str(current1), "run_id": "run-a"},
+        }
+    )
+
+    text = decision["arguments"]["memory_context_text"]
+    assert "Cached visual memory: reached the destination" in text
+    assert "Suggested subgoal: stop here" in text
+    assert "Last Qwen reason: I think stop is correct" in text
+    assert decision["runtime_metadata"]["memory_gate"]["stop_semantics_filtered"] is False
+
+
 def test_cli_plan_gateway_model_mode_preserves_context_audit_on_model_error(tmp_path):
     current = tmp_path / "current.png"
     current.write_bytes(b"not-a-real-png-for-command-shape-test")

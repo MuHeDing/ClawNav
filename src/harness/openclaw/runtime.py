@@ -66,12 +66,18 @@ class OpenClawVLNRuntime:
         executor: HabitatOpenClawExecutor,
         fallback_planner: OpenClawPlannerProtocol = None,
         allow_planner_action_override: bool = True,
+        policy_memory_context_enabled: bool = True,
+        stop_verification_mode: str = "off",
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
         self.executor = executor
         self.fallback_planner = fallback_planner
         self.allow_planner_action_override = allow_planner_action_override
+        self.policy_memory_context_enabled = bool(policy_memory_context_enabled)
+        self.stop_verification_mode = self._normalize_stop_verification_mode(
+            stop_verification_mode
+        )
         self.recent_visual_memories: List[Dict[str, Any]] = []
         self.max_recent_visual_memories = 10
         self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
@@ -249,6 +255,8 @@ class OpenClawVLNRuntime:
         )
         if decision.intent == "replan" and not nav_payload.get("active_subgoal") and decision.reason:
             nav_payload["active_subgoal"] = decision.reason
+        if not self.policy_memory_context_enabled:
+            self._suppress_policy_memory_context(nav_payload)
 
         planned_action_text = self._planned_action_text(decision.arguments)
         if planned_action_text and self.allow_planner_action_override:
@@ -290,6 +298,16 @@ class OpenClawVLNRuntime:
         tool_calls.append(nav_result)
 
         action_text = str(nav_result.get("payload", {}).get("action_text") or "STOP")
+        stop_verifier: Dict[str, Any] = {}
+        if nav_result.get("ok"):
+            action_text, stop_verifier = self._verify_stop_if_needed(
+                state,
+                runtime_payload,
+                nav_payload,
+                decision,
+                action_text,
+                tool_calls,
+            )
         metadata = self._metadata(
             decision,
             tool_calls,
@@ -299,6 +317,8 @@ class OpenClawVLNRuntime:
             action_text=action_text,
             causal_recall=causal_recall,
         )
+        if stop_verifier:
+            metadata["stop_verifier"] = stop_verifier
         if planner_error:
             metadata["planner_error"] = planner_error
         metadata["planner_fallback"] = planner_fallback
@@ -481,10 +501,12 @@ class OpenClawVLNRuntime:
             metadata["image_paths_used"] = image_paths_used
         planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
         if isinstance(planner_runtime_metadata, dict):
-            for key in ("context_audit", "agent_token_guard"):
+            for key in ("context_audit", "agent_token_guard", "memory_gate"):
                 value = planner_runtime_metadata.get(key)
                 if isinstance(value, dict):
                     metadata[key] = value
+        metadata["policy_memory_context_enabled"] = self.policy_memory_context_enabled
+        metadata["stop_verification_mode"] = self.stop_verification_mode
         planner_visual_analysis = {}
         if isinstance(planner_runtime_metadata, dict):
             candidate = planner_runtime_metadata.get("visual_analysis")
@@ -803,6 +825,83 @@ class OpenClawVLNRuntime:
         memory_images = context.get("memory_images")
         if include_memory_images and memory_images:
             nav_payload["memory_images"] = memory_images
+
+    def _suppress_policy_memory_context(self, nav_payload: Dict[str, Any]) -> None:
+        for key in ("active_subgoal", "memory_context_text", "memory_images"):
+            nav_payload.pop(key, None)
+
+    def _verify_stop_if_needed(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        nav_payload: Dict[str, Any],
+        decision,
+        action_text: str,
+        tool_calls: List[Dict[str, Any]],
+    ) -> tuple[str, Dict[str, Any]]:
+        memory_action = self._normalize_action_text(action_text) or "STOP"
+        if memory_action != "STOP" or self.stop_verification_mode == "off":
+            return action_text, {}
+        if not self._stop_verification_required(decision, nav_payload):
+            return action_text, {}
+        clean_payload = self._clean_navigation_payload(runtime_payload, nav_payload)
+        clean_result = self.tool_adapter.call_tool(
+            "NavigationPolicySkill",
+            clean_payload,
+            state=state,
+        )
+        tool_calls.append(clean_result)
+        clean_action = self._normalize_action_text(
+            (clean_result.get("payload") or {}).get("action_text")
+        ) or "STOP"
+        disagreement = clean_action != memory_action
+        blocked = bool(
+            self.stop_verification_mode == "clean_prompt_block"
+            and disagreement
+            and clean_action != "STOP"
+        )
+        executed_action = clean_action if blocked else memory_action
+        verifier = {
+            "mode": self.stop_verification_mode,
+            "triggered": True,
+            "trigger_reason": "memory_influenced_stop",
+            "memory_action": memory_action,
+            "clean_action": clean_action,
+            "disagreement": disagreement,
+            "blocked": blocked,
+            "executed_action": executed_action,
+            "clean_ok": bool(clean_result.get("ok")),
+        }
+        return executed_action, verifier
+
+    def _stop_verification_required(self, decision, nav_payload: Dict[str, Any]) -> bool:
+        runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        memory_gate = runtime_metadata.get("memory_gate") if isinstance(runtime_metadata, dict) else {}
+        if isinstance(memory_gate, dict):
+            control_context = memory_gate.get("control_context") or {}
+            if isinstance(control_context, dict) and control_context.get("requires_stop_verification"):
+                return True
+            if memory_gate.get("policy_context_used"):
+                return True
+        return bool(nav_payload.get("active_subgoal") or nav_payload.get("memory_context_text"))
+
+    def _clean_navigation_payload(
+        self,
+        runtime_payload: Dict[str, Any],
+        nav_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        clean_payload = {}
+        recent_frames = nav_payload.get("recent_frames", runtime_payload.get("recent_frames"))
+        if recent_frames:
+            clean_payload["recent_frames"] = recent_frames
+        return clean_payload
+
+    @staticmethod
+    def _normalize_stop_verification_mode(value: str) -> str:
+        mode = str(value or "off").strip().lower()
+        if mode in {"off", "audit_clean_prompt", "clean_prompt_block"}:
+            return mode
+        return "off"
 
     def _merge_tool_navigation_context(
         self,

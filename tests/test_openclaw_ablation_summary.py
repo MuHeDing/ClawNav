@@ -163,6 +163,63 @@ def test_summarize_run_flags_all_one_step_results_as_invalid(tmp_path):
     assert summary["invalid_run_reason"] == "all_episodes_ended_after_one_step"
 
 
+def test_ablation_summary_tolerates_missing_memory_gate_fields(tmp_path):
+    run = tmp_path / "run"
+    traces = run / "harness_traces"
+    traces.mkdir(parents=True)
+    (run / "summary.json").write_text(
+        json.dumps({"sucs_all": 0.5, "spls_all": 0.2, "length": 1}),
+        encoding="utf-8",
+    )
+    (traces / "harness_trace_rank0.jsonl").write_text(
+        json.dumps({"planned_intent": "act"}) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_run(run)
+
+    assert summary["memory_gate_policy_context_used_count"] == 0
+    assert summary["memory_gate_stop_semantics_filtered_count"] == 0
+    assert summary["stop_verifier_trigger_count"] == 0
+
+
+def test_ablation_summary_surfaces_memory_gate_and_stop_metrics(tmp_path):
+    run = tmp_path / "run"
+    traces = run / "harness_traces"
+    traces.mkdir(parents=True)
+    (run / "summary.json").write_text(
+        json.dumps({"sucs_all": 0.5, "spls_all": 0.2, "length": 1}),
+        encoding="utf-8",
+    )
+    (traces / "harness_trace_rank0.jsonl").write_text(
+        json.dumps(
+            {
+                "memory_gate": {
+                    "policy_context_used": True,
+                    "stop_semantics_filtered": True,
+                    "raw_reason_included": False,
+                },
+                "stop_verifier": {
+                    "triggered": True,
+                    "blocked": True,
+                    "disagreement": True,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = summarize_run(run)
+
+    assert summary["memory_gate_policy_context_used_count"] == 1
+    assert summary["memory_gate_stop_semantics_filtered_count"] == 1
+    assert summary["memory_gate_raw_reason_included_count"] == 0
+    assert summary["stop_verifier_trigger_count"] == 1
+    assert summary["stop_verifier_block_count"] == 1
+    assert summary["stop_verifier_disagreement_count"] == 1
+
+
 def test_format_markdown_reports_core_ablation_metrics():
     markdown = format_markdown(
         [
@@ -177,6 +234,8 @@ def test_format_markdown_reports_core_ablation_metrics():
                 "useful_recall_rate": 0.666666,
                 "action_changed_after_recall_events": 1,
                 "oracle_leakage_steps": 0,
+                "memory_gate_policy_context_used_count": 2,
+                "stop_verifier_trigger_count": 1,
             }
         ]
     )
@@ -185,3 +244,5 @@ def test_format_markdown_reports_core_ablation_metrics():
     assert "openclaw_full_visual_memory_system" in markdown
     assert "0.7500" in markdown
     assert "0.6667" in markdown
+    assert "memory_gate_policy_context_used_count" in markdown
+    assert "stop_verifier_trigger_count" in markdown

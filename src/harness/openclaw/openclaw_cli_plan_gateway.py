@@ -12,6 +12,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
+from harness.memory.policy_memory_adapter import (
+    MemoryGateResult,
+    distill_memory,
+    to_navigation_arguments,
+)
 from harness.openclaw.gateway_server import make_gateway_server
 from harness.openclaw.visual_analyzer import OpenClawVisualAnalyzer
 
@@ -368,6 +373,8 @@ class OpenClawCliPlanPlanner:
         openclaw_model_image_interval_steps: int = 20,
         openclaw_model_fast_mode: str = "qwen_text_only",
         openclaw_model_fast_use_memory_context: bool = True,
+        openclaw_model_memory_policy_mode: str = "raw",
+        openclaw_model_filter_stop_semantics: bool = False,
         model_client: Any = None,
         agent_session_id: str = "",
         openclaw_visual_mode: str = "path",
@@ -397,6 +404,10 @@ class OpenClawCliPlanPlanner:
         )
         self.openclaw_model_fast_mode = openclaw_model_fast_mode or "qwen_text_only"
         self.openclaw_model_fast_use_memory_context = bool(openclaw_model_fast_use_memory_context)
+        self.openclaw_model_memory_policy_mode = self._memory_policy_mode(
+            openclaw_model_memory_policy_mode
+        )
+        self.openclaw_model_filter_stop_semantics = bool(openclaw_model_filter_stop_semantics)
         self.model_client = model_client
         self._visual_memory_cache: Dict[str, Dict[str, Any]] = {}
         self.agent_session_id = agent_session_id or "clawnav"
@@ -654,43 +665,56 @@ class OpenClawCliPlanPlanner:
         context_audit["model_skip_reason"] = "memory_guided_policy_fast"
         context_audit["fast_policy_mode"] = self.openclaw_model_fast_mode
         context_audit["provider_usage_source"] = "not_called"
+        memory_result = self._memory_gate_result(prompt_payload, step_mode)
+        arguments = self._memory_guided_policy_arguments(memory_result)
+        memory_gate = memory_result.to_audit()
+        context_audit["memory_context_used"] = memory_gate["policy_context_used"]
+        context_audit["memory_policy_mode"] = memory_gate["mode"]
+        context_audit["memory_gate_policy_context_used"] = memory_gate["policy_context_used"]
         return {
             "intent": "act",
             "tool_name": "NavigationPolicySkill",
-            "arguments": self._memory_guided_policy_arguments(prompt_payload, step_mode),
+            "arguments": arguments,
             "reason": "openclaw_memory_guided_policy_fast",
-            "runtime_metadata": {"context_audit": context_audit},
+            "runtime_metadata": {
+                "context_audit": context_audit,
+                "memory_gate": memory_gate,
+            },
         }
 
-    def _memory_guided_policy_arguments(
+    def _memory_gate_result(
         self,
         prompt_payload: Dict[str, Any],
         step_mode: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    ) -> MemoryGateResult:
+        runtime_context = prompt_payload.get("runtime_context") or {}
+        if not isinstance(runtime_context, dict):
+            runtime_context = {}
         memory = step_mode.get("visual_memory")
         if not isinstance(memory, dict):
             memory = {}
-        arguments: Dict[str, Any] = {}
-        subgoal = str(memory.get("last_suggested_subgoal") or "").strip()
-        if subgoal:
-            arguments["active_subgoal"] = subgoal
-        lines: List[str] = []
-        summary = str(memory.get("last_visual_summary") or "").strip()
-        if summary:
-            lines.append(f"Cached visual memory: {summary}")
-        if subgoal:
-            lines.append(f"Suggested subgoal: {subgoal}")
-        reason = str(memory.get("last_qwen_reason") or "").strip()
-        if reason:
-            lines.append(f"Last Qwen reason: {reason}")
-        runtime_context = prompt_payload.get("runtime_context") or {}
-        if isinstance(runtime_context, dict):
-            context_note = str(runtime_context.get("memory_context_text") or "").strip()
-            if context_note:
-                lines.append(f"Retrieved memory: {context_note}")
-        if lines:
-            arguments["memory_context_text"] = "\n".join(lines)[:MAX_PROMPT_MEMORY_CONTEXT_CHARS]
-        return arguments
+        mode = self.openclaw_model_memory_policy_mode
+        if not self.openclaw_model_fast_use_memory_context:
+            mode = "off"
+        return distill_memory(
+            memory,
+            runtime_context,
+            mode=mode,
+            should_filter_stop_semantics=self.openclaw_model_filter_stop_semantics,
+        )
+
+    def _memory_guided_policy_arguments(
+        self,
+        result: MemoryGateResult,
+    ) -> Dict[str, Any]:
+        return to_navigation_arguments(result)
+
+    @staticmethod
+    def _memory_policy_mode(value: str) -> str:
+        mode = str(value or "raw").strip().lower()
+        if mode in {"raw", "no_reason", "safe_cue", "off"}:
+            return mode
+        return "raw"
 
     def _model_run_stdout(self, prompt: str, model_images: Dict[str, Any]) -> str:
         image_paths = list(model_images.get("paths") or [])
@@ -1816,6 +1840,12 @@ def main() -> None:
     parser.add_argument("--openclaw_model_image_interval_steps", type=int, default=20)
     parser.add_argument("--openclaw_model_fast_mode", default="qwen_text_only")
     parser.add_argument("--openclaw_model_fast_use_memory_context", type=int, default=1)
+    parser.add_argument(
+        "--openclaw_model_memory_policy_mode",
+        choices=("raw", "no_reason", "safe_cue", "off"),
+        default="raw",
+    )
+    parser.add_argument("--openclaw_model_filter_stop_semantics", type=int, default=0)
     parser.add_argument("--agent_session_id", default="")
     parser.add_argument("--openclaw_visual_mode", choices=("path", "describe"), default="path")
     parser.add_argument("--openclaw_visual_max_images", type=int, default=2)
@@ -1839,6 +1869,8 @@ def main() -> None:
         openclaw_model_image_interval_steps=args.openclaw_model_image_interval_steps,
         openclaw_model_fast_mode=args.openclaw_model_fast_mode,
         openclaw_model_fast_use_memory_context=bool(args.openclaw_model_fast_use_memory_context),
+        openclaw_model_memory_policy_mode=args.openclaw_model_memory_policy_mode,
+        openclaw_model_filter_stop_semantics=bool(args.openclaw_model_filter_stop_semantics),
         agent_session_id=args.agent_session_id,
         openclaw_visual_mode=args.openclaw_visual_mode,
         openclaw_visual_max_images=args.openclaw_visual_max_images,

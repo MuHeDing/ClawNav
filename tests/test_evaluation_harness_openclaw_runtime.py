@@ -53,6 +53,8 @@ def make_args(tmp_path, **overrides):
         "openclaw_enable_subagent_critic": False,
         "openclaw_enable_subagent_memory_curator": False,
         "openclaw_allow_planner_action_override": False,
+        "openclaw_policy_memory_context_enabled": 1,
+        "openclaw_stop_verification_mode": "off",
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -63,6 +65,22 @@ def test_build_components_creates_openclaw_runtime_when_requested(tmp_path):
 
     assert components["openclaw_runtime"] is not None
     assert components["config"].harness_runtime == "openclaw_bridge"
+
+
+def test_build_harness_components_passes_policy_memory_and_stop_verifier_config(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            openclaw_policy_memory_context_enabled=0,
+            openclaw_stop_verification_mode="audit_clean_prompt",
+        ),
+        model=FakeBaseModel(),
+    )
+
+    runtime = components["openclaw_runtime"]
+
+    assert runtime.policy_memory_context_enabled is False
+    assert runtime.stop_verification_mode == "audit_clean_prompt"
 
 
 def test_build_components_registers_visual_memory_curator_when_enabled(tmp_path):

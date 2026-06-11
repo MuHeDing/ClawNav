@@ -10,6 +10,7 @@ from scripts.run_memory_guided_fast_large_eval import (
     build_eval_env,
     collect_run_summary,
     config_from_args,
+    load_episode_keys_from_path,
     parse_args,
     render_markdown_report,
     validate_large_eval_gate,
@@ -230,6 +231,11 @@ def test_command_env_defaults_lock_memory_guided_fast_contract(tmp_path):
     assert adapter_env["OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS"] == "10"
     assert adapter_env["OPENCLAW_MODEL_MAX_IMAGES"] == "1"
     assert adapter_env["OPENCLAW_QWEN_API_RETRIES"] == "1"
+    assert adapter_env["OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT"] == "1"
+    assert adapter_env["OPENCLAW_MODEL_MEMORY_POLICY_MODE"] == "raw"
+    assert adapter_env["OPENCLAW_MODEL_FILTER_STOP_SEMANTICS"] == "0"
+    assert smoke_env["OPENCLAW_STOP_VERIFICATION_MODE"] == "off"
+    assert smoke_env["OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED"] == "1"
     assert smoke_env["OPENCLAW_GATEWAY_TIMEOUT"] == "300"
     assert smoke_env["OPENCLAW_ENFORCE_TIMEOUT_BUDGET"] == "1"
     assert smoke_env["HARNESS_DEBUG_MAX_EPISODES"] == "1"
@@ -238,6 +244,65 @@ def test_command_env_defaults_lock_memory_guided_fast_contract(tmp_path):
     assert "HARNESS_EPISODE_KEYS" not in eval_env
     assert "DATA_PATH" not in eval_env
     assert "HARNESS_USE_DEFAULT_EPISODE_KEYS" not in eval_env
+
+
+def test_runner_can_disable_fast_memory_context(tmp_path):
+    config = LargeEvalConfig(
+        fast_use_memory_context=0,
+        smoke_output=tmp_path / "smoke",
+        eval_output=tmp_path / "eval",
+    )
+
+    adapter_env = build_adapter_env(config)
+    eval_env = build_eval_env(
+        config,
+        output_path=config.eval_output,
+        episodes=config.episodes,
+        master_port=20502,
+    )
+
+    assert adapter_env["OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT"] == "0"
+    assert eval_env["OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED"] == "0"
+
+
+def test_runner_passes_memory_policy_mode_to_adapter(tmp_path):
+    config = LargeEvalConfig(
+        memory_policy_mode="safe_cue",
+        filter_stop_semantics=1,
+        stop_verification_mode="audit_clean_prompt",
+        smoke_output=tmp_path / "smoke",
+        eval_output=tmp_path / "eval",
+    )
+
+    adapter_env = build_adapter_env(config)
+    eval_env = build_eval_env(
+        config,
+        output_path=config.eval_output,
+        episodes=config.episodes,
+        master_port=20502,
+    )
+
+    assert adapter_env["OPENCLAW_MODEL_MEMORY_POLICY_MODE"] == "safe_cue"
+    assert adapter_env["OPENCLAW_MODEL_FILTER_STOP_SEMANTICS"] == "1"
+    assert eval_env["OPENCLAW_STOP_VERIFICATION_MODE"] == "audit_clean_prompt"
+
+
+def test_runner_preserves_explicit_policy_memory_context_enabled_override(tmp_path):
+    config = LargeEvalConfig(
+        fast_use_memory_context=0,
+        policy_memory_context_enabled=1,
+        smoke_output=tmp_path / "smoke",
+        eval_output=tmp_path / "eval",
+    )
+
+    eval_env = build_eval_env(
+        config,
+        output_path=config.eval_output,
+        episodes=config.episodes,
+        master_port=20502,
+    )
+
+    assert eval_env["OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED"] == "1"
 
 
 def test_custom_data_path_runs_dataset_order_instead_of_fixed_episode_keys(tmp_path):
@@ -271,6 +336,202 @@ def test_custom_data_path_runs_dataset_order_instead_of_fixed_episode_keys(tmp_p
     assert eval_env["HARNESS_DEBUG_MAX_EPISODES"] == "400"
     assert eval_env["HARNESS_USE_DEFAULT_EPISODE_KEYS"] == "0"
     assert "HARNESS_EPISODE_KEYS" not in eval_env
+
+
+def test_load_episode_keys_from_path_validates_exact_keys(tmp_path):
+    keys_path = tmp_path / "keys.txt"
+    keys_path.write_text(
+        "\n".join(
+            [
+                "# comment",
+                "sceneA:1",
+                "",
+                "sceneB:2",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_episode_keys_from_path(keys_path) == ["sceneA:1", "sceneB:2"]
+
+    keys_path.write_text("sceneA:1\nsceneA:1\n", encoding="utf-8")
+    try:
+        load_episode_keys_from_path(keys_path)
+    except ValueError as exc:
+        assert "duplicate episode key" in str(exc)
+    else:
+        raise AssertionError("expected duplicate episode key error")
+
+
+def test_runner_episode_keys_path_sets_effective_eval_keys(tmp_path):
+    keys_path = tmp_path / "keys.txt"
+    keys_path.write_text("sceneA:1\nsceneB:2\n", encoding="utf-8")
+    config = LargeEvalConfig(
+        episode_keys_path=str(keys_path),
+        episodes=100,
+        smoke_output=tmp_path / "smoke",
+        eval_output=tmp_path / "eval",
+    )
+
+    eval_env = build_eval_env(
+        config,
+        output_path=config.eval_output,
+        episodes=config.episodes,
+        master_port=20502,
+    )
+
+    assert eval_env["HARNESS_EPISODE_KEYS"] == "sceneA:1,sceneB:2"
+    assert eval_env["HARNESS_DEBUG_MAX_EPISODES"] == "2"
+    assert eval_env["EPISODE_KEYS_PATH"] == str(keys_path)
+
+
+def test_discriminative_keys_file_contains_exact_27_keys():
+    repo_root = Path(__file__).resolve().parents[1]
+    keys_path = repo_root / "docs/plans/2026-06-09-memory-gated-openclaw-discriminative-keys.txt"
+
+    keys = load_episode_keys_from_path(keys_path)
+
+    assert len(keys) == 27
+    assert keys[:2] == ["2azQ1b91cZZ:10", "8194nk5LbLH:220"]
+    assert keys[-2:] == ["zsNo4HB9uLZ:41", "zsNo4HB9uLZ:87"]
+
+
+def test_collect_run_summary_counts_memory_gate_metrics(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(
+        run_dir / "harness_traces" / "harness_trace_rank0.jsonl",
+        [
+            _trace_row(
+                "fast_text",
+                episode_id="10",
+                step_id=1,
+                action_text="MOVE_FORWARD",
+                memory_gate={
+                    "mode": "safe_cue",
+                    "policy_context_used": True,
+                    "raw_reason_included": False,
+                    "stop_semantics_filtered": True,
+                },
+                tool_calls=[
+                    {
+                        "tool_name": "NavigationPolicySkill",
+                        "payload_summary": {
+                            "active_subgoal": "continue toward doorway",
+                            "memory_context_text": "Navigation cue: doorway",
+                        },
+                    }
+                ],
+            ),
+            _trace_row("fast_text", episode_id="10", step_id=2, action_text="STOP"),
+        ],
+    )
+    _write_jsonl(
+        run_dir / "result.json",
+        [
+            {
+                "scene_id": "2azQ1b91cZZ",
+                "episode_id": 10,
+                "success": 0.0,
+                "spl": 0.0,
+                "os": 1.0,
+                "steps": 400,
+            }
+        ],
+    )
+
+    summary = collect_run_summary(run_dir, expected_episodes=1, model_max_images=2, max_steps=400)
+
+    assert summary["os_rate"] == 1.0
+    assert summary["average_steps"] == 400.0
+    assert summary["final_stop_count"] == 1
+    assert summary["near_miss_fail_count"] == 1
+    assert summary["wrong_stop_count"] == 1
+    assert summary["timeout_or_loop_count"] == 1
+    assert summary["memory_gate_policy_context_used_count"] == 1
+    assert summary["memory_gate_stop_semantics_filtered_count"] == 1
+    assert summary["policy_context_injection_rate"] == 0.5
+    assert summary["active_subgoal_injection_rate"] == 0.5
+    assert summary["memory_changed_action_method"] == "not_available"
+    assert summary["memory_changed_action_rate"] is None
+
+
+def test_collect_run_summary_counts_stop_verifier_metrics(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(
+        run_dir / "harness_traces" / "harness_trace_rank0.jsonl",
+        [
+            _trace_row(
+                "fast_text",
+                scene_id="2azQ1b91cZZ",
+                episode_id="10",
+                action_text="STOP",
+                stop_verifier={
+                    "mode": "audit_clean_prompt",
+                    "triggered": True,
+                    "memory_action": "STOP",
+                    "clean_action": "MOVE_FORWARD",
+                    "disagreement": True,
+                    "blocked": False,
+                },
+            ),
+            _trace_row(
+                "fast_text",
+                scene_id="8194nk5LbLH",
+                episode_id="220",
+                action_text="MOVE_FORWARD",
+                stop_verifier={
+                    "mode": "clean_prompt_block",
+                    "triggered": True,
+                    "memory_action": "STOP",
+                    "clean_action": "MOVE_FORWARD",
+                    "disagreement": True,
+                    "blocked": True,
+                },
+            ),
+        ],
+    )
+    _write_jsonl(
+        run_dir / "result.json",
+        [
+            {"scene_id": "2azQ1b91cZZ", "episode_id": 10, "success": 0.0, "spl": 0.0, "os": 0.0},
+            {"scene_id": "8194nk5LbLH", "episode_id": 220, "success": 1.0, "spl": 1.0, "os": 1.0},
+        ],
+    )
+
+    summary = collect_run_summary(run_dir, expected_episodes=2, model_max_images=2)
+
+    assert summary["stop_verifier_trigger_count"] == 2
+    assert summary["stop_verifier_block_count"] == 1
+    assert summary["stop_verifier_disagreement_count"] == 2
+    assert summary["stop_verifier_clean_nonstop_count"] == 2
+    assert summary["clean_nonstop_disagreement_wrong_stop_count"] == 1
+    assert summary["clean_nonstop_disagreement_executed_stop_success_count"] == 0
+    assert summary["hypothetical_true_positive_block_count"] == 1
+    assert summary["hypothetical_false_positive_block_count"] == 0
+    assert summary["hypothetical_true_positive_block_rate"] == 1.0
+    assert summary["hypothetical_false_positive_block_rate"] == 0.0
+    assert summary["blocked_stop_later_success"] == 1
+    assert summary["blocked_stop_later_failure"] == 0
+
+
+def test_collect_run_summary_counts_discriminative_subgroups(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(run_dir / "harness_traces" / "harness_trace_rank0.jsonl", [_trace_row("fast_text")])
+    _write_jsonl(
+        run_dir / "result.json",
+        [
+            {"scene_id": "2azQ1b91cZZ", "episode_id": 10, "success": 1.0, "spl": 1.0},
+            {"scene_id": "zsNo4HB9uLZ", "episode_id": 87, "success": 1.0, "spl": 1.0},
+        ],
+    )
+
+    summary = collect_run_summary(run_dir, expected_episodes=2, model_max_images=2)
+
+    assert summary["janus_only_total_count"] == 17
+    assert summary["janus_only_recovered_count"] == 1
+    assert summary["claw_only_total_count"] == 10
+    assert summary["claw_only_preserved_count"] == 1
 
 
 def test_default_output_paths_do_not_include_gpu_tag():

@@ -107,6 +107,12 @@ def summarize_run(path: Path) -> Dict[str, Any]:
     episode_namespace_hits = 0
     scene_namespace_hits = 0
     task_namespace_hits = 0
+    memory_gate_policy_context_used_count = 0
+    memory_gate_stop_semantics_filtered_count = 0
+    memory_gate_raw_reason_included_count = 0
+    stop_verifier_trigger_count = 0
+    stop_verifier_block_count = 0
+    stop_verifier_disagreement_count = 0
 
     if trace_path.exists():
         for line in trace_path.read_text(encoding="utf-8").splitlines():
@@ -114,6 +120,22 @@ def summarize_run(path: Path) -> Dict[str, Any]:
                 continue
             trace_steps += 1
             record = json.loads(line)
+            memory_gate = record.get("memory_gate") or {}
+            if isinstance(memory_gate, dict):
+                if memory_gate.get("policy_context_used"):
+                    memory_gate_policy_context_used_count += 1
+                if memory_gate.get("stop_semantics_filtered"):
+                    memory_gate_stop_semantics_filtered_count += 1
+                if memory_gate.get("raw_reason_included"):
+                    memory_gate_raw_reason_included_count += 1
+            stop_verifier = record.get("stop_verifier") or {}
+            if isinstance(stop_verifier, dict):
+                if stop_verifier.get("triggered"):
+                    stop_verifier_trigger_count += 1
+                if stop_verifier.get("blocked"):
+                    stop_verifier_block_count += 1
+                if stop_verifier.get("disagreement"):
+                    stop_verifier_disagreement_count += 1
             if record.get("planned_intent") == "recall_memory" or record.get("intent") == "recall_memory":
                 memory_recall_steps += 1
             if record.get("oracle_metrics_used_for_decision"):
@@ -216,6 +238,12 @@ def summarize_run(path: Path) -> Dict[str, Any]:
         "episode_namespace_hits": episode_namespace_hits,
         "scene_namespace_hits": scene_namespace_hits,
         "task_namespace_hits": task_namespace_hits,
+        "memory_gate_policy_context_used_count": memory_gate_policy_context_used_count,
+        "memory_gate_stop_semantics_filtered_count": memory_gate_stop_semantics_filtered_count,
+        "memory_gate_raw_reason_included_count": memory_gate_raw_reason_included_count,
+        "stop_verifier_trigger_count": stop_verifier_trigger_count,
+        "stop_verifier_block_count": stop_verifier_block_count,
+        "stop_verifier_disagreement_count": stop_verifier_disagreement_count,
     }
 
 
@@ -230,6 +258,8 @@ def format_markdown(rows: List[Dict[str, Any]]) -> str:
         "memory_recall_events",
         "useful_recall_rate",
         "action_changed_after_recall_events",
+        "memory_gate_policy_context_used_count",
+        "stop_verifier_trigger_count",
         "oracle_leakage_steps",
     ]
     lines = [

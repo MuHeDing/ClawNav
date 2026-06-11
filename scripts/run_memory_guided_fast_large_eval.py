@@ -33,6 +33,37 @@ DEFAULT_MODEL_PATH = (
 TRACE_RELATIVE_PATH = Path("harness_traces") / "harness_trace_rank0.jsonl"
 SUMMARY_JSON_NAME = "large_eval_summary.json"
 REPORT_MD_NAME = "large_eval_report.md"
+JANUS_ONLY_DISCRIMINATIVE_KEYS = {
+    "2azQ1b91cZZ:10",
+    "8194nk5LbLH:220",
+    "EU6Fwq7SyZv:212",
+    "EU6Fwq7SyZv:390",
+    "QUCTc6BB5sX:97",
+    "QUCTc6BB5sX:105",
+    "QUCTc6BB5sX:153",
+    "TbHJrupSAjP:59",
+    "TbHJrupSAjP:135",
+    "X7HyMhZNoso:46",
+    "Z6MFQCViBuw:392",
+    "oLBMNvg9in8:533",
+    "pLe4wQe7qrG:412",
+    "x8F5xyUWy9e:7",
+    "x8F5xyUWy9e:33",
+    "x8F5xyUWy9e:310",
+    "x8F5xyUWy9e:522",
+}
+CLAW_ONLY_DISCRIMINATIVE_KEYS = {
+    "8194nk5LbLH:1591",
+    "QUCTc6BB5sX:83",
+    "X7HyMhZNoso:375",
+    "oLBMNvg9in8:466",
+    "pLe4wQe7qrG:414",
+    "x8F5xyUWy9e:188",
+    "x8F5xyUWy9e:640",
+    "zsNo4HB9uLZ:1",
+    "zsNo4HB9uLZ:41",
+    "zsNo4HB9uLZ:87",
+}
 
 
 @dataclass
@@ -47,6 +78,12 @@ class LargeEvalConfig:
     model: str = "qwen/qwen3.5-flash"
     model_provider: str = "qwen_api"
     fast_mode: str = "memory_guided_policy_fast"
+    memory_policy_mode: str = "raw"
+    filter_stop_semantics: int = 0
+    stop_verification_mode: str = "off"
+    fast_use_memory_context: int = 1
+    policy_memory_context_enabled: Optional[int] = None
+    episode_keys_path: Optional[str] = None
     image_interval_steps: int = 20
     model_max_images: int = 2
     qwen_retries: int = 1
@@ -100,7 +137,9 @@ def build_adapter_env(config: LargeEvalConfig) -> Dict[str, str]:
             "OPENCLAW_MODEL_MAX_IMAGES": config.model_max_images,
             "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS": config.image_interval_steps,
             "OPENCLAW_MODEL_FAST_MODE": config.fast_mode,
-            "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT": 1,
+            "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT": config.fast_use_memory_context,
+            "OPENCLAW_MODEL_MEMORY_POLICY_MODE": config.memory_policy_mode,
+            "OPENCLAW_MODEL_FILTER_STOP_SEMANTICS": config.filter_stop_semantics,
             "OPENCLAW_AGENT_TIMEOUT": config.agent_timeout_s,
             "OPENCLAW_AGENT_MAX_INPUT_TOKENS": config.agent_max_input_tokens,
             "OPENCLAW_GATEWAY_TIMEOUT": config.adapter_timeout_s,
@@ -120,6 +159,17 @@ def build_eval_env(
     episode_keys: str = "",
 ) -> Dict[str, str]:
     """Environment for scripts/evaluation_openclaw_gateway.sh."""
+    effective_episode_keys = episode_keys
+    effective_episode_count = episodes
+    if config.episode_keys_path and not effective_episode_keys:
+        loaded_keys = load_episode_keys_from_path(config.episode_keys_path)
+        effective_episode_keys = ",".join(loaded_keys)
+        effective_episode_count = len(loaded_keys)
+    policy_memory_context_enabled = (
+        int(config.policy_memory_context_enabled)
+        if config.policy_memory_context_enabled is not None
+        else int(config.fast_use_memory_context)
+    )
     env: Dict[str, Any] = {
         "MODEL_PATH": config.model_path,
         "OUTPUT_PATH": output_path,
@@ -131,19 +181,42 @@ def build_eval_env(
         "CHECK_GATEWAY": 1,
         "REQUIRE_GATEWAY": 1,
         "REQUIRE_OPENCLAW_CLI_ADAPTER": 1,
-        "HARNESS_DEBUG_MAX_EPISODES": episodes,
+        "HARNESS_DEBUG_MAX_EPISODES": effective_episode_count,
         "MAX_STEPS": config.max_steps,
+        "OPENCLAW_STOP_VERIFICATION_MODE": config.stop_verification_mode,
+        "OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED": policy_memory_context_enabled,
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "no_proxy": "127.0.0.1,localhost,::1",
         "TOKENIZERS_PARALLELISM": "false",
     }
-    if episode_keys:
-        env["HARNESS_EPISODE_KEYS"] = episode_keys
+    if effective_episode_keys:
+        env["HARNESS_EPISODE_KEYS"] = effective_episode_keys
+    if config.episode_keys_path:
+        env["EPISODE_KEYS_PATH"] = config.episode_keys_path
     if config.data_path:
         env["DATA_PATH"] = config.data_path
-        if not episode_keys:
+        if not effective_episode_keys:
             env["HARNESS_USE_DEFAULT_EPISODE_KEYS"] = 0
     return _stringify_env(env)
+
+
+def load_episode_keys_from_path(path: Path | str) -> List[str]:
+    key_path = Path(path)
+    keys: List[str] = []
+    seen = set()
+    for line_number, line in enumerate(key_path.read_text(encoding="utf-8").splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            raise ValueError(
+                f"episode key line {line_number} must use scene_id:episode_id format: {stripped}"
+            )
+        if stripped in seen:
+            raise ValueError(f"duplicate episode key on line {line_number}: {stripped}")
+        seen.add(stripped)
+        keys.append(stripped)
+    return keys
 
 
 def build_adapter_command() -> List[str]:
@@ -159,6 +232,7 @@ def collect_run_summary(
     *,
     expected_episodes: Optional[int] = None,
     model_max_images: Optional[int] = None,
+    max_steps: Optional[int] = None,
     allow_partial_jsonl: bool = False,
 ) -> Dict[str, Any]:
     run_path = Path(run_dir)
@@ -184,6 +258,9 @@ def collect_run_summary(
     fast_assembled_tokens: List[float] = []
     visual_assembled_tokens: List[float] = []
     visual_provider_tokens: List[float] = []
+    final_actions_by_key: Dict[str, Tuple[int, str]] = {}
+    max_trace_step_by_key: Dict[str, int] = {}
+    stop_verifier_rows: List[Dict[str, Any]] = []
 
     qwen_api_called = 0
     fast_qwen_api_called = 0
@@ -193,13 +270,44 @@ def collect_run_summary(
     planner_fallback_count = 0
     cli_fallback_count = 0
     runtime_error_count = 0
+    fast_text_count = 0
+    memory_gate_policy_context_used_count = 0
+    memory_gate_raw_reason_included_count = 0
+    memory_gate_stop_semantics_filtered_count = 0
+    active_subgoal_injection_count = 0
+    memory_induced_stop_count = 0
 
     for row in trace_rows:
         audit = row.get("context_audit") if isinstance(row.get("context_audit"), dict) else {}
         step_mode = str(audit.get("planner_step_mode") or row.get("planner_step_mode") or "")
         if step_mode:
             mode_counts[step_mode] += 1
+        if step_mode == "fast_text":
+            fast_text_count += 1
         planner_reason = str(row.get("planner_reason") or row.get("reason") or "")
+        row_key = _episode_key(row)
+        step_id = _coerce_int(row.get("step_id"), default=-1)
+        if row_key and step_id >= 0:
+            max_trace_step_by_key[row_key] = max(max_trace_step_by_key.get(row_key, -1), step_id)
+        action_text = _normalize_action(row.get("action_text"))
+        if row_key and action_text:
+            previous = final_actions_by_key.get(row_key)
+            if previous is None or step_id >= previous[0]:
+                final_actions_by_key[row_key] = (step_id, action_text)
+        memory_gate = row.get("memory_gate") if isinstance(row.get("memory_gate"), dict) else {}
+        if memory_gate.get("policy_context_used"):
+            memory_gate_policy_context_used_count += 1
+        if memory_gate.get("raw_reason_included"):
+            memory_gate_raw_reason_included_count += 1
+        if memory_gate.get("stop_semantics_filtered"):
+            memory_gate_stop_semantics_filtered_count += 1
+        if action_text == "STOP" and memory_gate.get("policy_context_used"):
+            memory_induced_stop_count += 1
+        if _row_has_active_subgoal(row, memory_gate):
+            active_subgoal_injection_count += 1
+        stop_verifier = row.get("stop_verifier") if isinstance(row.get("stop_verifier"), dict) else {}
+        if stop_verifier.get("triggered"):
+            stop_verifier_rows.append({"key": row_key, **stop_verifier})
         image_count = _coerce_int(audit.get("model_image_count"), default=0)
         max_model_image_count = max(max_model_image_count, image_count)
         qwen_called = audit.get("qwen_api_called") is True
@@ -253,9 +361,52 @@ def collect_run_summary(
             if model_max_images is not None and image_count > model_max_images:
                 _append_example(visual_image_over_budget_examples, row)
 
-    success_sum = sum(_coerce_float(row.get("success")) or 0.0 for row in result_rows)
-    spl_sum = sum(_coerce_float(row.get("spl")) or 0.0 for row in result_rows)
-    result_count = len(result_rows)
+    episode_result_rows = [row for row in result_rows if _episode_key(row)]
+    metric_result_rows = episode_result_rows if episode_result_rows else result_rows
+    success_sum = sum(_coerce_float(row.get("success")) or 0.0 for row in metric_result_rows)
+    spl_sum = sum(_coerce_float(row.get("spl")) or 0.0 for row in metric_result_rows)
+    os_values = [_coerce_float(row.get("os")) for row in metric_result_rows]
+    os_numbers = [value for value in os_values if value is not None]
+    step_values = [_coerce_float(row.get("steps")) for row in metric_result_rows]
+    step_numbers = [value for value in step_values if value is not None]
+    result_count = len(metric_result_rows)
+    result_by_key = {_episode_key(row): row for row in metric_result_rows if _episode_key(row)}
+    final_stop_count = 0
+    wrong_stop_count = 0
+    far_wrong_stop_count = 0
+    timeout_or_loop_count = 0
+    near_miss_fail_count = 0
+    for row in metric_result_rows:
+        key = _episode_key(row)
+        success = _coerce_float(row.get("success")) or 0.0
+        os_value = _coerce_float(row.get("os")) or 0.0
+        if success == 0.0 and os_value == 1.0:
+            near_miss_fail_count += 1
+        final_action = _final_action_for_result(row, final_actions_by_key.get(key))
+        if final_action == "STOP":
+            final_stop_count += 1
+            if success == 0.0:
+                wrong_stop_count += 1
+                if os_value == 0.0:
+                    far_wrong_stop_count += 1
+        result_steps = _coerce_int(row.get("steps"), default=-1)
+        trace_max_step = max_trace_step_by_key.get(key, -1)
+        if max_steps is not None and (
+            result_steps >= int(max_steps) or trace_max_step + 1 >= int(max_steps)
+        ):
+            timeout_or_loop_count += 1
+    stop_metrics = _stop_verifier_metrics(stop_verifier_rows, result_by_key)
+    denominator = fast_text_count if fast_text_count else len(trace_rows)
+    policy_context_injection_rate = _ratio(
+        memory_gate_policy_context_used_count,
+        denominator,
+    ) if denominator else None
+    active_subgoal_injection_rate = _ratio(
+        active_subgoal_injection_count,
+        denominator,
+    ) if denominator else None
+    janus_only_recovered_count = _success_count_for_keys(result_by_key, JANUS_ONLY_DISCRIMINATIVE_KEYS)
+    claw_only_preserved_count = _success_count_for_keys(result_by_key, CLAW_ONLY_DISCRIMINATIVE_KEYS)
 
     return {
         "run_dir": str(run_path),
@@ -279,6 +430,33 @@ def collect_run_summary(
         "spl_sum": round(spl_sum, 6),
         "success_rate": round(success_sum / result_count, 6) if result_count else None,
         "spl_rate": round(spl_sum / result_count, 6) if result_count else None,
+        "os_rate": round(sum(os_numbers) / len(os_numbers), 6) if os_numbers else None,
+        "average_steps": round(sum(step_numbers) / len(step_numbers), 6) if step_numbers else None,
+        "final_stop_count": final_stop_count,
+        "near_miss_fail_count": near_miss_fail_count,
+        "wrong_stop_count": wrong_stop_count,
+        "far_wrong_stop_count": far_wrong_stop_count,
+        "timeout_or_loop_count": timeout_or_loop_count,
+        "memory_gate_policy_context_used_count": memory_gate_policy_context_used_count,
+        "policy_context_injection_rate": policy_context_injection_rate,
+        "active_subgoal_injection_rate": active_subgoal_injection_rate,
+        "policy_context_injection_rate_denominator": "fast_text_rows"
+        if fast_text_count
+        else "trace_rows",
+        "memory_gate_raw_reason_included_count": memory_gate_raw_reason_included_count,
+        "memory_gate_stop_semantics_filtered_count": memory_gate_stop_semantics_filtered_count,
+        "fast_policy_memory_context_enabled": None,
+        "policy_memory_context_enabled": None,
+        "memory_changed_action_method": "not_available",
+        "memory_changed_action_rate": None,
+        "memory_changed_action_win_count": None,
+        "memory_changed_action_loss_count": None,
+        "memory_induced_stop_count": memory_induced_stop_count,
+        **stop_metrics,
+        "janus_only_total_count": len(JANUS_ONLY_DISCRIMINATIVE_KEYS),
+        "janus_only_recovered_count": janus_only_recovered_count,
+        "claw_only_total_count": len(CLAW_ONLY_DISCRIMINATIVE_KEYS),
+        "claw_only_preserved_count": claw_only_preserved_count,
         "token_summary": {
             "fast_assembled_prompt_tokens": _numeric_summary(fast_assembled_tokens),
             "visual_assembled_prompt_tokens": _numeric_summary(visual_assembled_tokens),
@@ -462,7 +640,37 @@ def render_markdown_report(summary: Dict[str, Any], *, label: str) -> str:
             "Metrics: "
             f"success_sum={summary.get('success_sum')}, "
             f"success_rate={summary.get('success_rate')}, "
-            f"spl_rate={summary.get('spl_rate')}"
+            f"spl_rate={summary.get('spl_rate')}, "
+            f"os_rate={summary.get('os_rate')}, "
+            f"near_miss_fail_count={summary.get('near_miss_fail_count')}"
+        ),
+        "",
+        "## Memory Gate / STOP Verification",
+        "",
+        (
+            "- Memory gate: "
+            f"policy_context_used={summary.get('memory_gate_policy_context_used_count')}, "
+            f"policy_context_injection_rate={summary.get('policy_context_injection_rate')}, "
+            f"active_subgoal_injection_rate={summary.get('active_subgoal_injection_rate')}, "
+            f"stop_semantics_filtered={summary.get('memory_gate_stop_semantics_filtered_count')}, "
+            f"raw_reason_included={summary.get('memory_gate_raw_reason_included_count')}"
+        ),
+        (
+            "- STOP verifier: "
+            f"triggered={summary.get('stop_verifier_trigger_count')}, "
+            f"blocked={summary.get('stop_verifier_block_count')}, "
+            f"disagreement={summary.get('stop_verifier_disagreement_count')}, "
+            f"clean_nonstop={summary.get('stop_verifier_clean_nonstop_count')}"
+        ),
+        (
+            "- Phase gates: "
+            f"wrong_stop={summary.get('wrong_stop_count')}, "
+            f"far_wrong_stop={summary.get('far_wrong_stop_count')}, "
+            f"timeout_or_loop={summary.get('timeout_or_loop_count')}, "
+            f"janus_recovered={summary.get('janus_only_recovered_count')}/"
+            f"{summary.get('janus_only_total_count')}, "
+            f"claw_preserved={summary.get('claw_only_preserved_count')}/"
+            f"{summary.get('claw_only_total_count')}"
         ),
         "",
         "## Token Summary",
@@ -611,6 +819,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--data-path", default=None)
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--model", default="qwen/qwen3.5-flash")
+    parser.add_argument(
+        "--memory-policy-mode",
+        choices=("raw", "no_reason", "safe_cue", "off"),
+        default="raw",
+    )
+    parser.add_argument("--filter-stop-semantics", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--stop-verification-mode",
+        choices=("off", "audit_clean_prompt", "clean_prompt_block"),
+        default="off",
+    )
+    parser.add_argument("--fast-use-memory-context", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--openclaw-policy-memory-context-enabled",
+        type=int,
+        choices=(0, 1),
+        default=None,
+    )
+    parser.add_argument("--episode-keys-path", default=None)
     parser.add_argument("--model-max-images", type=int, default=2)
     parser.add_argument("--image-interval-steps", type=int, default=20)
     parser.add_argument("--qwen-retries", type=int, default=1)
@@ -650,6 +877,12 @@ def config_from_args(args: argparse.Namespace) -> LargeEvalConfig:
         data_path=args.data_path,
         model_path=args.model_path,
         model=args.model,
+        memory_policy_mode=args.memory_policy_mode,
+        filter_stop_semantics=args.filter_stop_semantics,
+        stop_verification_mode=args.stop_verification_mode,
+        fast_use_memory_context=args.fast_use_memory_context,
+        policy_memory_context_enabled=args.openclaw_policy_memory_context_enabled,
+        episode_keys_path=args.episode_keys_path,
         image_interval_steps=args.image_interval_steps,
         model_max_images=args.model_max_images,
         qwen_retries=args.qwen_retries,
@@ -706,6 +939,7 @@ def _run_eval_phase(
         master_port=master_port,
         episode_keys=episode_keys,
     )
+    expected_episodes = _expected_episode_count_from_env(env, episodes)
     process = _launch_process(
         build_eval_command(),
         env,
@@ -721,8 +955,9 @@ def _run_eval_phase(
             time.sleep(config.poll_seconds)
             summary = collect_run_summary(
                 output_path,
-                expected_episodes=episodes,
+                expected_episodes=expected_episodes,
                 model_max_images=config.model_max_images,
+                max_steps=config.max_steps,
                 allow_partial_jsonl=True,
             )
             failures = validate_large_eval_gate(summary, require_complete=False)
@@ -744,9 +979,11 @@ def _run_eval_phase(
 
     summary = collect_run_summary(
         output_path,
-        expected_episodes=episodes,
+        expected_episodes=expected_episodes,
         model_max_images=config.model_max_images,
+        max_steps=config.max_steps,
     )
+    summary.update(_run_config_summary(config, expected_episodes=expected_episodes))
     failures = validate_large_eval_gate(summary)
     if aborted:
         runtime_abort = abort_code == "openclaw_runtime_error"
@@ -779,6 +1016,33 @@ def _run_eval_phase(
     summary["log_path"] = str(log_path)
     write_run_audit(summary, label=label)
     return returncode, summary
+
+
+def _expected_episode_count_from_env(env: Dict[str, str], fallback: int) -> int:
+    try:
+        return int(env.get("HARNESS_DEBUG_MAX_EPISODES") or fallback)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _run_config_summary(config: LargeEvalConfig, *, expected_episodes: int) -> Dict[str, Any]:
+    policy_memory_context_enabled = (
+        int(config.policy_memory_context_enabled)
+        if config.policy_memory_context_enabled is not None
+        else int(config.fast_use_memory_context)
+    )
+    source = "explicit" if config.policy_memory_context_enabled is not None else "derived_from_fast_use_memory_context"
+    return {
+        "memory_policy_mode": config.memory_policy_mode,
+        "filter_stop_semantics": int(config.filter_stop_semantics),
+        "stop_verification_mode": config.stop_verification_mode,
+        "fast_use_memory_context": int(config.fast_use_memory_context),
+        "fast_policy_memory_context_enabled": int(config.fast_use_memory_context),
+        "policy_memory_context_enabled": policy_memory_context_enabled,
+        "policy_memory_context_enabled_source": source,
+        "episode_keys_path": config.episode_keys_path or "",
+        "effective_episode_key_count": expected_episodes,
+    }
 
 
 def _launch_process(
@@ -1012,6 +1276,132 @@ def _row_example(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _episode_key(row: Dict[str, Any]) -> str:
+    scene_id = row.get("scene_id")
+    episode_id = row.get("episode_id")
+    if scene_id in (None, "") or episode_id in (None, ""):
+        return ""
+    return f"{_canonical_scene_id(scene_id)}:{episode_id}"
+
+
+def _canonical_scene_id(scene_id: Any) -> str:
+    text = str(scene_id or "").rstrip("/").replace("\\", "/")
+    parts = text.split("/")
+    if len(parts) >= 2 and "." in parts[-1]:
+        return parts[-2]
+    if len(parts) >= 2 and parts[-1] in {"", "habitat"}:
+        return parts[-2]
+    return parts[-1] if "/" in text else text
+
+
+def _normalize_action(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "FORWARD": "MOVE_FORWARD",
+        "MOVE": "MOVE_FORWARD",
+        "LEFT": "TURN_LEFT",
+        "RIGHT": "TURN_RIGHT",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"} else ""
+
+
+def _final_action_for_result(row: Dict[str, Any], trace_action: Optional[Tuple[int, str]]) -> str:
+    if trace_action is not None:
+        return trace_action[1]
+    for key in ("final_action", "final_action_text", "action_text"):
+        action = _normalize_action(row.get(key))
+        if action:
+            return action
+    return ""
+
+
+def _row_has_active_subgoal(row: Dict[str, Any], memory_gate: Dict[str, Any]) -> bool:
+    policy_context = memory_gate.get("policy_context")
+    if isinstance(policy_context, dict) and policy_context.get("active_subgoal"):
+        return True
+    for call in row.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        payload_summary = call.get("payload_summary") or {}
+        if isinstance(payload_summary, dict) and payload_summary.get("active_subgoal"):
+            return True
+    return False
+
+
+def _success_count_for_keys(result_by_key: Dict[str, Dict[str, Any]], keys: Iterable[str]) -> int:
+    count = 0
+    for key in keys:
+        row = result_by_key.get(key)
+        if not row:
+            continue
+        if (_coerce_float(row.get("success")) or 0.0) > 0.0:
+            count += 1
+    return count
+
+
+def _stop_verifier_metrics(
+    verifier_rows: List[Dict[str, Any]],
+    result_by_key: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    trigger_count = 0
+    block_count = 0
+    disagreement_count = 0
+    clean_stop_count = 0
+    clean_nonstop_count = 0
+    audit_wrong_stop_count = 0
+    audit_success_stop_count = 0
+    blocked_stop_later_success = 0
+    blocked_stop_later_failure = 0
+    for row in verifier_rows:
+        trigger_count += 1
+        memory_action = _normalize_action(row.get("memory_action"))
+        clean_action = _normalize_action(row.get("clean_action"))
+        mode = str(row.get("mode") or "")
+        blocked = bool(row.get("blocked"))
+        if blocked:
+            block_count += 1
+        if row.get("disagreement"):
+            disagreement_count += 1
+        if clean_action == "STOP":
+            clean_stop_count += 1
+        elif clean_action:
+            clean_nonstop_count += 1
+        result_row = result_by_key.get(str(row.get("key") or ""))
+        success = _coerce_float(result_row.get("success")) if result_row else None
+        clean_nonstop_disagreement = (
+            memory_action == "STOP" and clean_action not in {"", "STOP"} and row.get("disagreement")
+        )
+        if clean_nonstop_disagreement and mode == "audit_clean_prompt" and not blocked:
+            if success == 1.0:
+                audit_success_stop_count += 1
+            elif success == 0.0:
+                audit_wrong_stop_count += 1
+        if clean_nonstop_disagreement and blocked:
+            if success == 1.0:
+                blocked_stop_later_success += 1
+            elif success == 0.0:
+                blocked_stop_later_failure += 1
+    hypothetical_total = audit_wrong_stop_count + audit_success_stop_count
+    return {
+        "stop_verifier_trigger_count": trigger_count,
+        "stop_verifier_block_count": block_count,
+        "stop_verifier_disagreement_count": disagreement_count,
+        "stop_verifier_clean_stop_count": clean_stop_count,
+        "stop_verifier_clean_nonstop_count": clean_nonstop_count,
+        "blocked_stop_later_success": blocked_stop_later_success,
+        "blocked_stop_later_failure": blocked_stop_later_failure,
+        "clean_nonstop_disagreement_executed_stop_success_count": audit_success_stop_count,
+        "clean_nonstop_disagreement_wrong_stop_count": audit_wrong_stop_count,
+        "hypothetical_true_positive_block_count": audit_wrong_stop_count,
+        "hypothetical_false_positive_block_count": audit_success_stop_count,
+        "hypothetical_true_positive_block_rate": _ratio(audit_wrong_stop_count, hypothetical_total),
+        "hypothetical_false_positive_block_rate": _ratio(audit_success_stop_count, hypothetical_total),
+    }
+
+
 def _format_example_for_report(example: Dict[str, Any]) -> str:
     location = (
         f"{example.get('scene_id')} / {example.get('episode_id')} / "
@@ -1035,6 +1425,12 @@ def _numeric_summary(values: Iterable[float]) -> Dict[str, Any]:
         "max": round(max(numbers), 3),
         "avg": round(sum(numbers) / len(numbers), 3),
     }
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 6)
 
 
 def _coerce_int(value: Any, *, default: int = 0) -> int:

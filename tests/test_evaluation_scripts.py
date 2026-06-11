@@ -41,12 +41,16 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
     assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-300}" in contents
     assert "OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}" in contents
+    assert "OPENCLAW_STOP_VERIFICATION_MODE=${OPENCLAW_STOP_VERIFICATION_MODE:-off}" in contents
+    assert "OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED=${OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED:-1}" in contents
     assert "MAX_STEPS must be a positive integer" in contents
     assert "REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}" in contents
     assert "--require_service openclaw_cli_plan_gateway" in contents
     assert "--enforce_timeout_budget" in contents
     assert "--harness_debug_max_episodes" in contents
     assert "--max_steps" in contents
+    assert "--openclaw_stop_verification_mode" in contents
+    assert "--openclaw_policy_memory_context_enabled" in contents
 
 
 def test_openclaw_gateway_script_can_disable_default_episode_keys_for_custom_data():
@@ -105,8 +109,20 @@ def test_100_val_unseen_launcher_uses_100_episode_dataset():
     assert "IMAGE_INTERVAL_STEPS=${IMAGE_INTERVAL_STEPS:-20}" in contents
     assert "ABORT_ON_INVALID=${ABORT_ON_INVALID:-1}" in contents.splitlines()
     assert "SKIP_SMOKE=${SKIP_SMOKE:-1}" in contents
+    assert "MEMORY_POLICY_MODE=${MEMORY_POLICY_MODE:-raw}" in contents
+    assert "FILTER_STOP_SEMANTICS=${FILTER_STOP_SEMANTICS:-0}" in contents
+    assert "STOP_VERIFICATION_MODE=${STOP_VERIFICATION_MODE:-off}" in contents
+    assert "FAST_USE_MEMORY_CONTEXT=${FAST_USE_MEMORY_CONTEXT:-1}" in contents
+    assert "OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED=${OPENCLAW_POLICY_MEMORY_CONTEXT_ENABLED:-}" in contents
+    assert "EPISODE_KEYS_PATH=${EPISODE_KEYS_PATH:-}" in contents
     assert "SMOKE_EPISODE_KEY=${SMOKE_EPISODE_KEY:-zsNo4HB9uLZ:1}" in contents
     assert "--smoke-episode-key" in contents
+    assert "--memory-policy-mode" in contents
+    assert "--filter-stop-semantics" in contents
+    assert "--stop-verification-mode" in contents
+    assert "--fast-use-memory-context" in contents
+    assert "--openclaw-policy-memory-context-enabled" in contents
+    assert "--episode-keys-path" in contents
     assert "clawnav_openclaw_qwen_memory_guided_fast_100_val_unseen_" in contents
     assert "run_memory_guided_fast_large_eval.py" in contents
 
@@ -137,6 +153,8 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-20}" in contents
     assert "OPENCLAW_MODEL_FAST_MODE=${OPENCLAW_MODEL_FAST_MODE:-qwen_text_only}" in contents
     assert "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT=${OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT:-1}" in contents
+    assert "OPENCLAW_MODEL_MEMORY_POLICY_MODE=${OPENCLAW_MODEL_MEMORY_POLICY_MODE:-raw}" in contents
+    assert "OPENCLAW_MODEL_FILTER_STOP_SEMANTICS=${OPENCLAW_MODEL_FILTER_STOP_SEMANTICS:-0}" in contents
     assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents
     assert "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}" in contents
     assert "--openclaw_visual_mode" in contents
@@ -148,6 +166,8 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "--openclaw_model_image_interval_steps" in contents
     assert "--openclaw_model_fast_mode" in contents
     assert "--openclaw_model_fast_use_memory_context" in contents
+    assert "--openclaw_model_memory_policy_mode" in contents
+    assert "--openclaw_model_filter_stop_semantics" in contents
     assert "--agent_max_input_tokens" in contents
 
 

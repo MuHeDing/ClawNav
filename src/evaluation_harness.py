@@ -98,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--openclaw_allow_planner_action_override", action="store_true", default=False)
+    parser.add_argument("--openclaw_policy_memory_context_enabled", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--openclaw_stop_verification_mode",
+        choices=("off", "audit_clean_prompt", "clean_prompt_block"),
+        default="off",
+    )
     return parser
 
 
@@ -166,6 +172,14 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             args,
             "openclaw_allow_planner_action_override",
             False,
+        ),
+        openclaw_policy_memory_context_enabled=bool(
+            getattr(args, "openclaw_policy_memory_context_enabled", 1)
+        ),
+        openclaw_stop_verification_mode=getattr(
+            args,
+            "openclaw_stop_verification_mode",
+            "off",
         ),
     )
     if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
@@ -276,6 +290,8 @@ def build_harness_components(
                 recall_interval_steps=config.recall_interval_steps,
             ),
             allow_planner_action_override=config.openclaw_allow_planner_action_override,
+            policy_memory_context_enabled=config.openclaw_policy_memory_context_enabled,
+            stop_verification_mode=config.openclaw_stop_verification_mode,
         )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",

@@ -34,6 +34,22 @@ class RecordingNavigationSkill(Skill):
         return SkillResult.ok_result("action", {"action_text": "TURN_LEFT"})
 
 
+class SequenceNavigationSkill(Skill):
+    name = "NavigationPolicySkill"
+    description = "Records payloads and returns actions in order."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self, actions):
+        self.actions = list(actions)
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        action = self.actions.pop(0) if self.actions else "TURN_LEFT"
+        return SkillResult.ok_result("action", {"action_text": action})
+
+
 class EchoMemorySkill(Skill):
     name = "MemoryQuerySkill"
     description = "Returns fake memory."
@@ -695,6 +711,147 @@ def test_runtime_passes_memory_context_to_navigation_policy():
 
     assert result.ok is True
     assert navigation.calls[0]["memory_context_text"] == "kitchen"
+
+
+def test_runtime_clean_off_suppresses_navigation_policy_memory_payload():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={
+            "active_subgoal": "continue toward doorway",
+            "memory_context_text": "remember the doorway",
+            "memory_images": ["/tmp/doorway.png"],
+        },
+        reason="memory fast path",
+        planner_backend="gateway",
+        runtime_metadata={"memory_gate": {"mode": "safe_cue", "policy_context_used": True}},
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_memory_context_enabled=False,
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={
+            "active_subgoal": "payload subgoal",
+            "memory_context_text": "payload memory",
+            "recent_frames": ["frame0"],
+        },
+    )
+
+    assert result.ok is True
+    assert navigation.calls == [{"recent_frames": ["frame0"]}]
+    assert result.runtime_metadata["policy_memory_context_enabled"] is False
+    assert result.runtime_metadata["memory_gate"]["mode"] == "safe_cue"
+
+
+def test_runtime_clean_off_suppresses_memory_query_policy_context():
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "doorway"},
+        reason="recall",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(MemoryContextSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_memory_context_enabled=False,
+    )
+
+    result = runtime.step(make_state(step_id=0), payload={"recent_frames": ["frame0"]})
+
+    assert result.ok is True
+    assert navigation.calls == [{"recent_frames": ["frame0"]}]
+
+
+def test_runtime_audit_clean_prompt_stop_verification_keeps_memory_stop():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"memory_context_text": "Navigation cue: doorway", "active_subgoal": "doorway"},
+        reason="memory stop risk",
+        planner_backend="gateway",
+        runtime_metadata={
+            "memory_gate": {
+                "mode": "safe_cue",
+                "policy_context_used": True,
+                "control_context": {"requires_stop_verification": True},
+            }
+        },
+    )
+    navigation = SequenceNavigationSkill(["STOP", "MOVE_FORWARD"])
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        stop_verification_mode="audit_clean_prompt",
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(make_state(step_id=8), payload={"recent_frames": ["frame0"]})
+
+    assert result.ok is True
+    assert result.action_text == "STOP"
+    assert len(navigation.calls) == 2
+    assert navigation.calls[0]["memory_context_text"] == "Navigation cue: doorway"
+    assert navigation.calls[1] == {"recent_frames": ["frame0"]}
+    verifier = result.runtime_metadata["stop_verifier"]
+    assert verifier["mode"] == "audit_clean_prompt"
+    assert verifier["triggered"] is True
+    assert verifier["memory_action"] == "STOP"
+    assert verifier["clean_action"] == "MOVE_FORWARD"
+    assert verifier["disagreement"] is True
+    assert verifier["blocked"] is False
+
+
+def test_runtime_clean_prompt_block_replaces_memory_stop_with_clean_action():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={"memory_context_text": "Navigation cue: doorway", "active_subgoal": "doorway"},
+        reason="memory stop risk",
+        planner_backend="gateway",
+        runtime_metadata={
+            "memory_gate": {
+                "mode": "safe_cue",
+                "policy_context_used": True,
+                "control_context": {"requires_stop_verification": True},
+            }
+        },
+    )
+    navigation = SequenceNavigationSkill(["STOP", "MOVE_FORWARD"])
+    registry = SkillRegistry()
+    registry.register(navigation)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        stop_verification_mode="clean_prompt_block",
+        allow_planner_action_override=False,
+    )
+
+    result = runtime.step(make_state(step_id=8), payload={"recent_frames": ["frame0"]})
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert result.executor_command["action_index"] == 1
+    assert result.runtime_metadata["stop_verifier"]["blocked"] is True
+    assert result.runtime_metadata["stop_verifier"]["executed_action"] == "MOVE_FORWARD"
 
 
 def test_runtime_records_recall_usage_metadata():
