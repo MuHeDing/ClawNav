@@ -1,8 +1,13 @@
 import argparse
+import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
-from harness.config import HarnessConfig
+from harness.config import (
+    HarnessConfig,
+    parse_visual_readback_bool,
+    validate_visual_readback_config,
+)
 from harness.controller import HarnessController
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
 from harness.logging.harness_logger import HarnessLogger
@@ -19,6 +24,7 @@ from harness.skills.memory_write import MemoryWriteSkill
 from harness.skills.navigation_policy import NavigationPolicySkill
 from harness.skills.progress_critic import ProgressCriticSkill
 from harness.skills.replanner import ReplannerSkill
+from harness.skills.visual_memory_read import VisualMemoryReadSkill
 from harness.skills.visual_memory_curator import VisualMemoryCuratorSkill
 from harness.types import SkillResult
 
@@ -36,6 +42,13 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def parse_bool(value: str) -> bool:
+    try:
+        return parse_visual_readback_bool(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,7 +111,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--openclaw_allow_planner_action_override", action="store_true", default=False)
+    parser.add_argument("--visual_readback_mode", type=str, default=None)
+    parser.add_argument("--visual_readback_top_k", type=int, default=None)
+    parser.add_argument("--visual_readback_timeout_ms", type=int, default=None)
+    parser.add_argument("--visual_readback_low_confidence", type=float, default=None)
+    parser.add_argument("--visual_readback_high_confidence", type=float, default=None)
+    parser.add_argument("--visual_readback_shuffle_scope", type=str, default=None)
+    parser.add_argument("--visual_readback_shuffle_seed", type=str, default=None)
+    parser.add_argument("--visual_readback_control_only", type=parse_bool, default=None)
+    parser.add_argument("--visual_readback_fixed_case_manifest", type=str, default=None)
+    parser.add_argument("--visual_readback_stop_fallback_policy", type=str, default=None)
+    parser.add_argument("--visual_readback_smoke_seed_memory", type=parse_bool, default=None)
     return parser
+
+
+def _config_value(
+    args: argparse.Namespace,
+    attr_name: str,
+    env_name: str,
+    default: Any,
+    cast: Callable[[Any], Any],
+) -> Any:
+    arg_value = getattr(args, attr_name, None)
+    if arg_value is not None:
+        return arg_value
+    if env_name in os.environ:
+        return cast(os.environ[env_name])
+    return default
 
 
 def _canonical_episode_scene_id(scene_id: Any) -> str:
@@ -140,6 +179,7 @@ def filter_harness_episodes_by_keys(episodes: list[Any], raw_keys: str) -> list[
 
 
 def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
+    defaults = HarnessConfig()
     config = HarnessConfig(
         harness_mode=args.harness_mode,
         memory_backend=args.harness_memory_backend,
@@ -167,6 +207,83 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             "openclaw_allow_planner_action_override",
             False,
         ),
+        visual_readback_mode=_config_value(
+            args,
+            "visual_readback_mode",
+            "OPENCLAW_VISUAL_READBACK_MODE",
+            defaults.visual_readback_mode,
+            str,
+        ),
+        visual_readback_top_k=_config_value(
+            args,
+            "visual_readback_top_k",
+            "OPENCLAW_VISUAL_READBACK_TOP_K",
+            defaults.visual_readback_top_k,
+            int,
+        ),
+        visual_readback_timeout_ms=_config_value(
+            args,
+            "visual_readback_timeout_ms",
+            "OPENCLAW_VISUAL_READBACK_TIMEOUT_MS",
+            defaults.visual_readback_timeout_ms,
+            int,
+        ),
+        visual_readback_low_confidence=_config_value(
+            args,
+            "visual_readback_low_confidence",
+            "OPENCLAW_VISUAL_READBACK_LOW_CONFIDENCE",
+            defaults.visual_readback_low_confidence,
+            float,
+        ),
+        visual_readback_high_confidence=_config_value(
+            args,
+            "visual_readback_high_confidence",
+            "OPENCLAW_VISUAL_READBACK_HIGH_CONFIDENCE",
+            defaults.visual_readback_high_confidence,
+            float,
+        ),
+        visual_readback_shuffle_scope=_config_value(
+            args,
+            "visual_readback_shuffle_scope",
+            "OPENCLAW_VISUAL_READBACK_SHUFFLE_SCOPE",
+            defaults.visual_readback_shuffle_scope,
+            str,
+        ),
+        visual_readback_shuffle_seed=_config_value(
+            args,
+            "visual_readback_shuffle_seed",
+            "OPENCLAW_VISUAL_READBACK_SHUFFLE_SEED",
+            defaults.visual_readback_shuffle_seed,
+            str,
+        ),
+        visual_readback_control_only=_config_value(
+            args,
+            "visual_readback_control_only",
+            "OPENCLAW_VISUAL_READBACK_CONTROL_ONLY",
+            defaults.visual_readback_control_only,
+            parse_visual_readback_bool,
+        ),
+        visual_readback_fixed_case_manifest_path=_config_value(
+            args,
+            "visual_readback_fixed_case_manifest",
+            "OPENCLAW_VISUAL_READBACK_FIXED_CASE_MANIFEST",
+            defaults.visual_readback_fixed_case_manifest_path,
+            str,
+        ),
+        visual_readback_stop_fallback_policy=_config_value(
+            args,
+            "visual_readback_stop_fallback_policy",
+            "OPENCLAW_VISUAL_READBACK_STOP_FALLBACK_POLICY",
+            defaults.visual_readback_stop_fallback_policy,
+            str,
+        ),
+        visual_readback_smoke_seed_memory=_config_value(
+            args,
+            "visual_readback_smoke_seed_memory",
+            "OPENCLAW_VISUAL_READBACK_SMOKE_SEED_MEMORY",
+            defaults.visual_readback_smoke_seed_memory,
+            parse_visual_readback_bool,
+        ),
     )
     if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
         from harness.openclaw.service_registry import OpenClawServiceRegistry
@@ -182,6 +299,7 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         from harness.memory.manifest import load_memory_manifest
 
         load_memory_manifest(Path(config.memory_manifest_path))
+    validate_visual_readback_config(config)
     return config
 
 
@@ -191,6 +309,10 @@ def build_memory_client(config: HarnessConfig):
             config.spatial_memory_url,
             memory_source=config.memory_source,
         )
+    if config.memory_backend == "image_backed_local":
+        from harness.visual_readback.memory_smoke import ImageBackedLocalMemoryClient
+
+        return ImageBackedLocalMemoryClient(memory_source=config.memory_source)
     return FakeSpatialMemoryClient(memory_source=config.memory_source)
 
 
@@ -216,6 +338,8 @@ def build_harness_components(
         )
     registry.register(MemoryQuerySkill(memory_manager))
     registry.register(MemoryWriteSkill(client=memory_client))
+    if config.visual_readback_mode != "off":
+        registry.register(VisualMemoryReadSkill())
     registry.register(ProgressCriticSkill())
     registry.register(ReplannerSkill())
     if config.openclaw_enable_subagent_memory_curator:
@@ -276,6 +400,7 @@ def build_harness_components(
                 recall_interval_steps=config.recall_interval_steps,
             ),
             allow_planner_action_override=config.openclaw_allow_planner_action_override,
+            config=config,
         )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",

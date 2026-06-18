@@ -74,6 +74,9 @@ if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_STEPS must be a positive integer; got '${MAX_STEPS}'" >&2
   exit 2
 fi
+SAVE_VIDEO=${SAVE_VIDEO:-0}
+SAVE_VIDEO_RATIO=${SAVE_VIDEO_RATIO:-1}
+SAVE_STEP_ARTIFACTS=${SAVE_STEP_ARTIFACTS:-0}
 CHECK_GATEWAY=${CHECK_GATEWAY:-1}
 REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}
 REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}
@@ -87,6 +90,13 @@ if [[ -n "${HARNESS_DEBUG_MAX_EPISODES}" ]]; then
 fi
 if [[ -n "${HARNESS_EPISODE_KEYS:-}" ]]; then
   extra_args+=(--harness_episode_keys "${HARNESS_EPISODE_KEYS}")
+fi
+if [[ "${SAVE_VIDEO}" == "1" ]]; then
+  extra_args+=(--save_video)
+  extra_args+=(--save_video_ratio "${SAVE_VIDEO_RATIO}")
+fi
+if [[ "${SAVE_STEP_ARTIFACTS}" == "1" ]]; then
+  extra_args+=(--save_step_artifacts)
 fi
 if [[ -n "${MEMORY_MANIFEST_PATH}" ]]; then
   extra_args+=(--memory_manifest_path "${MEMORY_MANIFEST_PATH}")

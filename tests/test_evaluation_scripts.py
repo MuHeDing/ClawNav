@@ -62,6 +62,49 @@ def test_openclaw_gateway_script_can_disable_default_episode_keys_for_custom_dat
     assert 'if [[ -n "${HARNESS_EPISODE_KEYS:-}" ]]; then' in contents
 
 
+def test_openclaw_gateway_script_can_save_demo_video_and_step_artifacts():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "SAVE_VIDEO=${SAVE_VIDEO:-0}" in contents
+    assert "SAVE_VIDEO_RATIO=${SAVE_VIDEO_RATIO:-1}" in contents
+    assert "SAVE_STEP_ARTIFACTS=${SAVE_STEP_ARTIFACTS:-0}" in contents
+    assert 'extra_args+=(--save_video)' in contents
+    assert 'extra_args+=(--save_video_ratio "${SAVE_VIDEO_RATIO}")' in contents
+    assert 'extra_args+=(--save_step_artifacts)' in contents
+
+
+def test_visual_readback_runtime_smoke_wrapper_can_run_multiple_demo_episodes():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_visual_readback_runtime_smoke.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "EPISODE_KEYS=${EPISODE_KEYS:-${EPISODE_KEY}}" in contents
+    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-1}" in contents
+    assert 'echo "episode_keys=${EPISODE_KEYS}"' in contents
+    assert 'echo "max_episodes=${HARNESS_DEBUG_MAX_EPISODES}"' in contents
+    assert 'HARNESS_DEBUG_MAX_EPISODES="${HARNESS_DEBUG_MAX_EPISODES}"' in contents
+    assert 'HARNESS_EPISODE_KEYS="${EPISODE_KEYS}"' in contents
+
+
+def test_visual_readback_demo_2az_long5_launcher_uses_full_dataset_without_step_artifacts_by_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_visual_readback_demo_2az_long5.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "JanusVLN/data/datasets/r2r/val_unseen/val_unseen.json.gz" in contents
+    assert (
+        "2azQ1b91cZZ:1525,2azQ1b91cZZ:179,2azQ1b91cZZ:980,"
+        "2azQ1b91cZZ:44,2azQ1b91cZZ:511"
+    ) in contents
+    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-5}" in contents
+    assert "MAX_STEPS=${MAX_STEPS:-340}" in contents
+    assert "SAVE_VIDEO=${SAVE_VIDEO:-1}" in contents
+    assert "SAVE_STEP_ARTIFACTS=${SAVE_STEP_ARTIFACTS:-0}" in contents
+    assert "bash scripts/run_visual_readback_runtime_smoke.sh" in contents
+
+
 def test_400_val_unseen_launcher_runs_directly_without_screen_management():
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "scripts" / "run_memory_guided_fast_400_val_unseen_screen.sh"

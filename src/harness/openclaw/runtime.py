@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+from harness.config import HarnessConfig
 from harness.memory.context_engine import MemoryAwareContextEngine
 from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
@@ -66,15 +67,20 @@ class OpenClawVLNRuntime:
         executor: HabitatOpenClawExecutor,
         fallback_planner: OpenClawPlannerProtocol = None,
         allow_planner_action_override: bool = True,
+        config: Optional[HarnessConfig] = None,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
         self.executor = executor
         self.fallback_planner = fallback_planner
         self.allow_planner_action_override = allow_planner_action_override
+        self.config = config or HarnessConfig()
         self.recent_visual_memories: List[Dict[str, Any]] = []
         self.max_recent_visual_memories = 10
         self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
+        self._stop_state_episode_key = ("", "")
+        self.last_executed_non_stop_action = ""
+        self.last_executed_non_stop_action_age = 0
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -84,6 +90,7 @@ class OpenClawVLNRuntime:
         state: VLNState,
         payload: Dict[str, Any],
     ) -> OpenClawRuntimeStepResult:
+        self._reset_stop_state_if_episode_changed(state)
         planner_error = ""
         planner_fallback = False
         runtime_payload = dict(payload)
@@ -260,6 +267,7 @@ class OpenClawVLNRuntime:
                 runtime_context=runtime_payload,
                 action_text=planned_action_text,
                 causal_recall=causal_recall,
+                policy_payload_has_memory=False,
             )
             metadata["planner_action_override"] = planned_action_text
             metadata["policy_skipped"] = True
@@ -276,12 +284,19 @@ class OpenClawVLNRuntime:
                 True,
                 tool_calls=tool_calls,
             )
+            self._update_stop_fallback_state(planned_action_text)
             return OpenClawRuntimeStepResult(
                 ok=True,
                 action_text=planned_action_text,
                 executor_command=self.executor.command_for_action(planned_action_text),
                 runtime_metadata=metadata,
             )
+        policy_context_available = self._navigation_payload_has_memory(nav_payload)
+        context_engine_context_available = bool(runtime_payload.get("memory_context_text"))
+        if self._control_only_visual_readback_enabled():
+            nav_payload = self._clean_policy_payload(nav_payload)
+        final_policy_payload_has_memory = self._navigation_payload_has_memory(nav_payload)
+
         nav_result = self.tool_adapter.call_tool(
             "NavigationPolicySkill",
             nav_payload,
@@ -290,6 +305,28 @@ class OpenClawVLNRuntime:
         tool_calls.append(nav_result)
 
         action_text = str(nav_result.get("payload", {}).get("action_text") or "STOP")
+        smoke_seed_calls = self._smoke_seed_visual_readback_memory(
+            state,
+            runtime_payload,
+            action_text,
+        )
+        if smoke_seed_calls:
+            tool_calls.extend(smoke_seed_calls)
+        visual_readback = self._run_visual_readback(
+            state=state,
+            runtime_payload=runtime_payload,
+            tool_calls=tool_calls,
+            candidate_action=action_text,
+            policy_context_available=policy_context_available,
+            context_engine_context_available=context_engine_context_available,
+            final_policy_payload_has_memory=final_policy_payload_has_memory,
+        )
+        if visual_readback:
+            tool_calls.append(visual_readback["tool_call"])
+            action_text = self._apply_visual_readback_controller(
+                action_text,
+                visual_readback["trace"],
+            )
         metadata = self._metadata(
             decision,
             tool_calls,
@@ -298,12 +335,15 @@ class OpenClawVLNRuntime:
             runtime_context=runtime_payload,
             action_text=action_text,
             causal_recall=causal_recall,
+            policy_payload_has_memory=final_policy_payload_has_memory,
         )
         if planner_error:
             metadata["planner_error"] = planner_error
         metadata["planner_fallback"] = planner_fallback
         if planned_action_text and not self.allow_planner_action_override:
             metadata["planner_action_guidance"] = planned_action_text
+        if visual_readback:
+            metadata["visual_readback"] = visual_readback["trace"]
         if not nav_result.get("ok"):
             self._record_context_engine_step(
                 metadata,
@@ -333,6 +373,7 @@ class OpenClawVLNRuntime:
             True,
             tool_calls=tool_calls,
         )
+        self._update_stop_fallback_state(action_text)
         return OpenClawRuntimeStepResult(
             ok=True,
             action_text=action_text,
@@ -468,6 +509,7 @@ class OpenClawVLNRuntime:
         runtime_context: Optional[Dict[str, Any]] = None,
         action_text: str = "",
         causal_recall: Optional[Dict[str, Any]] = None,
+        policy_payload_has_memory: Optional[bool] = None,
     ) -> Dict[str, Any]:
         metadata = {
             "runtime_mode": "openclaw_bridge",
@@ -509,9 +551,12 @@ class OpenClawVLNRuntime:
             runtime_context=runtime_context or {},
             action_text=action_text,
             causal_recall=causal_recall or {},
+            policy_payload_has_memory=policy_payload_has_memory,
         )
         if recall_usage:
             metadata["recall_usage"] = recall_usage
+        if self.config.visual_readback_mode != "off":
+            metadata["visual_readback_config"] = self._visual_readback_config_metadata()
         return metadata
 
     def _after_recall_decision(
@@ -588,32 +633,9 @@ class OpenClawVLNRuntime:
     ) -> List[Dict[str, Any]]:
         if self.tool_adapter.get_tool_schema("MemoryWriteSkill") is None:
             return []
-        if not self._planner_visual_analysis_ran(decision):
+        arguments = self._auto_visual_memory_write_arguments(state, payload, decision)
+        if not arguments:
             return []
-        observation = self._matching_visual_observation(
-            payload,
-            str(payload.get("current_image_path") or ""),
-        )
-        if not observation:
-            return []
-        arguments = self._memory_write_arguments(
-            payload,
-            {
-                "memory_source": "episode-local",
-                "note": str(getattr(decision, "reason", "") or ""),
-                "write_gate": {
-                    "candidate_reason": "openclaw_visual_analysis",
-                    "curator_decision": "write",
-                    "curator_reason": str(
-                        observation.get("navigation_relevance")
-                        or observation.get("visual_observation")
-                        or observation.get("caption")
-                        or "OpenClaw visual analysis"
-                    ),
-                    "confidence": observation.get("confidence"),
-                },
-            },
-        )
         arguments.setdefault("recent_visual_memories", list(self.recent_visual_memories))
         tool_calls: List[Dict[str, Any]] = []
         curator_result = self._curate_memory_write(state, arguments)
@@ -628,6 +650,73 @@ class OpenClawVLNRuntime:
         tool_calls.append(write_result)
         self._remember_written_visual_memory(write_result)
         return tool_calls
+
+    def _auto_visual_memory_write_arguments(
+        self,
+        state: VLNState,
+        payload: Dict[str, Any],
+        decision,
+    ) -> Dict[str, Any]:
+        if self._planner_visual_analysis_ran(decision):
+            observation = self._matching_visual_observation(
+                payload,
+                str(payload.get("current_image_path") or ""),
+            )
+            if not observation:
+                return {}
+            return self._memory_write_arguments(
+                payload,
+                {
+                    "memory_source": "episode-local",
+                    "note": str(getattr(decision, "reason", "") or ""),
+                    "write_gate": {
+                        "candidate_reason": "openclaw_visual_analysis",
+                        "curator_decision": "write",
+                        "curator_reason": str(
+                            observation.get("navigation_relevance")
+                            or observation.get("visual_observation")
+                            or observation.get("caption")
+                            or "OpenClaw visual analysis"
+                        ),
+                        "confidence": observation.get("confidence"),
+                    },
+                },
+            )
+
+        context_audit = self._gateway_visual_update_context_audit(decision)
+        if not context_audit:
+            return {}
+        image_path = self._gateway_visual_update_image_path(payload, context_audit)
+        if not image_path:
+            return {}
+        reason = str(getattr(decision, "reason", "") or "")
+        retrieval_text = reason or state.instruction
+        return self._memory_write_arguments(
+            payload,
+            {
+                "image_path": image_path,
+                "memory_source": "episode-local",
+                "note": retrieval_text,
+                "retrieval_text": retrieval_text,
+                "source_image_role": "gateway_visual_update",
+                "write_gate": {
+                    "candidate_reason": "gateway_visual_memory_update",
+                    "curator_decision": "write",
+                    "curator_reason": retrieval_text
+                    or "OpenClaw gateway visual memory update",
+                    "confidence": None,
+                },
+                "metadata": {
+                    "gateway_visual_memory_update_status": context_audit.get(
+                        "visual_memory_update_status"
+                    ),
+                    "gateway_planner_step_mode": context_audit.get("planner_step_mode"),
+                    "gateway_model_image_paths": list(
+                        context_audit.get("model_image_paths") or []
+                    ),
+                },
+            },
+        )
 
     def _auto_recall_memory(
         self,
@@ -656,6 +745,134 @@ class OpenClawVLNRuntime:
             state=state,
         )
 
+    def _smoke_seed_visual_readback_memory(
+        self,
+        state: VLNState,
+        payload: Dict[str, Any],
+        candidate_action: str,
+    ) -> List[Dict[str, Any]]:
+        if not self.config.visual_readback_smoke_seed_memory:
+            return []
+        if self.config.visual_readback_mode != "image_read_controller":
+            return []
+        trigger_rule = self._visual_readback_trigger_rule(candidate_action, payload)
+        if not trigger_rule:
+            return []
+        if self.tool_adapter.get_tool_schema("MemoryWriteSkill") is None:
+            return []
+        if self.tool_adapter.get_tool_schema("MemoryQuerySkill") is None:
+            return []
+        image_path = self._smoke_seed_image_path(payload)
+        if not image_path:
+            return []
+
+        write_arguments = self._memory_write_arguments(
+            payload,
+            {
+                "memory_source": self.config.memory_source,
+                "memory_scope": "episode",
+                "memory_namespace": self._episode_memory_namespace(state),
+                "step_id": state.step_id,
+                "image_path": image_path,
+                "source_image_role": "visual_readback_smoke_seed",
+                "note": "visual readback controlled smoke seed",
+                "caption": "visual readback controlled smoke seed",
+                "visual_observation": str(
+                    payload.get("visual_readback_smoke_observation")
+                    or state.instruction
+                    or "visual readback controlled smoke seed"
+                ),
+                "retrieval_text": self._smoke_seed_retrieval_text(
+                    state,
+                    payload,
+                    trigger_rule,
+                ),
+                "write_gate": {
+                    "candidate_reason": "visual_readback_smoke_seed_memory",
+                    "curator_decision": "write",
+                    "curator_reason": "controlled smoke fixture for image readback",
+                    "confidence": 1.0,
+                },
+                "metadata": {
+                    "visual_readback_smoke_seed_memory": True,
+                    "trigger_rule": trigger_rule,
+                    "candidate_action": candidate_action,
+                },
+            },
+        )
+        write_result = self.tool_adapter.call_tool(
+            "MemoryWriteSkill",
+            write_arguments,
+            state=state,
+        )
+        tool_calls = [write_result]
+        if not self._memory_write_succeeded(write_result):
+            return tool_calls
+        self._remember_written_visual_memory(write_result)
+
+        recall_arguments = self._memory_query_arguments(
+            state,
+            payload,
+            {
+                "text": self._smoke_seed_retrieval_text(
+                    state,
+                    payload,
+                    trigger_rule,
+                ),
+                "step_id": state.step_id,
+                "reason": "visual_readback_smoke_seed_memory",
+                "n_results": self.config.visual_readback_top_k,
+                "planner_reason": trigger_rule,
+                "allowed_scopes": ["episode"],
+                "memory_namespace": self._episode_memory_namespace(state),
+            },
+        )
+        recall_result = self.tool_adapter.call_tool(
+            "MemoryQuerySkill",
+            recall_arguments,
+            state=state,
+        )
+        tool_calls.append(recall_result)
+        payload["visual_readback_trigger_source"] = "controlled_smoke_seed"
+        payload["visual_readback_smoke_seed_memory"] = True
+        return tool_calls
+
+    def _smoke_seed_image_path(self, payload: Dict[str, Any]) -> str:
+        current_image_path = str(payload.get("current_image_path") or "")
+        recent_paths = payload.get("recent_keyframe_paths") or []
+        if isinstance(recent_paths, list):
+            for candidate in recent_paths:
+                candidate_path = str(candidate or "")
+                if candidate_path and candidate_path != current_image_path:
+                    return candidate_path
+        return current_image_path
+
+    def _smoke_seed_retrieval_text(
+        self,
+        state: VLNState,
+        payload: Dict[str, Any],
+        trigger_rule: str,
+    ) -> str:
+        parts = [
+            state.instruction,
+            payload.get("memory_query"),
+            payload.get("active_subgoal"),
+            trigger_rule,
+            "visual readback controlled smoke seed",
+        ]
+        return "\n".join(str(part) for part in parts if part)
+
+    def _memory_write_succeeded(self, tool_result: Dict[str, Any]) -> bool:
+        payload = tool_result.get("payload")
+        return bool(
+            tool_result.get("ok")
+            and isinstance(payload, dict)
+            and payload.get("written")
+        )
+
+    def _episode_memory_namespace(self, state: VLNState) -> str:
+        return f"episode:{state.scene_id}:{state.episode_id}"
+
     def _planner_visual_analysis_ran(self, decision) -> bool:
         planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
         if not isinstance(planner_runtime_metadata, dict):
@@ -664,6 +881,48 @@ class OpenClawVLNRuntime:
         if not isinstance(visual_analysis, dict):
             return False
         return bool(visual_analysis.get("ran"))
+
+    def _gateway_visual_update_context_audit(self, decision) -> Dict[str, Any]:
+        planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        if not isinstance(planner_runtime_metadata, dict):
+            return {}
+        context_audit = planner_runtime_metadata.get("context_audit") or {}
+        if not isinstance(context_audit, dict):
+            return {}
+        if context_audit.get("visual_memory_update_status") != "updated":
+            return {}
+        image_paths = [
+            path
+            for path in context_audit.get("model_image_paths") or []
+            if isinstance(path, str) and path
+        ]
+        if not image_paths:
+            return {}
+        audit = dict(context_audit)
+        audit["model_image_paths"] = image_paths
+        return audit
+
+    def _gateway_visual_update_image_path(
+        self,
+        payload: Dict[str, Any],
+        context_audit: Dict[str, Any],
+    ) -> str:
+        image_paths = [
+            path
+            for path in context_audit.get("model_image_paths") or []
+            if isinstance(path, str) and path
+        ]
+        if not image_paths:
+            return ""
+        current_image_path = payload.get("current_image_path")
+        if isinstance(current_image_path, str) and current_image_path in image_paths:
+            return current_image_path
+        keyframe_candidate = payload.get("keyframe_candidate") or {}
+        if isinstance(keyframe_candidate, dict):
+            candidate_path = keyframe_candidate.get("image_path")
+            if isinstance(candidate_path, str) and candidate_path in image_paths:
+                return candidate_path
+        return image_paths[0]
 
     def _image_paths_used(self, payload: Dict[str, Any]) -> List[str]:
         paths: List[str] = []
@@ -789,6 +1048,234 @@ class OpenClawVLNRuntime:
             for key, value in payload.items()
             if key in NAVIGATION_CONTEXT_KEYS
         }
+
+    def _control_only_visual_readback_enabled(self) -> bool:
+        return self.config.visual_readback_mode in {
+            "image_read_controller",
+            "current_only_controller",
+        }
+
+    def _clean_policy_payload(self, nav_payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in nav_payload.items()
+            if key not in {"active_subgoal", "memory_context_text", "memory_images"}
+        }
+
+    def _navigation_payload_has_memory(self, nav_payload: Dict[str, Any]) -> bool:
+        return bool(
+            nav_payload.get("active_subgoal")
+            or nav_payload.get("memory_context_text")
+            or nav_payload.get("memory_images")
+        )
+
+    def _run_visual_readback(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        tool_calls: List[Dict[str, Any]],
+        candidate_action: str,
+        policy_context_available: bool,
+        context_engine_context_available: bool,
+        final_policy_payload_has_memory: bool,
+    ) -> Dict[str, Any]:
+        if not self._control_only_visual_readback_enabled():
+            return {}
+        if self.tool_adapter.get_tool_schema("VisualMemoryReadSkill") is None:
+            return {}
+        trigger_rule = self._visual_readback_trigger_rule(
+            candidate_action,
+            runtime_payload,
+        )
+        base_trace = {
+            "mode": self.config.visual_readback_mode,
+            "trigger_source": str(
+                runtime_payload.get("visual_readback_trigger_source")
+                or "online_controller"
+            ),
+            "trigger_rule": trigger_rule,
+            "candidate_action": candidate_action,
+            "policy_context_available": policy_context_available,
+            "context_engine_context_available": context_engine_context_available,
+            "actual_policy_payload_merge": final_policy_payload_has_memory,
+            "used_by_policy": final_policy_payload_has_memory,
+            "readback_state_used_by_policy": False,
+            "final_policy_payload_has_memory": final_policy_payload_has_memory,
+        }
+        if not trigger_rule:
+            base_trace.update({"read_status": "skipped", "skip_reason": "no_trigger"})
+            return {"trace": base_trace, "tool_call": self._skipped_visual_readback_call(base_trace)}
+        current_image_path = str(runtime_payload.get("current_image_path") or "")
+        if not current_image_path:
+            base_trace.update(
+                {"read_status": "skipped", "skip_reason": "missing_current_image"}
+            )
+            return {"trace": base_trace, "tool_call": self._skipped_visual_readback_call(base_trace)}
+
+        memory_hits = []
+        if self.config.visual_readback_mode == "image_read_controller":
+            memory_hits = self._latest_memory_hits(tool_calls)
+        if self.config.visual_readback_mode == "image_read_controller" and not memory_hits:
+            base_trace.update({"read_status": "skipped", "skip_reason": "no_memory_hit"})
+            return {"trace": base_trace, "tool_call": self._skipped_visual_readback_call(base_trace)}
+
+        tool_call = self.tool_adapter.call_tool(
+            "VisualMemoryReadSkill",
+            {
+                "current_image_path": current_image_path,
+                "memory_hits": memory_hits,
+                "candidate_action": candidate_action,
+                "trigger_rule": trigger_rule,
+            },
+            state=state,
+        )
+        trace = dict(base_trace)
+        payload = tool_call.get("payload")
+        if isinstance(payload, dict):
+            trace.update(payload)
+        return {"trace": trace, "tool_call": tool_call}
+
+    def _apply_visual_readback_controller(
+        self,
+        candidate_action: str,
+        trace: Dict[str, Any],
+    ) -> str:
+        action = self._normalize_action_text(candidate_action) or "STOP"
+        trace.setdefault("controller_decision", "none")
+        trace.setdefault("fallback_policy", self.config.visual_readback_stop_fallback_policy)
+        trace.setdefault("fallback_source", "")
+        trace.setdefault("fallback_denominator", "")
+        trace.setdefault("stop_block_reason", "")
+        trace.setdefault("final_action", action)
+        trace.setdefault("controller_decision_changed_after_visual_read", False)
+        trace.setdefault("executed_action_changed_after_visual_read", False)
+        trace.setdefault("stop_blocked_after_visual_read", False)
+        trace.setdefault("current_view_stop_verification", False)
+        trace.setdefault("historical_memory_stop_causal", False)
+        trace.setdefault("replan_request_logged_after_visual_read", False)
+        trace["last_executed_non_stop_action"] = self.last_executed_non_stop_action
+        trace["last_executed_non_stop_action_age"] = self.last_executed_non_stop_action_age
+
+        labels = set(str(label) for label in trace.get("verifier_labels") or [])
+        high_confidence = float(trace.get("verifier_confidence") or 0.0) >= float(
+            self.config.visual_readback_high_confidence
+        )
+        if action == "STOP" and high_confidence and (
+            "goal_not_visible" in labels or "insufficient_evidence" in labels
+        ):
+            return self._apply_stop_block(action, trace, labels)
+        if action in {"TURN_LEFT", "TURN_RIGHT"} and high_confidence and "route_conflict" in labels:
+            trace["controller_decision"] = "log_replan_request"
+            trace["controller_decision_changed_after_visual_read"] = True
+            trace["replan_request_logged_after_visual_read"] = True
+        return action
+
+    def _apply_stop_block(
+        self,
+        action: str,
+        trace: Dict[str, Any],
+        labels: set[str],
+    ) -> str:
+        stop_reason = "goal_not_visible" if "goal_not_visible" in labels else "insufficient_evidence"
+        trace["stop_block_reason"] = stop_reason
+        trace["stop_blocked_after_visual_read"] = True
+        trace["current_view_stop_verification"] = True
+        trace["controller_decision_changed_after_visual_read"] = True
+        policy = self.config.visual_readback_stop_fallback_policy
+        trace["fallback_policy"] = policy
+        if policy == "previous_non_stop_else_move_forward":
+            fallback_action = self.last_executed_non_stop_action or "MOVE_FORWARD"
+            trace["controller_decision"] = "block_stop_executed"
+            trace["fallback_source"] = (
+                "previous_non_stop"
+                if self.last_executed_non_stop_action
+                else "default_move_forward"
+            )
+            trace["fallback_denominator"] = "executed_pilot"
+            trace["final_action"] = fallback_action
+            trace["executed_action_changed_after_visual_read"] = fallback_action != action
+            return fallback_action
+        trace["controller_decision"] = "block_stop_shadow"
+        trace["fallback_source"] = "log_only"
+        trace["fallback_denominator"] = "shadow_primary"
+        trace["final_action"] = action
+        trace["executed_action_changed_after_visual_read"] = False
+        return action
+
+    def _visual_readback_trigger_rule(
+        self,
+        candidate_action: str,
+        runtime_payload: Dict[str, Any],
+    ) -> str:
+        explicit = str(runtime_payload.get("visual_readback_trigger_rule") or "")
+        if explicit:
+            return explicit
+        action = self._normalize_action_text(candidate_action) or ""
+        if action == "STOP":
+            return "risky_stop"
+        if action in {"TURN_LEFT", "TURN_RIGHT"}:
+            return "decision_point"
+        return ""
+
+    def _latest_memory_hits(self, tool_calls: List[Dict[str, Any]]) -> List[Any]:
+        for call in reversed(tool_calls):
+            if call.get("tool_name") != "MemoryQuerySkill":
+                continue
+            payload = call.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            hits = payload.get("memory_hits") or []
+            return list(hits)
+        return []
+
+    def _skipped_visual_readback_call(self, trace: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "tool_name": "VisualMemoryReadSkill",
+            "result_type": "visual_memory_read",
+            "runtime_status": "skipped",
+            "latency_ms": 0.0,
+            "payload": dict(trace),
+            "error": None,
+        }
+
+    def _visual_readback_config_metadata(self) -> Dict[str, Any]:
+        return {
+            "visual_readback_mode": self.config.visual_readback_mode,
+            "visual_readback_top_k": self.config.visual_readback_top_k,
+            "visual_readback_timeout_ms": self.config.visual_readback_timeout_ms,
+            "visual_readback_low_confidence": self.config.visual_readback_low_confidence,
+            "visual_readback_high_confidence": self.config.visual_readback_high_confidence,
+            "visual_readback_shuffle_scope": self.config.visual_readback_shuffle_scope,
+            "visual_readback_shuffle_seed": self.config.visual_readback_shuffle_seed,
+            "visual_readback_control_only": self.config.visual_readback_control_only,
+            "visual_readback_fixed_case_manifest_path": (
+                self.config.visual_readback_fixed_case_manifest_path
+            ),
+            "visual_readback_stop_fallback_policy": (
+                self.config.visual_readback_stop_fallback_policy
+            ),
+            "visual_readback_smoke_seed_memory": (
+                self.config.visual_readback_smoke_seed_memory
+            ),
+        }
+
+    def _reset_stop_state_if_episode_changed(self, state: VLNState) -> None:
+        episode_key = (str(state.scene_id or ""), str(state.episode_id or ""))
+        if episode_key == self._stop_state_episode_key:
+            return
+        self._stop_state_episode_key = episode_key
+        self.last_executed_non_stop_action = ""
+        self.last_executed_non_stop_action_age = 0
+
+    def _update_stop_fallback_state(self, action_text: str) -> None:
+        action = self._normalize_action_text(action_text)
+        if action in {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"}:
+            self.last_executed_non_stop_action = action
+            self.last_executed_non_stop_action_age = 0
+            return
+        if self.last_executed_non_stop_action:
+            self.last_executed_non_stop_action_age += 1
 
     def _merge_navigation_context(
         self,
@@ -969,6 +1456,7 @@ class OpenClawVLNRuntime:
         runtime_context: Dict[str, Any],
         action_text: str,
         causal_recall: Optional[Dict[str, Any]] = None,
+        policy_payload_has_memory: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
         causal_recall = causal_recall or {}
@@ -997,6 +1485,14 @@ class OpenClawVLNRuntime:
                     hit_captions.append(caption)
             policy_context = payload.get("policy_context") or {}
             control_context = payload.get("control_context") or {}
+            used_by_policy = (
+                bool(policy_payload_has_memory)
+                if policy_payload_has_memory is not None
+                else bool(
+                    policy_context.get("memory_context_text")
+                    or policy_context.get("memory_images")
+                )
+            )
             action_before = (
                 causal_recall.get("action_before")
                 or self._normalize_action_text(runtime_context.get("policy_action"))
@@ -1032,10 +1528,7 @@ class OpenClawVLNRuntime:
                     ),
                     "used_by_planner": bool(causal_recall.get("after_decision"))
                     or before_decision.intent == "recall_memory",
-                    "used_by_policy": bool(
-                        policy_context.get("memory_context_text")
-                        or policy_context.get("memory_images")
-                    ),
+                    "used_by_policy": used_by_policy,
                     "used_by_critic": bool(control_context),
                     "planner_intent_before_recall": before_decision.intent,
                     "planner_intent_after_recall": after_decision.intent,

@@ -3,11 +3,16 @@ from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.gateway import FakeOpenClawGatewayClient, OpenClawGatewayError
 from harness.openclaw.planner import OpenClawPlanDecision, RuleOpenClawPlanner
 from harness.openclaw.runtime import OpenClawVLNRuntime
+from harness.memory.memory_manager import MemoryManager
 from harness.skill_registry import SkillRegistry
 from harness.skills.base import Skill
+from harness.skills.memory_query import MemoryQuerySkill
 from harness.skills.memory_write import MemoryWriteSkill
 from harness.skills.visual_memory_curator import VisualMemoryCuratorSkill
+from harness.types import MemoryHit
 from harness.types import SkillResult, VLNState
+from harness.config import HarnessConfig
+from harness.visual_readback.memory_smoke import ImageBackedLocalMemoryClient
 
 
 class EchoNavigationSkill(Skill):
@@ -32,6 +37,22 @@ class RecordingNavigationSkill(Skill):
     def run(self, state, payload):
         self.calls.append(dict(payload))
         return SkillResult.ok_result("action", {"action_text": "TURN_LEFT"})
+
+
+class SequenceNavigationSkill(Skill):
+    name = "NavigationPolicySkill"
+    description = "Returns configured actions in order."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self, actions):
+        self.actions = list(actions)
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        action = self.actions.pop(0) if self.actions else "STOP"
+        return SkillResult.ok_result("action", {"action_text": action})
 
 
 class EchoMemorySkill(Skill):
@@ -86,6 +107,103 @@ class MemoryContextSkill(Skill):
                     "memory_images": ["/tmp/doorway.png"],
                 },
             },
+        )
+
+
+class ImageMemoryContextSkill(Skill):
+    name = "MemoryQuerySkill"
+    description = "Returns image-backed policy memory context."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self, image_path):
+        self.image_path = image_path
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        hit = MemoryHit(
+            memory_id="m1",
+            memory_type="semantic_frame",
+            name="left opening",
+            confidence=0.8,
+            image_path=self.image_path,
+            evidence_text="left opening near landmark",
+        )
+        return SkillResult.ok_result(
+            "memory_query",
+            {
+                "memory_hits": [hit],
+                "query": payload.get("text", ""),
+                "policy_context": {
+                    "memory_context_text": "remember the left opening",
+                    "memory_images": [self.image_path],
+                },
+                "control_context": {"confidence": 0.8, "recall_confidence": 0.8},
+            },
+            confidence=0.8,
+        )
+
+
+class RecordingVisualReadSkill(Skill):
+    name = "VisualMemoryReadSkill"
+    description = "Records visual readback payload."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        return SkillResult.ok_result(
+            "visual_memory_read",
+            {
+                "read_status": "completed",
+                "trigger_rule": payload.get("trigger_rule"),
+                "candidate_action": payload.get("candidate_action"),
+                "retrieved_image_paths": [hit.image_path for hit in payload["memory_hits"]],
+                "actually_read_image_paths": [
+                    payload["current_image_path"],
+                    *[hit.image_path for hit in payload["memory_hits"]],
+                ],
+                "model_image_count": 1 + len(payload["memory_hits"]),
+                "attached_memory_ids": [hit.memory_id for hit in payload["memory_hits"]],
+                "matched_memory_ids": [hit.memory_id for hit in payload["memory_hits"]],
+                "verifier_labels": ["route_conflict"],
+                "readback_confidence": 0.9,
+                "verifier_confidence": 0.9,
+            },
+            confidence=0.9,
+        )
+
+
+class StopBlockedVisualReadSkill(Skill):
+    name = "VisualMemoryReadSkill"
+    description = "Returns goal-not-visible STOP evidence."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def run(self, state, payload):
+        return SkillResult.ok_result(
+            "visual_memory_read",
+            {
+                "read_status": "completed",
+                "trigger_rule": payload.get("trigger_rule"),
+                "candidate_action": payload.get("candidate_action"),
+                "retrieved_image_paths": [hit.image_path for hit in payload["memory_hits"]],
+                "actually_read_image_paths": [
+                    payload["current_image_path"],
+                    *[hit.image_path for hit in payload["memory_hits"]],
+                ],
+                "model_image_count": 1 + len(payload["memory_hits"]),
+                "attached_memory_ids": [hit.memory_id for hit in payload["memory_hits"]],
+                "matched_memory_ids": [hit.memory_id for hit in payload["memory_hits"]],
+                "verifier_labels": ["goal_not_visible"],
+                "readback_confidence": 0.95,
+                "verifier_confidence": 0.95,
+            },
+            confidence=0.95,
         )
 
 
@@ -697,6 +815,211 @@ def test_runtime_passes_memory_context_to_navigation_policy():
     assert navigation.calls[0]["memory_context_text"] == "kitchen"
 
 
+def test_v4_controller_readback_keeps_policy_payload_clean(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "left opening", "step_id": 4},
+        reason="decision_point",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    memory_skill = ImageMemoryContextSkill(str(memory))
+    visual_skill = RecordingVisualReadSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(memory_skill)
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_controller",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.ok is True
+    assert "memory_context_text" not in navigation.calls[0]
+    assert "memory_images" not in navigation.calls[0]
+    assert visual_skill.calls[0]["current_image_path"] == str(current)
+    assert visual_skill.calls[0]["candidate_action"] == "TURN_LEFT"
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["read_status"] == "completed"
+    assert visual_readback["trigger_rule"] == "decision_point"
+    assert visual_readback["policy_context_available"] is True
+    assert visual_readback["actual_policy_payload_merge"] is False
+    assert visual_readback["used_by_policy"] is False
+    assert visual_readback["readback_state_used_by_policy"] is False
+    assert visual_readback["final_policy_payload_has_memory"] is False
+    assert result.runtime_metadata["recall_usage"][0]["used_by_policy"] is False
+    assert result.action_text == "TURN_LEFT"
+
+
+def test_v4_smoke_seed_forces_image_hit_before_readback(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_text("current", encoding="utf-8")
+    config = HarnessConfig(
+        memory_backend="image_backed_local",
+        visual_readback_mode="image_read_controller",
+    )
+    config.visual_readback_smoke_seed_memory = True
+    memory_client = ImageBackedLocalMemoryClient(memory_source=config.memory_source)
+    memory_manager = MemoryManager(memory_client, config)
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason="ordinary_gateway_act",
+        planner_backend="gateway",
+    )
+    navigation = RecordingNavigationSkill()
+    visual_skill = RecordingVisualReadSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(MemoryWriteSkill(client=memory_client))
+    registry.register(MemoryQuerySkill(memory_manager))
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=config,
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    tool_names = [call["tool_name"] for call in result.runtime_metadata["tool_calls"]]
+    assert "MemoryWriteSkill" in tool_names
+    assert "MemoryQuerySkill" in tool_names
+    assert tool_names.index("NavigationPolicySkill") < tool_names.index("MemoryQuerySkill")
+    assert tool_names.index("MemoryQuerySkill") < tool_names.index("VisualMemoryReadSkill")
+    assert len(memory_client.records) == 1
+    assert visual_skill.calls[0]["current_image_path"] == str(current)
+    assert visual_skill.calls[0]["memory_hits"][0].image_path == str(current)
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["trigger_source"] == "controlled_smoke_seed"
+    assert visual_readback["read_status"] == "completed"
+    assert visual_readback["actually_read_image_paths"] == [str(current), str(current)]
+    assert visual_readback["matched_memory_ids"]
+    assert result.runtime_metadata["recall_usage"][0]["num_hits"] == 1
+    assert result.runtime_metadata["recall_usage"][0]["used_by_policy"] is False
+
+
+def test_v4_stop_block_defaults_to_shadow_log_only(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "goal", "step_id": 4},
+        reason="risky_stop",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["STOP"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(StopBlockedVisualReadSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_controller",
+            visual_readback_stop_fallback_policy="log_only",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "STOP"
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["controller_decision"] == "block_stop_shadow"
+    assert visual_readback["fallback_policy"] == "log_only"
+    assert visual_readback["fallback_denominator"] == "shadow_primary"
+    assert visual_readback["fallback_source"] == "log_only"
+    assert visual_readback["final_action"] == "STOP"
+    assert visual_readback["executed_action_changed_after_visual_read"] is False
+
+
+def test_v4_stop_block_executed_pilot_uses_previous_non_stop(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="NavigationPolicySkill",
+                arguments={},
+                reason="move",
+                planner_backend="gateway",
+            ),
+            OpenClawPlanDecision(
+                intent="recall_memory",
+                tool_name="MemoryQuerySkill",
+                arguments={"text": "goal", "step_id": 5},
+                reason="risky_stop",
+                planner_backend="gateway",
+            ),
+        ]
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["MOVE_FORWARD", "STOP"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(StopBlockedVisualReadSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_controller",
+            visual_readback_stop_fallback_policy="previous_non_stop_else_move_forward",
+        ),
+    )
+
+    first = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+    second = runtime.step(
+        make_state(step_id=5),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert first.action_text == "MOVE_FORWARD"
+    assert second.action_text == "MOVE_FORWARD"
+    visual_readback = second.runtime_metadata["visual_readback"]
+    assert visual_readback["controller_decision"] == "block_stop_executed"
+    assert visual_readback["fallback_denominator"] == "executed_pilot"
+    assert visual_readback["fallback_source"] == "previous_non_stop"
+    assert visual_readback["final_action"] == "MOVE_FORWARD"
+    assert visual_readback["executed_action_changed_after_visual_read"] is True
+
+
 def test_runtime_records_recall_usage_metadata():
     decision = OpenClawPlanDecision(
         intent="recall_memory",
@@ -848,6 +1171,75 @@ def test_runtime_auto_writes_and_recalls_planner_visual_analysis_for_policy():
     assert result.runtime_metadata["recall_usage"][0]["used_by_policy"] is True
     assert navigation.calls[0]["memory_context_text"] == "remember the bright doorway"
     assert "memory_images" not in navigation.calls[0]
+
+
+def test_runtime_bridges_gateway_visual_update_audit_into_image_memory_readback(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_text("current", encoding="utf-8")
+    config = HarnessConfig(
+        memory_backend="image_backed_local",
+        visual_readback_mode="image_read_controller",
+    )
+    memory_client = ImageBackedLocalMemoryClient(memory_source=config.memory_source)
+    memory_manager = MemoryManager(memory_client, config)
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason=(
+            "The doorway is visible on the left side of the image, so turn left "
+            "toward the exit."
+        ),
+        planner_backend="gateway",
+        runtime_metadata={
+            "context_audit": {
+                "planner_step_mode": "visual_update",
+                "visual_memory_update_status": "updated",
+                "model_image_paths": [str(current)],
+            }
+        },
+    )
+    navigation = RecordingNavigationSkill()
+    visual_skill = RecordingVisualReadSkill()
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(VisualMemoryCuratorSkill())
+    registry.register(MemoryWriteSkill(client=memory_client))
+    registry.register(MemoryQuerySkill(memory_manager))
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=config,
+    )
+
+    result = runtime.step(
+        make_state(step_id=0),
+        payload={"current_image_path": str(current)},
+    )
+
+    tool_names = [call["tool_name"] for call in result.runtime_metadata["tool_calls"]]
+    assert "MemoryWriteSkill" in tool_names
+    assert "MemoryQuerySkill" in tool_names
+    assert "VisualMemoryReadSkill" in tool_names
+    assert tool_names.index("MemoryWriteSkill") < tool_names.index("MemoryQuerySkill")
+    assert tool_names.index("MemoryQuerySkill") < tool_names.index("VisualMemoryReadSkill")
+    assert len(memory_client.records) == 1
+    assert memory_client.records[0]["image_path"] == str(current)
+    assert memory_client.records[0]["source_image_role"] == "gateway_visual_update"
+    assert memory_client.records[0]["metadata"]["gateway_visual_memory_update_status"] == (
+        "updated"
+    )
+    assert visual_skill.calls[0]["memory_hits"][0].image_path == str(current)
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["trigger_source"] == "online_controller"
+    assert visual_readback["read_status"] == "completed"
+    assert visual_readback["actually_read_image_paths"] == [str(current), str(current)]
+    assert visual_readback["matched_memory_ids"]
+    assert result.runtime_metadata["recall_usage"][0]["num_hits"] == 1
+    assert result.runtime_metadata["recall_usage"][0]["used_by_policy"] is False
 
 
 def test_runtime_supplies_auto_recalled_visual_memory_to_next_planner_call():
