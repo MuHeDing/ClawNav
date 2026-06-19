@@ -2,8 +2,14 @@ import json
 
 import pytest
 
+from scripts.build_event_gated_phase0_manifest import (
+    build_manifest_rows,
+    write_manifest as write_phase0_manifest,
+)
 from harness.visual_readback.manifest import (
     VisualReadbackManifestError,
+    compute_event_gated_phase0_manifest_sha256,
+    load_event_gated_phase0_manifest_jsonl,
     load_visual_readback_manifest,
     select_v5_replacement_hits,
 )
@@ -76,6 +82,42 @@ def write_manifest(tmp_path, doc):
     return path
 
 
+def phase0_seed(tmp_path):
+    source = tmp_path / "trace.jsonl"
+    source.write_text('{"ok": true}\n', encoding="utf-8")
+    return {
+        "cases": [{"scene_id": "s1", "episode_id": "e1", "max_steps": 100}],
+        "route_event_labels": {
+            "s1:e1": [{"event_type": "TURN_RIGHT", "step_id": 4}]
+        },
+        "shared_readback_trigger_keys": {"s1:e1": ["s1:e1:4:decision_point"]},
+        "accepted_step_tolerance": 2,
+        "phase0_stop_go_thresholds": {
+            "route_event_miss_rate_max": 0.0,
+            "exact_duplicate_rate_max": 0.1,
+            "adjacent_triplet_rate_max": 0.2,
+            "ambiguous_evidence_rate_max": 0.0,
+            "comparison_direction": "lower_is_better",
+            "invalid_comparison_behavior": "mark_invalid",
+        },
+        "selection_rules": "predeclared_test_seed",
+        "selection_seed": 123,
+        "trigger_key_source": "fixture",
+        "source_dataset_id": "dataset-v1",
+        "source_run_id": "run-1",
+        "source_file_hashes": {"trace.jsonl": "abc123"},
+    }
+
+
+def write_phase0_jsonl(tmp_path, rows):
+    path = tmp_path / "phase0.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_valid_manifest_loads_and_preserves_case_order(tmp_path):
     doc = manifest_doc(tmp_path)
     doc["cases"].append({**doc["cases"][0], "case_id": "case-2", "step_id": 5})
@@ -84,6 +126,95 @@ def test_valid_manifest_loads_and_preserves_case_order(tmp_path):
 
     assert manifest.manifest_version == "visual_readback_fixed_v1"
     assert [case["case_id"] for case in manifest.cases] == ["case-1", "case-2"]
+
+
+def test_event_gated_phase0_manifest_jsonl_validates_and_recomputes_hash(tmp_path):
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps(phase0_seed(tmp_path)), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "seed_file": str(seed_path),
+            "episode_key": [],
+            "route_event_labels_json": "",
+            "shared_readback_trigger_keys_json": "",
+            "phase0_stop_go_thresholds_json": "",
+            "source_file": [],
+            "max_steps": 100,
+            "accepted_step_tolerance": 2,
+            "selection_seed": 0,
+            "selection_rules": "",
+            "trigger_key_source": "",
+            "source_dataset_id": "",
+            "source_run_id": "",
+        },
+    )()
+    rows = build_manifest_rows(args)
+    output_path = tmp_path / "phase0_manifest.jsonl"
+
+    write_phase0_manifest(rows, output_path)
+    manifest = load_event_gated_phase0_manifest_jsonl(output_path)
+
+    assert manifest.manifest_schema_version == "event_gated_phase0_v1"
+    assert manifest.manifest_sha256 == rows[0]["manifest_sha256"]
+    assert compute_event_gated_phase0_manifest_sha256(rows) == rows[0]["manifest_sha256"]
+    assert manifest.cases[0]["phase0_stop_go_thresholds"]["comparison_direction"] == "lower_is_better"
+
+
+def test_event_gated_phase0_manifest_rejects_missing_thresholds(tmp_path):
+    row = phase0_seed(tmp_path)
+    case = row["cases"][0]
+    del row["phase0_stop_go_thresholds"]
+    rows = [
+        {
+            "manifest_schema_version": "event_gated_phase0_v1",
+            "scene_id": case["scene_id"],
+            "episode_id": case["episode_id"],
+            "max_steps": case["max_steps"],
+            "route_event_labels": row["route_event_labels"]["s1:e1"],
+            "accepted_step_tolerance": 2,
+            "shared_readback_trigger_keys": row["shared_readback_trigger_keys"]["s1:e1"],
+            "trigger_key_source": "fixture",
+            "selection_rules": "predeclared_test_seed",
+            "selection_seed": 123,
+            "source_dataset_id": "dataset-v1",
+            "source_run_id": "run-1",
+            "source_file_hashes": {"trace.jsonl": "abc123"},
+        }
+    ]
+
+    with pytest.raises(VisualReadbackManifestError, match="phase0_stop_go_thresholds"):
+        load_event_gated_phase0_manifest_jsonl(write_phase0_jsonl(tmp_path, rows))
+
+
+def test_event_gated_phase0_manifest_hash_changes_with_canonical_rows(tmp_path):
+    seed_path = tmp_path / "seed.json"
+    seed_path.write_text(json.dumps(phase0_seed(tmp_path)), encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "seed_file": str(seed_path),
+            "episode_key": [],
+            "route_event_labels_json": "",
+            "shared_readback_trigger_keys_json": "",
+            "phase0_stop_go_thresholds_json": "",
+            "source_file": [],
+            "max_steps": 100,
+            "accepted_step_tolerance": 2,
+            "selection_seed": 0,
+            "selection_rules": "",
+            "trigger_key_source": "",
+            "source_dataset_id": "",
+            "source_run_id": "",
+        },
+    )()
+    rows = build_manifest_rows(args)
+    original = rows[0]["manifest_sha256"]
+    rows[0]["accepted_step_tolerance"] = 3
+
+    assert compute_event_gated_phase0_manifest_sha256(rows) != original
 
 
 def test_manifest_rejects_missing_required_case_fields(tmp_path):

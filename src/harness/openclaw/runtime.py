@@ -1,12 +1,18 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Protocol
 
 from harness.config import HarnessConfig
 from harness.memory.context_engine import MemoryAwareContextEngine
 from harness.openclaw.executor import HabitatOpenClawExecutor
+from harness.openclaw.keyframe_gate import (
+    EventGatedKeyframeGate,
+    candidate_action_status_from_tool_result,
+)
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
 from harness.skill_registry import SkillRegistry
+from harness.types import MemoryHit
 from harness.types import VLNState
 
 
@@ -76,8 +82,15 @@ class OpenClawVLNRuntime:
         self.allow_planner_action_override = allow_planner_action_override
         self.config = config or HarnessConfig()
         self.recent_visual_memories: List[Dict[str, Any]] = []
+        self.event_gated_keyframe_ledger: List[Dict[str, Any]] = []
         self.max_recent_visual_memories = 10
         self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
+        self.keyframe_gate = EventGatedKeyframeGate(
+            min_gap_steps=self.config.keyframe_min_gap_steps,
+            episode_cap=self.config.keyframe_episode_cap,
+            coverage_gap_steps=self.config.keyframe_coverage_gap_steps,
+            debug_save_all_eligible=self.config.keyframe_debug_save_all_eligible,
+        )
         self._stop_state_episode_key = ("", "")
         self.last_executed_non_stop_action = ""
         self.last_executed_non_stop_action_age = 0
@@ -226,7 +239,10 @@ class OpenClawVLNRuntime:
                             include_memory_images=False,
                         )
 
-        if decision.intent != "write_memory":
+        if (
+            decision.intent != "write_memory"
+            and self.config.keyframe_policy_mode != "event_gated_smoke"
+        ):
             auto_write_calls = self._auto_write_visual_memory(state, runtime_payload, decision)
             if auto_write_calls:
                 tool_calls.extend(auto_write_calls)
@@ -305,6 +321,18 @@ class OpenClawVLNRuntime:
         tool_calls.append(nav_result)
 
         action_text = str(nav_result.get("payload", {}).get("action_text") or "STOP")
+        keyframe_gate = self._run_keyframe_gate(
+            state=state,
+            runtime_payload=runtime_payload,
+            nav_result=nav_result,
+        )
+        keyframe_write_call = self._write_event_gated_keyframe_memory(
+            state,
+            runtime_payload,
+            keyframe_gate,
+        )
+        if keyframe_write_call:
+            tool_calls.append(keyframe_write_call)
         smoke_seed_calls = self._smoke_seed_visual_readback_memory(
             state,
             runtime_payload,
@@ -327,6 +355,8 @@ class OpenClawVLNRuntime:
                 action_text,
                 visual_readback["trace"],
             )
+        if keyframe_gate:
+            self._finalize_keyframe_gate(keyframe_gate, action_text)
         metadata = self._metadata(
             decision,
             tool_calls,
@@ -342,6 +372,8 @@ class OpenClawVLNRuntime:
         metadata["planner_fallback"] = planner_fallback
         if planned_action_text and not self.allow_planner_action_override:
             metadata["planner_action_guidance"] = planned_action_text
+        if keyframe_gate:
+            metadata["keyframe_gate"] = keyframe_gate
         if visual_readback:
             metadata["visual_readback"] = visual_readback["trace"]
         if not nav_result.get("ok"):
@@ -751,6 +783,8 @@ class OpenClawVLNRuntime:
         payload: Dict[str, Any],
         candidate_action: str,
     ) -> List[Dict[str, Any]]:
+        if self.config.keyframe_policy_mode == "event_gated_smoke":
+            return []
         if not self.config.visual_readback_smoke_seed_memory:
             return []
         if self.config.visual_readback_mode != "image_read_controller":
@@ -1069,6 +1103,194 @@ class OpenClawVLNRuntime:
             or nav_payload.get("memory_images")
         )
 
+    def _run_keyframe_gate(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        nav_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if self.config.keyframe_policy_mode != "event_gated_smoke":
+            return {}
+        payload = nav_result.get("payload")
+        raw_action = ""
+        if isinstance(payload, dict):
+            raw_action = str(payload.get("action_text") or "")
+        gate = self.keyframe_gate.evaluate(
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+            step_id=state.step_id,
+            raw_candidate_action=raw_action,
+            candidate_action_status=candidate_action_status_from_tool_result(nav_result),
+            current_image_path=str(runtime_payload.get("current_image_path") or ""),
+            keyframe_target_path=str(runtime_payload.get("keyframe_target_path") or ""),
+        )
+        if gate.get("save_decision") == "save":
+            self._promote_keyframe(gate)
+        runtime_payload["keyframe_gate"] = gate
+        return gate
+
+    def _promote_keyframe(self, gate: Dict[str, Any]) -> None:
+        source = Path(str(gate.get("current_image_path") or ""))
+        target = Path(str(gate.get("keyframe_target_path") or ""))
+        if not source.exists():
+            gate["promotion_status"] = "failed"
+            gate["failure_reason"] = "missing_current_image"
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            gate["promotion_status"] = "failed"
+            gate["failure_reason"] = f"promotion_failed:{exc.__class__.__name__}"
+            return
+        gate["promotion_status"] = "promoted"
+        gate["promoted_image_path"] = str(target)
+
+    def _write_event_gated_keyframe_memory(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        gate: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not gate:
+            return None
+        if gate.get("save_decision") != "save":
+            return None
+        if gate.get("promotion_status") != "promoted":
+            return None
+        if self.tool_adapter.get_tool_schema("MemoryWriteSkill") is None:
+            gate["write_status"] = "unavailable"
+            gate["memory_id_link_status"] = "unavailable"
+            return None
+        write_payload = self._event_gated_keyframe_write_payload(
+            state,
+            runtime_payload,
+            gate,
+        )
+        write_result = self.tool_adapter.call_tool(
+            "MemoryWriteSkill",
+            write_payload,
+            state=state,
+        )
+        self._update_keyframe_gate_write_status(gate, write_result)
+        return write_result
+
+    def _event_gated_keyframe_write_payload(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        gate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        image_path = str(
+            gate.get("promoted_image_path")
+            or gate.get("keyframe_target_path")
+            or ""
+        )
+        retrieval_text = self._event_gated_keyframe_retrieval_text(
+            state,
+            runtime_payload,
+            gate,
+        )
+        metadata = {
+            "keyframe_gate": dict(gate),
+            "run_id": str(runtime_payload.get("run_id") or ""),
+            "scene_id": state.scene_id,
+            "episode_id": state.episode_id,
+            "step_id": state.step_id,
+            "image_path": image_path,
+            "source_image_role": "event_gated_keyframe",
+            "memory_namespace": self._episode_memory_namespace(state),
+        }
+        return {
+            "should_write": True,
+            "memory_source": self.config.memory_source,
+            "memory_scope": "episode",
+            "memory_namespace": self._episode_memory_namespace(state),
+            "run_id": str(runtime_payload.get("run_id") or ""),
+            "step_id": state.step_id,
+            "scene_id": state.scene_id,
+            "episode_id": state.episode_id,
+            "image_path": image_path,
+            "source_image_role": "event_gated_keyframe",
+            "retrieval_text": retrieval_text,
+            "action_context": retrieval_text,
+            "note": retrieval_text,
+            "write_gate": {
+                "candidate_reason": str(gate.get("save_reason") or ""),
+                "curator_decision": "write",
+                "curator_reason": "event-gated keyframe promotion",
+                "confidence": 1.0,
+            },
+            "metadata": metadata,
+        }
+
+    def _event_gated_keyframe_retrieval_text(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        gate: Dict[str, Any],
+    ) -> str:
+        parts = [
+            state.instruction,
+            runtime_payload.get("active_subgoal"),
+            gate.get("candidate_event_type"),
+            gate.get("normalized_candidate_action"),
+            gate.get("save_reason"),
+        ]
+        return "\n".join(str(part) for part in parts if part)
+
+    def _update_keyframe_gate_write_status(
+        self,
+        gate: Dict[str, Any],
+        write_result: Dict[str, Any],
+    ) -> None:
+        payload = write_result.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        if not write_result.get("ok"):
+            gate["write_status"] = "failed"
+            gate["memory_id_link_status"] = "failed"
+            gate["failure_reason"] = write_result.get("error") or "memory_write_failed"
+            return
+        if payload.get("written"):
+            gate["write_status"] = "written"
+            record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
+            memory_id = str(
+                payload.get("memory_id")
+                or record.get("memory_id")
+                or ""
+            )
+            if memory_id:
+                gate["memory_id"] = memory_id
+                gate["memory_id_link_status"] = "linked"
+            else:
+                gate["memory_id_link_status"] = "path_only"
+            if record:
+                self.event_gated_keyframe_ledger.append(dict(record))
+            return
+        gate["write_status"] = str(payload.get("error_type") or "skipped")
+        gate["memory_id_link_status"] = "not_linked"
+        gate["failure_reason"] = str(
+            payload.get("skip_reason") or payload.get("error") or "memory_write_not_written"
+        )
+
+    def _finalize_keyframe_gate(
+        self,
+        gate: Dict[str, Any],
+        final_action: str,
+    ) -> None:
+        candidate_event_type = str(gate.get("candidate_event_type") or "")
+        if candidate_event_type not in {"STOP", "TURN_LEFT", "TURN_RIGHT"}:
+            if candidate_event_type:
+                gate["controller_event_status"] = "not_applicable"
+            return
+        normalized_final = self._normalize_action_text(final_action) or ""
+        if normalized_final == candidate_event_type:
+            gate["confirmed_event_type"] = normalized_final
+            gate["controller_event_status"] = "confirmed_executed"
+        else:
+            gate["confirmed_event_type"] = normalized_final
+            gate["controller_event_status"] = "candidate_only"
+
     def _run_visual_readback(
         self,
         state: VLNState,
@@ -1113,10 +1335,26 @@ class OpenClawVLNRuntime:
             return {"trace": base_trace, "tool_call": self._skipped_visual_readback_call(base_trace)}
 
         memory_hits = []
-        if self.config.visual_readback_mode == "image_read_controller":
+        candidate_pool_trace: Dict[str, Any] = {}
+        if (
+            self.config.keyframe_policy_mode == "event_gated_smoke"
+            and self.config.visual_readback_mode == "image_read_controller"
+        ):
+            memory_hits, candidate_pool_trace = self._event_gated_smoke_candidate_pool(
+                state=state,
+                runtime_payload=runtime_payload,
+                current_image_path=current_image_path,
+            )
+            base_trace.update(candidate_pool_trace)
+        elif self.config.visual_readback_mode == "image_read_controller":
             memory_hits = self._latest_memory_hits(tool_calls)
         if self.config.visual_readback_mode == "image_read_controller" and not memory_hits:
-            base_trace.update({"read_status": "skipped", "skip_reason": "no_memory_hit"})
+            skip_reason = (
+                "no_eligible_prior_keyframe"
+                if self.config.keyframe_policy_mode == "event_gated_smoke"
+                else "no_memory_hit"
+            )
+            base_trace.update({"read_status": "skipped", "skip_reason": skip_reason})
             return {"trace": base_trace, "tool_call": self._skipped_visual_readback_call(base_trace)}
 
         tool_call = self.tool_adapter.call_tool(
@@ -1133,6 +1371,7 @@ class OpenClawVLNRuntime:
         payload = tool_call.get("payload")
         if isinstance(payload, dict):
             trace.update(payload)
+        trace.update(candidate_pool_trace)
         return {"trace": trace, "tool_call": tool_call}
 
     def _apply_visual_readback_controller(
@@ -1207,6 +1446,13 @@ class OpenClawVLNRuntime:
         candidate_action: str,
         runtime_payload: Dict[str, Any],
     ) -> str:
+        keyframe_gate = runtime_payload.get("keyframe_gate")
+        if (
+            self.config.keyframe_policy_mode == "event_gated_smoke"
+            and isinstance(keyframe_gate, dict)
+            and keyframe_gate.get("candidate_action_status") != "ok"
+        ):
+            return ""
         explicit = str(runtime_payload.get("visual_readback_trigger_rule") or "")
         if explicit:
             return explicit
@@ -1216,6 +1462,91 @@ class OpenClawVLNRuntime:
         if action in {"TURN_LEFT", "TURN_RIGHT"}:
             return "decision_point"
         return ""
+
+    def _event_gated_smoke_candidate_pool(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        current_image_path: str,
+    ) -> tuple[List[MemoryHit], Dict[str, Any]]:
+        requested_count = self.config.visual_readback_top_k
+        namespace = self._episode_memory_namespace(state)
+        run_id = str(runtime_payload.get("run_id") or "")
+        eligible_records = [
+            record
+            for record in self.event_gated_keyframe_ledger
+            if self._event_gated_record_is_eligible(
+                record=record,
+                state=state,
+                namespace=namespace,
+                run_id=run_id,
+                current_image_path=current_image_path,
+            )
+        ]
+        backend_returned = len(eligible_records)
+        unique_records = []
+        seen_paths = set()
+        duplicate_drop_count = 0
+        for record in eligible_records:
+            image_path = str(record.get("image_path") or "")
+            if image_path in seen_paths:
+                duplicate_drop_count += 1
+                continue
+            seen_paths.add(image_path)
+            unique_records.append(record)
+        attached_records = unique_records[:requested_count]
+        metrics = {
+            "candidate_pool_source": "local_event_gated_keyframe_ledger",
+            "candidate_pool_requested_count": requested_count,
+            "eligible_prior_keyframe_count": len(eligible_records),
+            "candidate_pool_backend_returned_count": backend_returned,
+            "candidate_pool_exact_duplicate_drop_count": duplicate_drop_count,
+            "candidate_pool_attached_count": len(attached_records),
+        }
+        return [self._memory_hit_from_event_gated_record(record) for record in attached_records], metrics
+
+    def _event_gated_record_is_eligible(
+        self,
+        record: Dict[str, Any],
+        state: VLNState,
+        namespace: str,
+        run_id: str,
+        current_image_path: str,
+    ) -> bool:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        record_run_id = str(record.get("run_id") or metadata.get("run_id") or "")
+        if run_id and record_run_id != run_id:
+            return False
+        if str(record.get("scene_id") or metadata.get("scene_id") or "") != str(state.scene_id):
+            return False
+        if str(record.get("episode_id") or metadata.get("episode_id") or "") != str(state.episode_id):
+            return False
+        if str(record.get("memory_namespace") or metadata.get("memory_namespace") or "") != namespace:
+            return False
+        if str(record.get("source_image_role") or metadata.get("source_image_role") or "") != "event_gated_keyframe":
+            return False
+        image_path = str(record.get("image_path") or metadata.get("image_path") or "")
+        if not image_path or image_path == current_image_path:
+            return False
+        try:
+            record_step = int(record.get("step_id", metadata.get("step_id")))
+        except (TypeError, ValueError):
+            return False
+        return record_step < state.step_id
+
+    def _memory_hit_from_event_gated_record(self, record: Dict[str, Any]) -> MemoryHit:
+        metadata = dict(record.get("metadata") or {})
+        return MemoryHit(
+            memory_id=str(record.get("memory_id") or ""),
+            memory_type=str(record.get("memory_type") or "semantic_frame"),
+            name=str(record.get("name") or record.get("retrieval_text") or "event gated keyframe"),
+            confidence=float(record.get("confidence") or 1.0),
+            evidence_text=str(record.get("retrieval_text") or record.get("note") or ""),
+            image_path=str(record.get("image_path") or ""),
+            note=str(record.get("note") or ""),
+            memory_source=str(record.get("memory_source") or self.config.memory_source),
+            metadata=metadata,
+        )
 
     def _latest_memory_hits(self, tool_calls: List[Dict[str, Any]]) -> List[Any]:
         for call in reversed(tool_calls):
@@ -1257,6 +1588,13 @@ class OpenClawVLNRuntime:
             ),
             "visual_readback_smoke_seed_memory": (
                 self.config.visual_readback_smoke_seed_memory
+            ),
+            "keyframe_policy_mode": self.config.keyframe_policy_mode,
+            "keyframe_min_gap_steps": self.config.keyframe_min_gap_steps,
+            "keyframe_episode_cap": self.config.keyframe_episode_cap,
+            "keyframe_coverage_gap_steps": self.config.keyframe_coverage_gap_steps,
+            "keyframe_debug_save_all_eligible": (
+                self.config.keyframe_debug_save_all_eligible
             ),
         }
 

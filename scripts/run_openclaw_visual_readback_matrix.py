@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
+from harness.visual_readback.manifest import load_event_gated_phase0_manifest_jsonl
+
 
 LOWMEM_ARGS = [
     "--num_history 8",
@@ -71,7 +73,113 @@ def build_phase1b_matrix(output_root: Path, manifest_path: Path) -> List[Dict[st
                 "claim_scope": "full_fixed_manifest",
             }
         )
+    runs.append(_phase_a_smoke_audit_control_run(output_root, manifest_path))
     return runs
+
+
+def _phase_a_smoke_audit_control_run(
+    output_root: Path,
+    manifest_path: Path,
+) -> Dict[str, object]:
+    name = "interval_10_smoke_audit_control"
+    args = [
+        *COMMON_ENV,
+        *COMMON_ARGS,
+        "--visual_readback_mode",
+        "image_read_controller",
+        "--visual_readback_fixed_case_manifest",
+        str(manifest_path),
+        "--visual_readback_control_only",
+        "true",
+        "--keyframe_policy_mode",
+        "interval",
+        "--output_path",
+        str(output_root / name),
+    ]
+    return {
+        "name": name,
+        "visual_readback_mode": "image_read_controller",
+        "effective_config": {
+            "keyframe_policy_mode": "interval",
+            "keyframe_interval_step": "10",
+            "visual_readback_mode": "image_read_controller",
+            "visual_readback_control_only": "1",
+            "visual_readback_fixed_case_manifest": str(manifest_path),
+            "memory_scope": "episode",
+            "source_image_role": "interval_smoke_audit_keyframe",
+            "memory_namespace_role": "interval_smoke_audit_control",
+            "readback_query_predicate": "prior_step_same_run_episode_namespace",
+            "exact_dedupe": "enabled",
+            "attachment_audit": "enabled",
+            "evidence_diagnostics": "enabled",
+            "candidate_pool_diagnostics": "smoke_audit_compatible",
+            "legacy_auto_write_bypass_scope": "interval_smoke_audit_namespace",
+        },
+        "command": ["bash", "-lc", " ".join(args)],
+        "claim_scope": "phase_a_retrieval_audit_control",
+    }
+
+
+def build_phase0b_interval_cleanup_matrix(
+    output_root: Path,
+    manifest_path: Path,
+) -> List[Dict[str, object]]:
+    manifest = load_event_gated_phase0_manifest_jsonl(manifest_path)
+    thresholds = dict(manifest.rows[0].get("phase0_stop_go_thresholds") or {})
+    interval_run_dir = output_root / "interval_10"
+    interval_args = [
+        *COMMON_ENV,
+        *COMMON_ARGS,
+        "--visual_readback_mode",
+        "image_read_controller",
+        "--output_path",
+        str(interval_run_dir),
+    ]
+    summary_args = [
+        *COMMON_ENV,
+        "/ssd/dingmuhe/anaconda3/envs/janusvln/bin/python",
+        "scripts/summarize_openclaw_visual_readback.py",
+        str(interval_run_dir),
+        "--format",
+        "json",
+        "--event_gated_phase0_manifest",
+        str(manifest_path),
+        "--expected_manifest_sha256",
+        manifest.manifest_sha256,
+        "--output",
+        str(output_root / "interval_10_exact_dedupe" / "summary.json"),
+    ]
+    return [
+        {
+            "name": "interval_10",
+            "visual_readback_mode": "image_read_controller",
+            "effective_config": {
+                "keyframe_policy_mode": "interval",
+                "keyframe_interval_step": "10",
+                "visual_readback_mode": "image_read_controller",
+                "event_gated_phase0_manifest_path": str(manifest_path),
+                "event_gated_phase0_manifest_sha256": manifest.manifest_sha256,
+                "phase0_stop_go_thresholds": thresholds,
+            },
+            "command": ["bash", "-lc", " ".join(interval_args)],
+            "claim_scope": "phase0_interval_baseline",
+        },
+        {
+            "name": "interval_10_exact_dedupe",
+            "visual_readback_mode": "image_read_controller",
+            "effective_config": {
+                "keyframe_policy_mode": "interval",
+                "keyframe_interval_step": "10",
+                "visual_readback_mode": "image_read_controller",
+                "event_gated_phase0_manifest_path": str(manifest_path),
+                "event_gated_phase0_manifest_sha256": manifest.manifest_sha256,
+                "phase0_stop_go_thresholds": thresholds,
+                "interval_cleanup_exact_dedupe": "summary_only",
+            },
+            "command": ["bash", "-lc", " ".join(summary_args)],
+            "claim_scope": "interval_cleanup_reporting_only",
+        },
+    ]
 
 
 def build_runner_plan(
@@ -97,6 +205,8 @@ def build_runner_plan(
                 "claim_scope": "phase0_audit_only",
             }
         ]
+    if phase == "phase0b":
+        return build_phase0b_interval_cleanup_matrix(Path(output_root), Path(manifest_path))
     if phase == "phase1a":
         return [_phase1a_run(output_root, "Phase1a_V4", "mechanism_validation")]
     if phase == "stop_only":
@@ -113,8 +223,10 @@ def validate_runner_request(
     gate_artifact_path: str = "",
     manifest_path: str = "",
 ) -> None:
-    if phase not in {"phase0", "phase1a", "phase1b", "stop_only", "turn_only"}:
+    if phase not in {"phase0", "phase0b", "phase1a", "phase1b", "stop_only", "turn_only"}:
         raise ValueError(f"unsupported visual readback runner phase: {phase}")
+    if phase == "phase0b" and not manifest_path:
+        raise ValueError("phase0b requires an event-gated Phase 0 manifest")
     if phase == "phase1b":
         if not gate_artifact_path:
             raise ValueError("phase1b requires a phase0 gate artifact")
@@ -164,7 +276,11 @@ def _read_gate_artifact(path: str) -> Dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", choices=["phase0", "phase1a", "phase1b", "stop_only", "turn_only"], required=True)
+    parser.add_argument(
+        "--phase",
+        choices=["phase0", "phase0b", "phase1a", "phase1b", "stop_only", "turn_only"],
+        required=True,
+    )
     parser.add_argument("--output_root", default="results/openclaw_visual_readback")
     parser.add_argument("--phase0_gate_artifact", default="")
     parser.add_argument("--manifest_path", default="")

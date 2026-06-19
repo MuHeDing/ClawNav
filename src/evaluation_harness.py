@@ -122,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual_readback_fixed_case_manifest", type=str, default=None)
     parser.add_argument("--visual_readback_stop_fallback_policy", type=str, default=None)
     parser.add_argument("--visual_readback_smoke_seed_memory", type=parse_bool, default=None)
+    parser.add_argument("--keyframe_policy_mode", type=str, default=None)
+    parser.add_argument("--keyframe_min_gap_steps", type=int, default=None)
+    parser.add_argument("--keyframe_episode_cap", type=int, default=None)
+    parser.add_argument("--keyframe_coverage_gap_steps", type=int, default=None)
+    parser.add_argument("--keyframe_debug_save_all_eligible", type=parse_bool, default=None)
     return parser
 
 
@@ -282,6 +287,41 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             "visual_readback_smoke_seed_memory",
             "OPENCLAW_VISUAL_READBACK_SMOKE_SEED_MEMORY",
             defaults.visual_readback_smoke_seed_memory,
+            parse_visual_readback_bool,
+        ),
+        keyframe_policy_mode=_config_value(
+            args,
+            "keyframe_policy_mode",
+            "OPENCLAW_KEYFRAME_POLICY_MODE",
+            defaults.keyframe_policy_mode,
+            str,
+        ),
+        keyframe_min_gap_steps=_config_value(
+            args,
+            "keyframe_min_gap_steps",
+            "OPENCLAW_KEYFRAME_MIN_GAP_STEPS",
+            defaults.keyframe_min_gap_steps,
+            int,
+        ),
+        keyframe_episode_cap=_config_value(
+            args,
+            "keyframe_episode_cap",
+            "OPENCLAW_KEYFRAME_EPISODE_CAP",
+            defaults.keyframe_episode_cap,
+            int,
+        ),
+        keyframe_coverage_gap_steps=_config_value(
+            args,
+            "keyframe_coverage_gap_steps",
+            "OPENCLAW_KEYFRAME_COVERAGE_GAP_STEPS",
+            defaults.keyframe_coverage_gap_steps,
+            int,
+        ),
+        keyframe_debug_save_all_eligible=_config_value(
+            args,
+            "keyframe_debug_save_all_eligible",
+            "OPENCLAW_KEYFRAME_DEBUG_SAVE_ALL_ELIGIBLE",
+            defaults.keyframe_debug_save_all_eligible,
             parse_visual_readback_bool,
         ),
     )
@@ -451,6 +491,7 @@ class HarnessModelProxy:
                 self._runtime_payload(images, step_id),
             )
             action_text = runtime_result.action_text if runtime_result.ok else "STOP"
+            self._remember_promoted_keyframe_from_runtime(runtime_result)
             self.last_action_text = action_text
             self._append_working_memory(images, action_text)
             self._log_runtime_step(state, runtime_result, action_text)
@@ -475,8 +516,16 @@ class HarnessModelProxy:
             "recent_frames": list(images[:-1]),
             "policy_action": self.last_action_text,
             "run_id": str(self.components.get("output_path") or ""),
+            "keyframe_policy_mode": self.components["config"].keyframe_policy_mode,
         }
-        if self.components["working_memory"].should_promote_keyframe(step_id):
+        keyframe_target_path = self._keyframe_target_path(current_image, step_id)
+        payload["keyframe_target_path"] = keyframe_target_path
+        if self.components["config"].keyframe_policy_mode == "event_gated_smoke":
+            payload["current_image_path"] = self._save_current_image_if_needed(
+                current_image,
+                step_id,
+            )
+        elif self.components["working_memory"].should_promote_keyframe(step_id):
             image_path = self._save_keyframe_if_needed(current_image, step_id)
             if image_path:
                 self._remember_keyframe_path(image_path)
@@ -504,15 +553,23 @@ class HarnessModelProxy:
     def _save_image_artifact(self, image, root_dir_name: str, step_id: int) -> str:
         if image is None:
             return ""
-        image_dir = self._episode_artifact_dir(root_dir_name)
-        image_dir.mkdir(parents=True, exist_ok=True)
+        path = self._image_artifact_path(image, root_dir_name, step_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
         if hasattr(image, "save"):
-            path = image_dir / f"step_{step_id:06d}.png"
             image.save(path)
         else:
-            path = image_dir / f"step_{step_id:06d}.txt"
             path.write_text(str(image), encoding="utf-8")
         return str(path)
+
+    def _keyframe_target_path(self, image, step_id: int) -> str:
+        if image is None:
+            return ""
+        return str(self._image_artifact_path(image, "keyframes", step_id))
+
+    def _image_artifact_path(self, image, root_dir_name: str, step_id: int) -> Path:
+        image_dir = self._episode_artifact_dir(root_dir_name)
+        suffix = "png" if hasattr(image, "save") else "txt"
+        return image_dir / f"step_{step_id:06d}.{suffix}"
 
     def _episode_artifact_dir(self, root_dir_name: str) -> Path:
         root_dir = Path(self.components["output_path"]) / root_dir_name
@@ -530,6 +587,33 @@ class HarnessModelProxy:
             return
         self.recent_keyframe_paths.append(image_path)
         self.recent_keyframe_paths = self.recent_keyframe_paths[-8:]
+
+    def _remember_promoted_keyframe_from_runtime(self, runtime_result) -> None:
+        metadata = getattr(runtime_result, "runtime_metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            return
+        gate = metadata.get("keyframe_gate") or {}
+        if not isinstance(gate, dict):
+            return
+        if gate.get("promotion_status") != "promoted":
+            return
+        if gate.get("write_status") in {
+            "failed",
+            "write_failed",
+            "memory_write_failed",
+            "skipped",
+            "unavailable",
+            "invalid_event_gated_keyframe_write",
+        }:
+            return
+        image_path = str(
+            gate.get("promoted_image_path")
+            or gate.get("keyframe_image_path")
+            or gate.get("image_path")
+            or ""
+        )
+        if image_path:
+            self._remember_keyframe_path(image_path)
 
     def consume_last_visual_prune_profile(self):
         return self.base_model.consume_last_visual_prune_profile()

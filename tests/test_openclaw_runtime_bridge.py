@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
 from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.gateway import FakeOpenClawGatewayClient, OpenClawGatewayError
@@ -53,6 +55,17 @@ class SequenceNavigationSkill(Skill):
         self.calls.append(dict(payload))
         action = self.actions.pop(0) if self.actions else "STOP"
         return SkillResult.ok_result("action", {"action_text": action})
+
+
+class FailingNavigationSkill(Skill):
+    name = "NavigationPolicySkill"
+    description = "Fails without returning an action."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def run(self, state, payload):
+        del state, payload
+        return SkillResult.error_result("navigation_failed", result_type="action")
 
 
 class EchoMemorySkill(Skill):
@@ -918,6 +931,284 @@ def test_v4_smoke_seed_forces_image_hit_before_readback(tmp_path):
     assert visual_readback["matched_memory_ids"]
     assert result.runtime_metadata["recall_usage"][0]["num_hits"] == 1
     assert result.runtime_metadata["recall_usage"][0]["used_by_policy"] is False
+
+
+def test_event_gated_smoke_gate_promotes_turn_candidate_with_queryable_memory_write(tmp_path):
+    current = tmp_path / "current.png"
+    target = tmp_path / "keyframes" / "s1" / "e1" / "step_000004.png"
+    current.write_text("current-frame", encoding="utf-8")
+    memory_client = ImageBackedLocalMemoryClient()
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason="ordinary_gateway_act",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["TURN_RIGHT"]))
+    registry.register(MemoryWriteSkill(client=memory_client))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            keyframe_policy_mode="event_gated_smoke",
+            visual_readback_mode="off",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={
+            "run_id": str(tmp_path / "run-1"),
+            "current_image_path": str(current),
+            "keyframe_target_path": str(target),
+        },
+    )
+
+    assert result.ok is True
+    keyframe_gate = result.runtime_metadata["keyframe_gate"]
+    assert keyframe_gate["save_decision"] == "save"
+    assert keyframe_gate["save_reason"] == "candidate_decision_point"
+    assert keyframe_gate["candidate_event_type"] == "TURN_RIGHT"
+    assert keyframe_gate["promotion_status"] == "promoted"
+    assert keyframe_gate["promoted_image_path"] == str(target)
+    assert keyframe_gate["write_status"] == "written"
+    assert keyframe_gate["memory_id"] == "image-backed-local-0"
+    assert keyframe_gate["memory_id_link_status"] == "linked"
+    assert keyframe_gate["controller_event_status"] == "confirmed_executed"
+    assert target.read_text(encoding="utf-8") == "current-frame"
+    assert "MemoryWriteSkill" in [
+        call["tool_name"] for call in result.runtime_metadata["tool_calls"]
+    ]
+    assert len(memory_client.records) == 1
+    record = memory_client.records[0]
+    assert record["source_image_role"] == "event_gated_keyframe"
+    assert record["metadata"]["keyframe_gate"]["candidate_event_type"] == "TURN_RIGHT"
+    assert record["metadata"]["run_id"] == str(tmp_path / "run-1")
+
+
+def test_event_gated_smoke_gate_memory_write_failure_does_not_abort(tmp_path):
+    class FailingClient:
+        def ingest_semantic(self, payload):
+            del payload
+            raise RuntimeError("backend down")
+
+    current = tmp_path / "current.png"
+    target = tmp_path / "keyframes" / "s1" / "e1" / "step_000004.png"
+    current.write_text("current-frame", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason="ordinary_gateway_act",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["TURN_RIGHT"]))
+    registry.register(MemoryWriteSkill(client=FailingClient()))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            keyframe_policy_mode="event_gated_smoke",
+            visual_readback_mode="off",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={
+            "run_id": str(tmp_path / "run-1"),
+            "current_image_path": str(current),
+            "keyframe_target_path": str(target),
+        },
+    )
+
+    assert result.ok is True
+    keyframe_gate = result.runtime_metadata["keyframe_gate"]
+    assert keyframe_gate["promotion_status"] == "promoted"
+    assert keyframe_gate["write_status"] == "memory_write_failed"
+    assert keyframe_gate["memory_id_link_status"] == "not_linked"
+    assert "backend down" in keyframe_gate["failure_reason"]
+
+
+def test_event_gated_smoke_gate_failed_action_does_not_create_fallback_stop_keyframe(tmp_path):
+    current = tmp_path / "current.png"
+    target = tmp_path / "keyframes" / "s1" / "e1" / "step_000004.png"
+    current.write_text("current-frame", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason="ordinary_gateway_act",
+        planner_backend="gateway",
+    )
+    visual_skill = RecordingVisualReadSkill()
+    registry = SkillRegistry()
+    registry.register(FailingNavigationSkill())
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            keyframe_policy_mode="event_gated_smoke",
+            visual_readback_mode="image_read_controller",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={
+            "run_id": str(tmp_path / "run-1"),
+            "current_image_path": str(current),
+            "keyframe_target_path": str(target),
+        },
+    )
+
+    assert result.ok is False
+    keyframe_gate = result.runtime_metadata["keyframe_gate"]
+    assert keyframe_gate["save_decision"] == "skip"
+    assert keyframe_gate["skip_reason"] == "candidate_action_failed"
+    assert not target.exists()
+    assert result.runtime_metadata["visual_readback"]["read_status"] == "skipped"
+    assert result.runtime_metadata["visual_readback"]["skip_reason"] == "no_trigger"
+    assert visual_skill.calls == []
+
+
+def test_event_gated_smoke_bypasses_legacy_smoke_seed_write(tmp_path):
+    current = tmp_path / "current.png"
+    target = tmp_path / "keyframes" / "s1" / "e1" / "step_000004.png"
+    current.write_text("current-frame", encoding="utf-8")
+    config = HarnessConfig(
+        memory_backend="image_backed_local",
+        keyframe_policy_mode="event_gated_smoke",
+        visual_readback_mode="image_read_controller",
+    )
+    config.visual_readback_smoke_seed_memory = True
+    memory_client = ImageBackedLocalMemoryClient(memory_source=config.memory_source)
+    memory_manager = MemoryManager(memory_client, config)
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason="ordinary_gateway_act",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["TURN_LEFT"]))
+    registry.register(MemoryWriteSkill(client=memory_client))
+    registry.register(MemoryQuerySkill(memory_manager))
+    registry.register(RecordingVisualReadSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=config,
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={
+            "run_id": str(tmp_path / "run-1"),
+            "current_image_path": str(current),
+            "keyframe_target_path": str(target),
+        },
+    )
+
+    tool_names = [call["tool_name"] for call in result.runtime_metadata["tool_calls"]]
+    assert tool_names.count("MemoryWriteSkill") == 1
+    assert len(memory_client.records) == 1
+    assert memory_client.records[0]["source_image_role"] == "event_gated_keyframe"
+    assert memory_client.records[0]["metadata"]["keyframe_gate"]["save_reason"] == (
+        "candidate_decision_point"
+    )
+    assert result.runtime_metadata["keyframe_gate"]["promotion_status"] == "promoted"
+
+
+def test_event_gated_smoke_readback_uses_only_prior_eligible_keyframes(tmp_path):
+    config = HarnessConfig(
+        memory_backend="image_backed_local",
+        keyframe_policy_mode="event_gated_smoke",
+        visual_readback_mode="image_read_controller",
+    )
+    memory_client = ImageBackedLocalMemoryClient(memory_source=config.memory_source)
+    memory_manager = MemoryManager(memory_client, config)
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="NavigationPolicySkill",
+                arguments={},
+                reason="first turn",
+                planner_backend="gateway",
+            ),
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="NavigationPolicySkill",
+                arguments={},
+                reason="stop check",
+                planner_backend="gateway",
+            ),
+        ]
+    )
+    visual_skill = RecordingVisualReadSkill()
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["TURN_LEFT", "STOP"]))
+    registry.register(MemoryWriteSkill(client=memory_client))
+    registry.register(MemoryQuerySkill(memory_manager))
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=config,
+    )
+    current1 = tmp_path / "current1.png"
+    current2 = tmp_path / "current2.png"
+    target1 = tmp_path / "keyframes" / "s1" / "e1" / "step_000001.png"
+    target2 = tmp_path / "keyframes" / "s1" / "e1" / "step_000002.png"
+    current1.write_text("first", encoding="utf-8")
+    current2.write_text("second", encoding="utf-8")
+
+    first = runtime.step(
+        make_state(step_id=1),
+        payload={
+            "run_id": str(tmp_path / "run-1"),
+            "current_image_path": str(current1),
+            "keyframe_target_path": str(target1),
+        },
+    )
+    second = runtime.step(
+        make_state(step_id=2),
+        payload={
+            "run_id": str(tmp_path / "run-1"),
+            "current_image_path": str(current2),
+            "keyframe_target_path": str(target2),
+        },
+    )
+
+    assert first.runtime_metadata["visual_readback"]["read_status"] == "skipped"
+    assert first.runtime_metadata["visual_readback"]["eligible_prior_keyframe_count"] == 0
+    assert second.runtime_metadata["visual_readback"]["read_status"] == "completed"
+    assert second.runtime_metadata["visual_readback"]["eligible_prior_keyframe_count"] == 1
+    assert second.runtime_metadata["visual_readback"]["candidate_pool_backend_returned_count"] == 1
+    assert second.runtime_metadata["visual_readback"]["candidate_pool_attached_count"] == 1
+    assert second.runtime_metadata["visual_readback"]["candidate_pool_exact_duplicate_drop_count"] == 0
+    assert visual_skill.calls[-1]["memory_hits"][0].image_path == str(target1)
+    assert visual_skill.calls[-1]["memory_hits"][0].metadata["step_id"] == 1
+    assert visual_skill.calls[-1]["memory_hits"][0].metadata["source_image_role"] == (
+        "event_gated_keyframe"
+    )
 
 
 def test_v4_stop_block_defaults_to_shadow_log_only(tmp_path):

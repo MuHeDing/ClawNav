@@ -99,6 +99,25 @@ def run_image_backed_memory_smoke(
 
 
 def _memory_hit_from_record(record: Dict[str, Any]) -> MemoryHit:
+    metadata = dict(record.get("metadata") or {})
+    metadata.update(
+        {
+            "memory_scope": str(record.get("memory_scope") or "episode"),
+            "memory_namespace": str(record.get("memory_namespace") or ""),
+            "run_id": str(record.get("run_id") or metadata.get("run_id") or ""),
+            "scene_id": str(record.get("scene_id") or metadata.get("scene_id") or ""),
+            "episode_id": str(
+                record.get("episode_id") or metadata.get("episode_id") or ""
+            ),
+            "step_id": record.get("step_id", metadata.get("step_id")),
+            "image_path": str(record.get("image_path") or metadata.get("image_path") or ""),
+            "source_image_role": str(
+                record.get("source_image_role")
+                or metadata.get("source_image_role")
+                or ""
+            ),
+        }
+    )
     return MemoryHit(
         memory_id=str(record.get("memory_id") or ""),
         memory_type=str(record.get("memory_type") or "semantic_frame"),
@@ -110,8 +129,5 @@ def _memory_hit_from_record(record: Dict[str, Any]) -> MemoryHit:
         note=str(record.get("note") or ""),
         timestamp=record.get("timestamp"),
         memory_source=str(record.get("memory_source") or "episode-local"),
-        metadata={
-            "memory_scope": str(record.get("memory_scope") or "episode"),
-            "memory_namespace": str(record.get("memory_namespace") or ""),
-        },
+        metadata=metadata,
     )

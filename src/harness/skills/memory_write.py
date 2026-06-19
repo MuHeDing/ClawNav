@@ -36,6 +36,8 @@ class MemoryWriteSkill(Skill):
             "memory_scope": {"type": "string"},
             "memory_namespace": {"type": "string"},
             "source_image_role": {"type": "string"},
+            "run_id": {"type": "string"},
+            "action_context": {"type": "string"},
             "write_gate": {"type": "object"},
             "metadata": {"type": "object"},
         },
@@ -82,16 +84,46 @@ class MemoryWriteSkill(Skill):
                 "memory_write",
                 self._skip_payload(state, payload, memory_source, skip_reason),
             )
+        contract_error = self._event_gated_keyframe_contract_error(
+            state,
+            payload,
+        )
+        if contract_error:
+            failed_payload = self._skip_payload(
+                state,
+                payload,
+                memory_source,
+                contract_error,
+            )
+            failed_payload["error_type"] = "invalid_event_gated_keyframe_write"
+            return SkillResult.ok_result("memory_write", failed_payload)
 
         record = self._build_record(state, payload, memory_source)
+        if self.client is not None:
+            try:
+                response = self.client.ingest_semantic(record)
+            except Exception as exc:
+                return SkillResult.ok_result(
+                    "memory_write",
+                    {
+                        "written": False,
+                        "skipped": False,
+                        "error_type": "memory_write_failed",
+                        "error": str(exc),
+                        "record": record,
+                    },
+                )
+            if isinstance(response, dict) and response.get("memory_id"):
+                record["memory_id"] = str(response["memory_id"])
         if self.store is not None:
             self.store.append(record)
-        if self.client is not None:
-            self.client.ingest_semantic(record)
 
+        payload_out = {"written": True, "record": record}
+        if record.get("memory_id"):
+            payload_out["memory_id"] = record["memory_id"]
         return SkillResult.ok_result(
             "memory_write",
-            {"written": True, "record": record},
+            payload_out,
             confidence=1.0,
         )
 
@@ -101,11 +133,13 @@ class MemoryWriteSkill(Skill):
         payload: Dict[str, Any],
         memory_source: str,
     ) -> Dict[str, Any]:
+        metadata = self._record_metadata(state, payload, memory_source)
         return {
             "write_type": payload.get("write_type", "episodic_keyframe"),
             "step_id": payload.get("step_id", getattr(state, "step_id", None)),
             "scene_id": payload.get("scene_id", getattr(state, "scene_id", None)),
             "episode_id": payload.get("episode_id", getattr(state, "episode_id", None)),
+            "run_id": payload.get("run_id") or metadata.get("run_id", ""),
             "image_path": payload.get("image_path"),
             "note": payload.get("note", ""),
             "caption": payload.get("caption", ""),
@@ -123,7 +157,7 @@ class MemoryWriteSkill(Skill):
             "source_image_role": payload.get("source_image_role", "keyframe"),
             "write_gate": dict(payload.get("write_gate") or {}),
             "memory_source": memory_source,
-            "metadata": payload.get("metadata", {}),
+            "metadata": metadata,
         }
 
     def _write_gate_skip_reason(self, payload: Dict[str, Any]) -> str:
@@ -154,6 +188,71 @@ class MemoryWriteSkill(Skill):
             "caption": payload.get("caption", ""),
             "visual_observation": payload.get("visual_observation", ""),
         }
+
+    def _event_gated_keyframe_contract_error(
+        self,
+        state: Any,
+        payload: Dict[str, Any],
+    ) -> str:
+        if str(payload.get("source_image_role") or "") != "event_gated_keyframe":
+            return ""
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        keyframe_gate = metadata.get("keyframe_gate")
+        required_values = {
+            "step_id": payload.get("step_id", getattr(state, "step_id", None)),
+            "scene_id": payload.get("scene_id", getattr(state, "scene_id", None)),
+            "episode_id": payload.get("episode_id", getattr(state, "episode_id", None)),
+            "image_path": payload.get("image_path"),
+            "memory_scope": payload.get("memory_scope"),
+            "memory_namespace": payload.get("memory_namespace"),
+            "run_id": payload.get("run_id") or metadata.get("run_id"),
+        }
+        missing = [
+            key
+            for key, value in required_values.items()
+            if value is None or str(value) == ""
+        ]
+        if missing:
+            return "missing required event_gated_keyframe fields: " + ", ".join(missing)
+        if not isinstance(keyframe_gate, dict) or not keyframe_gate:
+            return "missing required event_gated_keyframe fields: metadata.keyframe_gate"
+        if not (
+            payload.get("retrieval_text")
+            or payload.get("action_context")
+            or payload.get("visual_observation")
+            or payload.get("caption")
+            or payload.get("note")
+        ):
+            return (
+                "missing required event_gated_keyframe fields: "
+                "retrieval_text_or_action_context"
+            )
+        return ""
+
+    def _record_metadata(
+        self,
+        state: Any,
+        payload: Dict[str, Any],
+        memory_source: str,
+    ) -> Dict[str, Any]:
+        metadata = payload.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        fields = {
+            "run_id": payload.get("run_id") or metadata.get("run_id", ""),
+            "step_id": payload.get("step_id", getattr(state, "step_id", None)),
+            "scene_id": payload.get("scene_id", getattr(state, "scene_id", None)),
+            "episode_id": payload.get("episode_id", getattr(state, "episode_id", None)),
+            "image_path": payload.get("image_path"),
+            "memory_scope": payload.get("memory_scope", "episode"),
+            "memory_namespace": payload.get("memory_namespace")
+            or self._default_namespace(state, payload, memory_source),
+            "source_image_role": payload.get("source_image_role", "keyframe"),
+        }
+        for key, value in fields.items():
+            if value is not None and str(value) != "":
+                metadata.setdefault(key, value)
+        return metadata
 
     def _build_retrieval_text(self, payload: Dict[str, Any]) -> str:
         parts = []

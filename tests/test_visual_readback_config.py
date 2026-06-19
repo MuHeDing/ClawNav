@@ -41,6 +41,11 @@ def make_args(**overrides):
         "visual_readback_fixed_case_manifest": None,
         "visual_readback_stop_fallback_policy": None,
         "visual_readback_smoke_seed_memory": None,
+        "keyframe_policy_mode": None,
+        "keyframe_min_gap_steps": None,
+        "keyframe_episode_cap": None,
+        "keyframe_coverage_gap_steps": None,
+        "keyframe_debug_save_all_eligible": None,
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -60,6 +65,11 @@ def test_visual_readback_defaults_are_off_and_log_only():
     assert config.visual_readback_fixed_case_manifest_path == ""
     assert config.visual_readback_stop_fallback_policy == "log_only"
     assert getattr(config, "visual_readback_smoke_seed_memory", None) is False
+    assert config.keyframe_policy_mode == "interval"
+    assert config.keyframe_min_gap_steps == 5
+    assert config.keyframe_episode_cap == 64
+    assert config.keyframe_coverage_gap_steps == 20
+    assert config.keyframe_debug_save_all_eligible is False
 
 
 def test_visual_readback_env_values_are_used_when_cli_is_absent(monkeypatch):
@@ -71,6 +81,11 @@ def test_visual_readback_env_values_are_used_when_cli_is_absent(monkeypatch):
     monkeypatch.setenv("OPENCLAW_VISUAL_READBACK_CONTROL_ONLY", "true")
     monkeypatch.setenv("OPENCLAW_VISUAL_READBACK_STOP_FALLBACK_POLICY", "log_only")
     monkeypatch.setenv("OPENCLAW_VISUAL_READBACK_SMOKE_SEED_MEMORY", "true")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_POLICY_MODE", "event_gated_smoke")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_MIN_GAP_STEPS", "7")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_EPISODE_CAP", "11")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_COVERAGE_GAP_STEPS", "13")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_DEBUG_SAVE_ALL_ELIGIBLE", "true")
 
     config = build_harness_config(make_args(harness_memory_backend="spatial_http"))
 
@@ -82,22 +97,33 @@ def test_visual_readback_env_values_are_used_when_cli_is_absent(monkeypatch):
     assert config.visual_readback_control_only is True
     assert config.visual_readback_stop_fallback_policy == "log_only"
     assert getattr(config, "visual_readback_smoke_seed_memory", None) is True
+    assert config.keyframe_policy_mode == "event_gated_smoke"
+    assert config.keyframe_min_gap_steps == 7
+    assert config.keyframe_episode_cap == 11
+    assert config.keyframe_coverage_gap_steps == 13
+    assert config.keyframe_debug_save_all_eligible is True
 
 
 def test_visual_readback_cli_values_override_environment(monkeypatch):
     monkeypatch.setenv("OPENCLAW_VISUAL_READBACK_MODE", "image_read_controller")
     monkeypatch.setenv("OPENCLAW_VISUAL_READBACK_TOP_K", "5")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_POLICY_MODE", "event_gated_smoke")
+    monkeypatch.setenv("OPENCLAW_KEYFRAME_MIN_GAP_STEPS", "9")
 
     config = build_harness_config(
         make_args(
             harness_memory_backend="spatial_http",
             visual_readback_mode="current_only_controller",
             visual_readback_top_k=2,
+            keyframe_policy_mode="interval",
+            keyframe_min_gap_steps=3,
         )
     )
 
     assert config.visual_readback_mode == "current_only_controller"
     assert config.visual_readback_top_k == 2
+    assert config.keyframe_policy_mode == "interval"
+    assert config.keyframe_min_gap_steps == 3
 
 
 def test_visual_readback_parser_exposes_cli_flags():
@@ -115,6 +141,16 @@ def test_visual_readback_parser_exposes_cli_flags():
             "false",
             "--visual_readback_stop_fallback_policy",
             "previous_non_stop_else_move_forward",
+            "--keyframe_policy_mode",
+            "event_gated_smoke",
+            "--keyframe_min_gap_steps",
+            "6",
+            "--keyframe_episode_cap",
+            "12",
+            "--keyframe_coverage_gap_steps",
+            "18",
+            "--keyframe_debug_save_all_eligible",
+            "true",
         ]
     )
     options = {
@@ -128,6 +164,12 @@ def test_visual_readback_parser_exposes_cli_flags():
     assert args.visual_readback_control_only is False
     assert args.visual_readback_stop_fallback_policy == "previous_non_stop_else_move_forward"
     assert "--visual_readback_smoke_seed_memory" in options
+    assert args.keyframe_policy_mode == "event_gated_smoke"
+    assert args.keyframe_min_gap_steps == 6
+    assert args.keyframe_episode_cap == 12
+    assert args.keyframe_coverage_gap_steps == 18
+    assert args.keyframe_debug_save_all_eligible is True
+    assert "--keyframe_policy_mode" in options
 
 
 def smoke_seed_config(mode):
@@ -189,11 +231,45 @@ def smoke_seed_config(mode):
             smoke_seed_config("current_only_controller"),
             "smoke_seed_memory",
         ),
+        (
+            HarnessConfig(keyframe_policy_mode="event_gated_smoke_gate"),
+            "use keyframe_policy_mode=event_gated_smoke",
+        ),
+        (
+            HarnessConfig(keyframe_policy_mode="event_gated_smoke_audit"),
+            "use keyframe_policy_mode=event_gated_smoke",
+        ),
+        (
+            HarnessConfig(keyframe_policy_mode="unknown"),
+            "unknown keyframe_policy_mode",
+        ),
+        (
+            HarnessConfig(keyframe_min_gap_steps=0),
+            "keyframe_min_gap_steps",
+        ),
+        (
+            HarnessConfig(keyframe_episode_cap=0),
+            "keyframe_episode_cap",
+        ),
+        (
+            HarnessConfig(keyframe_coverage_gap_steps=0),
+            "keyframe_coverage_gap_steps",
+        ),
     ],
 )
 def test_visual_readback_validation_rejects_invalid_contracts(config, error_text):
     with pytest.raises(ValueError, match=error_text):
         validate_visual_readback_config(config)
+
+
+def test_event_gated_smoke_config_does_not_require_v1_only_fields():
+    config = HarnessConfig(
+        memory_backend="image_backed_local",
+        visual_readback_mode="off",
+        keyframe_policy_mode="event_gated_smoke",
+    )
+
+    validate_visual_readback_config(config)
 
 
 def test_visual_readback_validation_can_require_fixed_manifest():

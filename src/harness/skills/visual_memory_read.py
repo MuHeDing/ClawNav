@@ -102,11 +102,16 @@ class QwenDirectVisualReadbackAdapter:
             "If every memory image is visible and used, set "
             f'"matched_memory_ids": {expected_memory_ids_json}. '
             "If a memory image is unreadable, omit only that image's ID.\n"
+            "For every visual_evidence or audit_action_hint claim, add an "
+            "evidence_sources array item with field_name, item_index, "
+            "evidence_source_type=current|memory, and one stable identity such as "
+            "memory_id, retrieved_image_path, step_id, or readback_slot_id. "
+            "Use readback_slot_id=0 for the current image and 1..N for memory images.\n"
             "Use verifier_labels from this closed set only: route_conflict, "
             "goal_not_visible, insufficient_evidence. If current and memory views "
             "show conflicting landmarks/layouts, use route_conflict.\n"
             "Return only compact JSON with keys: verifier_labels, matched_memory_ids, "
-            "visual_evidence, audit_action_hint, readback_confidence, "
+            "visual_evidence, audit_action_hint, evidence_sources, readback_confidence, "
             "verifier_confidence, visual_grounding_status."
             )
 
@@ -223,6 +228,12 @@ class VisualMemoryReadSkill(Skill):
             "model_image_count": {"type": "integer"},
             "verifier_labels": {"type": "array"},
             "matched_memory_ids": {"type": "array"},
+            "evidence_sources": {"type": "array"},
+            "memory_evidence_used_count": {"type": "integer"},
+            "current_only_evidence_count": {"type": "integer"},
+            "ambiguous_evidence_count": {"type": "integer"},
+            "invalid_evidence_source_count": {"type": "integer"},
+            "no_evidence_count": {"type": "integer"},
             "readback_confidence": {"type": "number"},
             "verifier_confidence": {"type": "number"},
         },

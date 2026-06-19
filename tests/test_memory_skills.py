@@ -3,6 +3,7 @@ from harness.memory.memory_manager import MemoryManager
 from harness.memory.spatial_memory_client import FakeSpatialMemoryClient
 from harness.skills.memory_query import MemoryQuerySkill
 from harness.skills.memory_write import MemoryWriteSkill
+from harness.visual_readback.memory_smoke import ImageBackedLocalMemoryClient
 
 
 class InMemoryStore:
@@ -11,6 +12,36 @@ class InMemoryStore:
 
     def append(self, record):
         self.records.append(record)
+
+
+class FailingClient:
+    def ingest_semantic(self, payload):
+        del payload
+        raise RuntimeError("backend down")
+
+
+def smoke_write_payload(**overrides):
+    payload = {
+        "should_write": True,
+        "memory_source": "episode-local",
+        "memory_scope": "episode",
+        "memory_namespace": "episode:s1:e1",
+        "run_id": "run-1",
+        "step_id": 4,
+        "scene_id": "s1",
+        "episode_id": "e1",
+        "image_path": "/tmp/keyframe.png",
+        "source_image_role": "event_gated_keyframe",
+        "retrieval_text": "turn right near the doorway",
+        "metadata": {
+            "keyframe_gate": {
+                "save_reason": "candidate_decision_point",
+                "candidate_event_type": "TURN_RIGHT",
+            }
+        },
+    }
+    payload.update(overrides)
+    return payload
 
 
 def test_memory_query_skill_returns_memory_hits():
@@ -174,3 +205,66 @@ def test_memory_write_skill_skips_when_write_gate_rejects_candidate():
     assert result.payload["skipped"] is True
     assert result.payload["skip_reason"] == "duplicate generic hallway"
     assert store.records == []
+
+
+def test_memory_write_skill_preserves_event_gated_keyframe_metadata_for_local_query():
+    client = ImageBackedLocalMemoryClient()
+    skill = MemoryWriteSkill(client=client, allowed_sources={"episode-local"})
+
+    result = skill.run(None, smoke_write_payload())
+
+    assert result.ok is True
+    assert result.payload["written"] is True
+    assert result.payload["memory_id"] == "image-backed-local-0"
+    record = result.payload["record"]
+    assert record["memory_id"] == "image-backed-local-0"
+    assert record["run_id"] == "run-1"
+    assert record["source_image_role"] == "event_gated_keyframe"
+    assert record["metadata"]["keyframe_gate"]["candidate_event_type"] == "TURN_RIGHT"
+    hits = client.query_semantic(
+        "turn right",
+        n_results=1,
+        allowed_scopes=["episode"],
+        memory_namespace="episode:s1:e1",
+    )
+    assert hits[0].memory_id == "image-backed-local-0"
+    assert hits[0].metadata["keyframe_gate"]["candidate_event_type"] == "TURN_RIGHT"
+    assert hits[0].metadata["step_id"] == 4
+    assert hits[0].metadata["source_image_role"] == "event_gated_keyframe"
+
+
+def test_memory_write_skill_builds_smoke_retrieval_text_from_action_context():
+    store = InMemoryStore()
+    skill = MemoryWriteSkill(store=store, allowed_sources={"episode-local"})
+    payload = smoke_write_payload(retrieval_text="", action_context="STOP before outside")
+
+    result = skill.run(None, payload)
+
+    assert result.ok is True
+    assert "STOP before outside" in result.payload["record"]["retrieval_text"]
+
+
+def test_memory_write_skill_marks_invalid_event_gated_keyframe_non_queryable():
+    store = InMemoryStore()
+    skill = MemoryWriteSkill(store=store, allowed_sources={"episode-local"})
+    payload = smoke_write_payload(memory_namespace="")
+
+    result = skill.run(None, payload)
+
+    assert result.ok is True
+    assert result.payload["written"] is False
+    assert result.payload["skipped"] is True
+    assert result.payload["error_type"] == "invalid_event_gated_keyframe_write"
+    assert "memory_namespace" in result.payload["skip_reason"]
+    assert store.records == []
+
+
+def test_memory_write_skill_converts_backend_exception_to_failed_payload():
+    skill = MemoryWriteSkill(client=FailingClient(), allowed_sources={"episode-local"})
+
+    result = skill.run(None, smoke_write_payload())
+
+    assert result.ok is True
+    assert result.payload["written"] is False
+    assert result.payload["error_type"] == "memory_write_failed"
+    assert "backend down" in result.payload["error"]

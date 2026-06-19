@@ -215,6 +215,81 @@ def test_proxy_payload_exposes_current_image_path_and_recent_keyframe_paths(tmp_
     assert second_payload["current_image_path"].endswith("step_000001.png")
 
 
+def test_proxy_smoke_mode_stages_current_frame_without_interval_keyframe(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(
+        make_args(tmp_path, keyframe_policy_mode="event_gated_smoke"),
+        model=base_model,
+    )
+    proxy = HarnessModelProxy(base_model, components)
+    proxy.start_episode("scene-a", "episode-1")
+
+    payload = proxy._runtime_payload([SaveableFrame("first")], step_id=0)
+
+    assert payload["current_image_path"].endswith(
+        "openclaw_current_frames/scene-a/episode-1/step_000000.png"
+    )
+    assert payload["keyframe_target_path"].endswith(
+        "keyframes/scene-a/episode-1/step_000000.png"
+    )
+    assert "keyframe_candidate" not in payload
+    assert payload["recent_keyframe_paths"] == []
+    assert Path(payload["current_image_path"]).exists()
+    assert not Path(payload["keyframe_target_path"]).exists()
+
+
+def test_proxy_updates_recent_keyframes_only_after_runtime_promoted_written(tmp_path):
+    class FakeRuntime:
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+        def step(self, state, payload):
+            del state, payload
+            return SimpleNamespace(
+                ok=True,
+                action_text="MOVE_FORWARD",
+                executor_command={},
+                runtime_metadata=self.metadata,
+                error=None,
+            )
+
+    promoted_path = str(tmp_path / "keyframes" / "scene-a" / "episode-1" / "step_000000.png")
+    components = build_harness_components(
+        make_args(tmp_path, keyframe_policy_mode="event_gated_smoke"),
+        model=FakeBaseModel(),
+    )
+    components["openclaw_runtime"] = FakeRuntime(
+        {
+            "planned_intent": "act",
+            "keyframe_gate": {
+                "promotion_status": "promoted",
+                "write_status": "written",
+                "promoted_image_path": promoted_path,
+            },
+        }
+    )
+    proxy = HarnessModelProxy(FakeBaseModel(), components)
+    proxy.start_episode("scene-a", "episode-1")
+
+    proxy.call_model([SaveableFrame("first")], "go", step_id=0)
+
+    assert proxy.recent_keyframe_paths == [promoted_path]
+
+    components["openclaw_runtime"] = FakeRuntime(
+        {
+            "planned_intent": "act",
+            "keyframe_gate": {
+                "promotion_status": "promoted",
+                "write_status": "failed",
+                "promoted_image_path": str(tmp_path / "failed.png"),
+            },
+        }
+    )
+    proxy.call_model([SaveableFrame("second")], "go", step_id=1)
+
+    assert proxy.recent_keyframe_paths == [promoted_path]
+
+
 def test_proxy_saves_keyframe_artifact_for_write_memory(tmp_path):
     base_model = FakeBaseModel()
     components = build_harness_components(make_args(tmp_path), model=base_model)

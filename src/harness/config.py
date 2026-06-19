@@ -23,6 +23,14 @@ VISUAL_READBACK_STOP_FALLBACK_POLICIES = {
     "log_only",
     "previous_non_stop_else_move_forward",
 }
+KEYFRAME_POLICY_MODES = {
+    "interval",
+    "event_gated_smoke",
+}
+KEYFRAME_POLICY_CHECKPOINT_LABELS = {
+    "event_gated_smoke_gate",
+    "event_gated_smoke_audit",
+}
 
 
 def parse_visual_readback_bool(value: Any) -> bool:
@@ -78,6 +86,19 @@ def validate_visual_readback_config(
         )
     if require_fixed_manifest and not config.visual_readback_fixed_case_manifest_path:
         raise ValueError("fixed_case_manifest is required for Phase 1b replay")
+    if config.keyframe_policy_mode in KEYFRAME_POLICY_CHECKPOINT_LABELS:
+        raise ValueError(
+            f"{config.keyframe_policy_mode} is a validation checkpoint label; "
+            "use keyframe_policy_mode=event_gated_smoke"
+        )
+    if config.keyframe_policy_mode not in KEYFRAME_POLICY_MODES:
+        raise ValueError(f"unknown keyframe_policy_mode: {config.keyframe_policy_mode}")
+    if config.keyframe_min_gap_steps <= 0:
+        raise ValueError("keyframe_min_gap_steps must be positive")
+    if config.keyframe_episode_cap <= 0:
+        raise ValueError("keyframe_episode_cap must be positive")
+    if config.keyframe_coverage_gap_steps <= 0:
+        raise ValueError("keyframe_coverage_gap_steps must be positive")
 
 
 @dataclass
@@ -119,3 +140,8 @@ class HarnessConfig:
     visual_readback_fixed_case_manifest_path: str = ""
     visual_readback_stop_fallback_policy: str = "log_only"
     visual_readback_smoke_seed_memory: bool = False
+    keyframe_policy_mode: str = "interval"
+    keyframe_min_gap_steps: int = 5
+    keyframe_episode_cap: int = 64
+    keyframe_coverage_gap_steps: int = 20
+    keyframe_debug_save_all_eligible: bool = False

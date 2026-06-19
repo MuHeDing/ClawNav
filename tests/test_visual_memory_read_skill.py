@@ -318,6 +318,158 @@ def test_visual_memory_read_skill_normalizes_valid_adapter_payload(tmp_path):
     assert adapter.calls[0]["trigger_rule"] == "decision_point"
 
 
+def test_visual_memory_read_skill_counts_valid_memory_evidence_source(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    skill = VisualMemoryReadSkill(
+        adapter=FakeReadbackAdapter(
+            {
+                "verifier_labels": ["route_conflict"],
+                "matched_memory_ids": ["m1"],
+                "visual_evidence": "The retrieved memory shows the turn.",
+                "evidence_sources": [
+                    {
+                        "field_name": "visual_evidence",
+                        "item_index": 0,
+                        "evidence_source_type": "memory",
+                        "memory_id": "m1",
+                    }
+                ],
+            }
+        )
+    )
+
+    result = skill.run(
+        make_state(),
+        {
+            "current_image_path": str(current),
+            "memory_hits": [{"memory_id": "m1", "image_path": str(memory)}],
+            "candidate_action": "TURN_RIGHT",
+            "trigger_rule": "decision_point",
+        },
+    )
+
+    assert result.payload["memory_evidence_used_count"] == 1
+    assert result.payload["current_only_evidence_count"] == 0
+    assert result.payload["ambiguous_evidence_count"] == 0
+    assert result.payload["invalid_evidence_source_count"] == 0
+
+
+def test_visual_memory_read_skill_counts_current_only_evidence_source(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    skill = VisualMemoryReadSkill(
+        adapter=FakeReadbackAdapter(
+            {
+                "verifier_labels": ["goal_not_visible"],
+                "visual_evidence": "The current view does not show the goal.",
+                "evidence_sources": [
+                    {
+                        "field_name": "visual_evidence",
+                        "item_index": 0,
+                        "evidence_source_type": "current",
+                        "readback_slot_id": 0,
+                    }
+                ],
+            }
+        )
+    )
+
+    result = skill.run(
+        make_state(),
+        {
+            "current_image_path": str(current),
+            "memory_hits": [{"memory_id": "m1", "image_path": str(memory)}],
+            "candidate_action": "STOP",
+            "trigger_rule": "risky_stop",
+        },
+    )
+
+    assert result.payload["memory_evidence_used_count"] == 0
+    assert result.payload["current_only_evidence_count"] == 1
+    assert result.payload["ambiguous_evidence_count"] == 0
+
+
+def test_visual_memory_read_skill_counts_legacy_string_evidence_as_ambiguous(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    skill = VisualMemoryReadSkill(
+        adapter=FakeReadbackAdapter(
+            {
+                "verifier_labels": ["route_conflict"],
+                "visual_evidence": "A previous view shows the doorway.",
+            }
+        )
+    )
+
+    result = skill.run(
+        make_state(),
+        {
+            "current_image_path": str(current),
+            "memory_hits": [{"memory_id": "m1", "image_path": str(memory)}],
+            "candidate_action": "TURN_LEFT",
+            "trigger_rule": "decision_point",
+        },
+    )
+
+    assert result.payload["memory_evidence_used_count"] == 0
+    assert result.payload["ambiguous_evidence_count"] == 1
+
+
+def test_visual_memory_read_skill_rejects_unattached_or_duplicate_sources(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    skill = VisualMemoryReadSkill(
+        adapter=FakeReadbackAdapter(
+            {
+                "verifier_labels": ["route_conflict"],
+                "visual_evidence": "The retrieved image supports this.",
+                "evidence_sources": [
+                    {
+                        "field_name": "visual_evidence",
+                        "item_index": 0,
+                        "evidence_source_type": "memory",
+                        "memory_id": "not-attached",
+                    },
+                    {
+                        "field_name": "visual_evidence",
+                        "item_index": 1,
+                        "evidence_source_type": "memory",
+                        "memory_id": "m1",
+                    },
+                    {
+                        "field_name": "visual_evidence",
+                        "item_index": 1,
+                        "evidence_source_type": "memory",
+                        "memory_id": "m1",
+                    },
+                ],
+            }
+        )
+    )
+
+    result = skill.run(
+        make_state(),
+        {
+            "current_image_path": str(current),
+            "memory_hits": [{"memory_id": "m1", "image_path": str(memory)}],
+            "candidate_action": "TURN_LEFT",
+            "trigger_rule": "decision_point",
+        },
+    )
+
+    assert result.payload["memory_evidence_used_count"] == 1
+    assert result.payload["invalid_evidence_source_count"] == 2
+
+
 def test_visual_memory_read_skill_fails_closed_on_non_json_response(tmp_path):
     current = tmp_path / "current.png"
     memory = tmp_path / "memory.png"

@@ -26,6 +26,7 @@ def normalize_visual_readback_response(
     verifier_labels = _string_list(data.get("verifier_labels")) or [
         "insufficient_evidence"
     ]
+    evidence_audit = _evidence_source_audit(data, request)
     return {
         "read_status": "completed",
         "trigger_rule": str(request.get("trigger_rule") or ""),
@@ -53,6 +54,7 @@ def normalize_visual_readback_response(
             data.get("visual_grounding_status")
         ),
         "grounding_eval_protocol": data.get("grounding_eval_protocol") or {},
+        **evidence_audit,
     }
 
 
@@ -164,7 +166,119 @@ def _failed_payload(
         "retrieval_confidence": _float(request.get("retrieval_confidence"), 0.0),
         "verifier_confidence": 0.0,
         "visual_grounding_status": "unverified",
+        "evidence_sources": [],
+        "memory_evidence_used_count": 0,
+        "current_only_evidence_count": 0,
+        "ambiguous_evidence_count": 0,
+        "invalid_evidence_source_count": 0,
+        "no_evidence_count": 1,
     }
+
+
+def _evidence_source_audit(
+    data: Dict[str, Any],
+    request: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw_sources = data.get("evidence_sources")
+    attached_memory_ids = set(_string_list(request.get("attached_memory_ids")))
+    retrieved_paths = set(_string_list(request.get("retrieved_image_paths")))
+    sources = raw_sources if isinstance(raw_sources, list) else []
+    if not sources:
+        has_legacy_text = any(
+            str(data.get(key) or "").strip()
+            for key in (
+                "visual_evidence",
+                "audit_action_hint",
+                "audit_relative_direction_hint",
+            )
+        )
+        return {
+            "evidence_sources": [],
+            "memory_evidence_used_count": 0,
+            "current_only_evidence_count": 0,
+            "ambiguous_evidence_count": 1 if has_legacy_text else 0,
+            "invalid_evidence_source_count": 0,
+            "no_evidence_count": 0 if has_legacy_text else 1,
+        }
+
+    normalized_sources: List[Dict[str, Any]] = []
+    seen_identities = set()
+    memory_count = 0
+    current_count = 0
+    invalid_count = 0
+    for source in sources:
+        if not isinstance(source, dict):
+            invalid_count += 1
+            continue
+        normalized = dict(source)
+        source_type = str(normalized.get("evidence_source_type") or "")
+        identity = _evidence_source_identity(normalized)
+        if not source_type or identity is None:
+            invalid_count += 1
+            normalized_sources.append(normalized)
+            continue
+        dedupe_key = (source_type, identity)
+        if dedupe_key in seen_identities:
+            invalid_count += 1
+            normalized_sources.append(normalized)
+            continue
+        seen_identities.add(dedupe_key)
+        if source_type == "memory":
+            if _source_maps_to_attached_memory(normalized, attached_memory_ids, retrieved_paths):
+                memory_count += 1
+            else:
+                invalid_count += 1
+        elif source_type == "current":
+            if _source_maps_to_current(normalized):
+                current_count += 1
+            else:
+                invalid_count += 1
+        else:
+            invalid_count += 1
+        normalized_sources.append(normalized)
+    return {
+        "evidence_sources": normalized_sources,
+        "memory_evidence_used_count": memory_count,
+        "current_only_evidence_count": current_count,
+        "ambiguous_evidence_count": 0,
+        "invalid_evidence_source_count": invalid_count,
+        "no_evidence_count": 0
+        if memory_count or current_count or invalid_count or normalized_sources
+        else 1,
+    }
+
+
+def _evidence_source_identity(source: Dict[str, Any]) -> Any:
+    for key in ("memory_id", "retrieved_image_path", "step_id", "readback_slot_id"):
+        value = source.get(key)
+        if value is not None and str(value) != "":
+            return (key, str(value))
+    return None
+
+
+def _source_maps_to_attached_memory(
+    source: Dict[str, Any],
+    attached_memory_ids: set[str],
+    retrieved_paths: set[str],
+) -> bool:
+    memory_id = str(source.get("memory_id") or "")
+    if memory_id and memory_id in attached_memory_ids:
+        return True
+    image_path = str(source.get("retrieved_image_path") or "")
+    if image_path and image_path in retrieved_paths:
+        return True
+    try:
+        slot_id = int(source.get("readback_slot_id"))
+    except (TypeError, ValueError):
+        return False
+    return 1 <= slot_id <= len(retrieved_paths)
+
+
+def _source_maps_to_current(source: Dict[str, Any]) -> bool:
+    try:
+        return int(source.get("readback_slot_id")) == 0
+    except (TypeError, ValueError):
+        return bool(source.get("retrieved_image_path") == source.get("current_image_path"))
 
 
 def _string_list(value: Any) -> List[str]:

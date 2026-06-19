@@ -88,6 +88,16 @@ def test_visual_readback_runtime_smoke_wrapper_can_run_multiple_demo_episodes():
     assert 'HARNESS_EPISODE_KEYS="${EPISODE_KEYS}"' in contents
 
 
+def test_visual_readback_summarizer_can_emit_phase_a_gate_reports():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "summarize_openclaw_visual_readback.py"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "--phase_a_summary" in contents
+    assert "build_phase_a_gate_report" in contents
+    assert "format_phase_a_gate_markdown" in contents
+
+
 def test_visual_readback_demo_2az_long5_launcher_uses_full_dataset_without_step_artifacts_by_default():
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "scripts" / "run_visual_readback_demo_2az_long5.sh"
