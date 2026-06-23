@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union
 
 
 VISUAL_READBACK_PHASE01_MODES = {
@@ -8,6 +8,8 @@ VISUAL_READBACK_PHASE01_MODES = {
     "path_only",
     "image_read_prompt",
     "image_read_controller",
+    "image_read_replan_prompt",
+    "image_read_action_override",
     "current_only_controller",
     "shuffled_image_read_controller",
 }
@@ -22,6 +24,10 @@ VISUAL_READBACK_IMAGE_BACKED_MEMORY_BACKENDS = {
 VISUAL_READBACK_STOP_FALLBACK_POLICIES = {
     "log_only",
     "previous_non_stop_else_move_forward",
+}
+VISUAL_READBACK_TRIGGER_POLICIES = {
+    "sparse_action_override",
+    "dense_action_override",
 }
 KEYFRAME_POLICY_MODES = {
     "interval",
@@ -42,6 +48,16 @@ def parse_visual_readback_bool(value: Any) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def parse_action_override_budget(value: Any) -> Union[int, str]:
+    normalized = str(value).strip().lower()
+    if normalized == "adaptive":
+        return "adaptive"
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("visual_readback_max_action_overrides_per_episode must be positive")
+    return parsed
 
 
 def validate_visual_readback_config(
@@ -78,6 +94,20 @@ def validate_visual_readback_config(
         raise ValueError(
             "unknown visual_readback_stop_fallback_policy: "
             f"{config.visual_readback_stop_fallback_policy}"
+        )
+    try:
+        parse_action_override_budget(
+            config.visual_readback_max_action_overrides_per_episode
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "visual_readback_max_action_overrides_per_episode must be "
+            "positive or adaptive"
+        ) from exc
+    if config.visual_readback_trigger_policy not in VISUAL_READBACK_TRIGGER_POLICIES:
+        raise ValueError(
+            "unknown visual_readback_trigger_policy: "
+            f"{config.visual_readback_trigger_policy}"
         )
     if mode != "off" and config.memory_backend not in VISUAL_READBACK_IMAGE_BACKED_MEMORY_BACKENDS:
         raise ValueError(
@@ -130,6 +160,7 @@ class HarnessConfig:
     memory_source: str = "episode-local"
     expose_sim_pose_online: bool = False
     visual_readback_mode: str = "off"
+    visual_readback_trigger_policy: str = "sparse_action_override"
     visual_readback_top_k: int = 3
     visual_readback_timeout_ms: int = 90000
     visual_readback_low_confidence: float = 0.6
@@ -140,6 +171,7 @@ class HarnessConfig:
     visual_readback_fixed_case_manifest_path: str = ""
     visual_readback_stop_fallback_policy: str = "log_only"
     visual_readback_smoke_seed_memory: bool = False
+    visual_readback_max_action_overrides_per_episode: Union[int, str] = 1
     keyframe_policy_mode: str = "interval"
     keyframe_min_gap_steps: int = 5
     keyframe_episode_cap: int = 64

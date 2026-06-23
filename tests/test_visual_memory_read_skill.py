@@ -280,6 +280,12 @@ def test_visual_memory_read_skill_normalizes_valid_adapter_payload(tmp_path):
             "matched_memory_ids": ["m1", "not-attached"],
             "visual_evidence": "The recalled image shows the left opening.",
             "audit_action_hint": "TURN_LEFT",
+            "candidate_action_valid": False,
+            "should_override": True,
+            "invalid_reason": "route_conflict",
+            "recommended_action": "TURN_LEFT",
+            "decision_scope": "immediate_next_action",
+            "action_confidence": 0.82,
             "readback_confidence": 0.81,
             "retrieval_confidence": 0.72,
             "verifier_confidence": 0.8,
@@ -313,6 +319,12 @@ def test_visual_memory_read_skill_normalizes_valid_adapter_payload(tmp_path):
     assert payload["matched_memory_ids"] == ["m1"]
     assert payload["verifier_labels"] == ["route_conflict"]
     assert payload["audit_action_hint"] == "TURN_LEFT"
+    assert payload["candidate_action_valid"] is False
+    assert payload["should_override"] is True
+    assert payload["invalid_reason"] == "route_conflict"
+    assert payload["recommended_action"] == "TURN_LEFT"
+    assert payload["decision_scope"] == "immediate_next_action"
+    assert payload["action_confidence"] == 0.82
     assert payload["readback_confidence"] == 0.81
     assert adapter.calls[0]["candidate_action"] == "TURN_RIGHT"
     assert adapter.calls[0]["trigger_rule"] == "decision_point"

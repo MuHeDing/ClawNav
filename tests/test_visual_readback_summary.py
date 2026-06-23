@@ -167,7 +167,19 @@ def test_visual_readback_summary_counts_primary_offline_and_readback_metrics(tmp
             ),
             row("B", "image_read_controller", current_only_sufficient=True),
             row("B", "current_only_controller", current_only_sufficient=True),
-            row("C", "image_read_controller"),
+            row(
+                "C",
+                "image_read_controller",
+                candidate_action_valid=False,
+                should_override=True,
+                invalid_reason="route_conflict",
+                replan_executed_after_visual_read=True,
+                readback_state_used_by_policy=True,
+                action_hint_override_attempted_after_visual_read=True,
+                action_hint_executed_after_visual_read=True,
+                readback_state_used_by_controller=True,
+                executed_action_changed_after_visual_read=True,
+            ),
             row(
                 "C",
                 "shuffled_image_read_controller",
@@ -201,6 +213,15 @@ def test_visual_readback_summary_counts_primary_offline_and_readback_metrics(tmp
     assert summary["adjudication_correct_readback_count"] == 5
     assert summary["controller_decision_changed_after_visual_read_count"] == 4
     assert summary["replan_request_logged_after_visual_read_count"] == 4
+    assert summary["replan_executed_after_visual_read_count"] == 1
+    assert summary["readback_state_used_by_policy_count"] == 1
+    assert summary["action_hint_override_attempted_after_visual_read_count"] == 1
+    assert summary["action_hint_executed_after_visual_read_count"] == 1
+    assert summary["readback_state_used_by_controller_count"] == 1
+    assert summary["executed_action_changed_after_visual_read_count"] == 1
+    assert summary["candidate_action_valid_counts"] == {"false": 1, "missing": 10}
+    assert summary["should_override_counts"] == {"missing": 10, "true": 1}
+    assert summary["invalid_reason_counts"] == {"route_conflict": 1}
     assert summary["grounded_but_wrong_label_count"] == 1
     assert summary["memory_evidence_used_count"] == 0
     assert summary["current_only_evidence_count"] == 0

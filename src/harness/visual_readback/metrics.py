@@ -167,6 +167,41 @@ def summarize_visual_readback_run(
         "replan_request_logged_after_visual_read_count": sum(
             1 for block in blocks if bool(block.get("replan_request_logged_after_visual_read"))
         ),
+        "replan_executed_after_visual_read_count": sum(
+            1 for block in blocks if bool(block.get("replan_executed_after_visual_read"))
+        ),
+        "readback_state_used_by_policy_count": sum(
+            1 for block in blocks if bool(block.get("readback_state_used_by_policy"))
+        ),
+        "executed_action_changed_after_visual_read_count": sum(
+            1 for block in blocks if bool(block.get("executed_action_changed_after_visual_read"))
+        ),
+        "action_hint_override_attempted_after_visual_read_count": sum(
+            1
+            for block in blocks
+            if bool(block.get("action_hint_override_attempted_after_visual_read"))
+        ),
+        "action_hint_executed_after_visual_read_count": sum(
+            1 for block in blocks if bool(block.get("action_hint_executed_after_visual_read"))
+        ),
+        "candidate_action_valid_counts": dict(
+            sorted(Counter(_bool_status(block, "candidate_action_valid") for block in blocks).items())
+        ),
+        "should_override_counts": dict(
+            sorted(Counter(_bool_status(block, "should_override") for block in blocks).items())
+        ),
+        "invalid_reason_counts": dict(
+            sorted(
+                Counter(
+                    str(block.get("invalid_reason") or "")
+                    for block in blocks
+                    if str(block.get("invalid_reason") or "")
+                ).items()
+            )
+        ),
+        "readback_state_used_by_controller_count": sum(
+            1 for block in blocks if bool(block.get("readback_state_used_by_controller"))
+        ),
         "grounded_but_wrong_label_count": sum(1 for block in blocks if _is_grounded_but_wrong(block)),
         "memory_evidence_used_count": sum(_int_value(block.get("memory_evidence_used_count")) for block in blocks),
         "current_only_evidence_count": sum(_int_value(block.get("current_only_evidence_count")) for block in blocks),
@@ -1006,6 +1041,20 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def _bool_status(block: Dict[str, Any], key: str) -> str:
+    if key not in block:
+        return "missing"
+    value = block.get(key)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return "true"
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return "false"
+    return "missing"
 
 
 def _canonical_json(value: Any) -> str:

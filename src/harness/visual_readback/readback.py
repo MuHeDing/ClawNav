@@ -44,6 +44,12 @@ def normalize_visual_readback_response(
         "verifier_labels": verifier_labels,
         "visual_evidence": str(data.get("visual_evidence") or ""),
         "audit_action_hint": str(data.get("audit_action_hint") or ""),
+        "candidate_action_valid": _bool(data.get("candidate_action_valid"), True),
+        "should_override": _bool(data.get("should_override"), False),
+        "invalid_reason": str(data.get("invalid_reason") or ""),
+        "recommended_action": str(data.get("recommended_action") or ""),
+        "decision_scope": str(data.get("decision_scope") or ""),
+        "action_confidence": _float(data.get("action_confidence"), 0.0),
         "audit_relative_direction_hint": str(
             data.get("audit_relative_direction_hint") or ""
         ),
@@ -162,6 +168,13 @@ def _failed_payload(
         "matched_memory_ids_from_attached_only": True,
         "verifier_labels": ["insufficient_evidence"],
         "visual_evidence": "",
+        "audit_action_hint": "",
+        "candidate_action_valid": True,
+        "should_override": False,
+        "invalid_reason": "",
+        "recommended_action": "",
+        "decision_scope": "",
+        "action_confidence": 0.0,
         "readback_confidence": 0.0,
         "retrieval_confidence": _float(request.get("retrieval_confidence"), 0.0),
         "verifier_confidence": 0.0,
@@ -294,6 +307,19 @@ def _float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _hit_value(hit: Any, name: str) -> Any:

@@ -220,6 +220,71 @@ class StopBlockedVisualReadSkill(Skill):
         )
 
 
+class ActionHintVisualReadSkill(Skill):
+    name = "VisualMemoryReadSkill"
+    description = "Returns an executable action recommendation."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(
+        self,
+        audit_action_hint="TURN_LEFT",
+        labels=None,
+        confidence=0.9,
+        recommended_action="TURN_LEFT",
+        decision_scope="immediate_next_action",
+        action_confidence=None,
+        candidate_action_valid=False,
+        should_override=True,
+        invalid_reason="route_conflict",
+    ):
+        self.audit_action_hint = audit_action_hint
+        self.labels = list(labels or ["route_conflict"])
+        self.confidence = confidence
+        self.recommended_action = recommended_action
+        self.decision_scope = decision_scope
+        self.action_confidence = action_confidence
+        self.candidate_action_valid = candidate_action_valid
+        self.should_override = should_override
+        self.invalid_reason = invalid_reason
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        return SkillResult.ok_result(
+            "visual_memory_read",
+            {
+                "read_status": "completed",
+                "trigger_rule": payload.get("trigger_rule"),
+                "candidate_action": payload.get("candidate_action"),
+                "retrieved_image_paths": [hit.image_path for hit in payload["memory_hits"]],
+                "actually_read_image_paths": [
+                    payload["current_image_path"],
+                    *[hit.image_path for hit in payload["memory_hits"]],
+                ],
+                "model_image_count": 1 + len(payload["memory_hits"]),
+                "attached_memory_ids": [hit.memory_id for hit in payload["memory_hits"]],
+                "matched_memory_ids": [hit.memory_id for hit in payload["memory_hits"]],
+                "verifier_labels": self.labels,
+                "visual_evidence": ["memory view conflicts with current heading"],
+                "audit_action_hint": self.audit_action_hint,
+                "candidate_action_valid": self.candidate_action_valid,
+                "should_override": self.should_override,
+                "invalid_reason": self.invalid_reason,
+                "recommended_action": self.recommended_action,
+                "decision_scope": self.decision_scope,
+                "action_confidence": (
+                    self.confidence
+                    if self.action_confidence is None
+                    else self.action_confidence
+                ),
+                "readback_confidence": self.confidence,
+                "verifier_confidence": self.confidence,
+            },
+            confidence=self.confidence,
+        )
+
+
 class FailingGatewayPlanner:
     def plan(self, state, runtime_context):
         raise OpenClawGatewayError("502 Server Error: Bad Gateway for url: http://gateway/plan")
@@ -1309,6 +1374,633 @@ def test_v4_stop_block_executed_pilot_uses_previous_non_stop(tmp_path):
     assert visual_readback["fallback_source"] == "previous_non_stop"
     assert visual_readback["final_action"] == "MOVE_FORWARD"
     assert visual_readback["executed_action_changed_after_visual_read"] is True
+
+
+def test_image_read_replan_prompt_executes_clean_policy_reassessment(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="decision_point",
+        planner_backend="gateway",
+    )
+    navigation = SequenceNavigationSkill(["TURN_LEFT", "MOVE_FORWARD"])
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(RecordingVisualReadSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_replan_prompt",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "MOVE_FORWARD"
+    assert len(navigation.calls) == 2
+    first_payload, replan_payload = navigation.calls
+    assert "active_subgoal" not in first_payload
+    assert "memory_context_text" not in first_payload
+    assert "memory_images" not in first_payload
+    assert replan_payload["active_subgoal"].startswith("Reassess the route")
+    assert "Verifier labels: route_conflict." in replan_payload["memory_context_text"]
+    assert "memory_images" not in replan_payload
+    tool_names = [call["tool_name"] for call in result.runtime_metadata["tool_calls"]]
+    assert tool_names.count("NavigationPolicySkill") == 2
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["controller_decision"] == "execute_replan"
+    assert visual_readback["replan_request_logged_after_visual_read"] is True
+    assert visual_readback["replan_executed_after_visual_read"] is True
+    assert visual_readback["readback_state_used_by_policy"] is True
+    assert visual_readback["used_by_policy"] is True
+    assert visual_readback["replan_action_text"] == "MOVE_FORWARD"
+    assert visual_readback["final_action"] == "MOVE_FORWARD"
+    assert visual_readback["executed_action_changed_after_visual_read"] is True
+    assert visual_readback["controller_private_replan_state"]["route_stage"] == (
+        "visual_route_conflict_reassess"
+    )
+
+
+def test_image_read_action_override_executes_recommended_action(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    navigation = SequenceNavigationSkill(["MOVE_FORWARD"])
+    visual_skill = ActionHintVisualReadSkill(audit_action_hint="TURN_LEFT")
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "TURN_LEFT"
+    assert len(navigation.calls) == 1
+    assert visual_skill.calls[0]["candidate_action"] == "MOVE_FORWARD"
+    assert visual_skill.calls[0]["trigger_rule"] == "motion_consistency_check"
+    tool_names = [call["tool_name"] for call in result.runtime_metadata["tool_calls"]]
+    assert tool_names.count("NavigationPolicySkill") == 1
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["controller_decision"] == "execute_action_hint"
+    assert visual_readback["action_hint_override_attempted_after_visual_read"] is True
+    assert visual_readback["action_hint_executed_after_visual_read"] is True
+    assert visual_readback["action_hint_used_as_executable_action"] is True
+    assert visual_readback["action_hint_action_text"] == "TURN_LEFT"
+    assert visual_readback["readback_state_used_by_controller"] is True
+    assert visual_readback["readback_state_used_by_policy"] is False
+    assert visual_readback["final_action"] == "TURN_LEFT"
+    assert visual_readback["executed_action_changed_after_visual_read"] is True
+
+
+def test_image_read_action_override_keeps_valid_candidate_action(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["MOVE_FORWARD"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(
+        ActionHintVisualReadSkill(
+            candidate_action_valid=True,
+            should_override=False,
+            invalid_reason="",
+            recommended_action="TURN_LEFT",
+        )
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "MOVE_FORWARD"
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["candidate_action_valid"] is True
+    assert visual_readback["should_override"] is False
+    assert visual_readback["action_hint_executed_after_visual_read"] is False
+    assert visual_readback["action_hint_override_failure_reason"] == (
+        "candidate_action_valid"
+    )
+
+
+def test_image_read_action_override_rejects_payload_without_judge_decision(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["MOVE_FORWARD"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+
+    class LegacyRecommendedActionSkill(Skill):
+        name = "VisualMemoryReadSkill"
+        description = "Returns the old recommendation-only payload."
+        input_schema = {"type": "object"}
+        output_schema = {"type": "object"}
+
+        def run(self, state, payload):
+            del state
+            return SkillResult.ok_result(
+                "visual_memory_read",
+                {
+                    "read_status": "completed",
+                    "trigger_rule": payload.get("trigger_rule"),
+                    "candidate_action": payload.get("candidate_action"),
+                    "verifier_labels": ["route_conflict"],
+                    "audit_action_hint": "TURN_LEFT",
+                    "recommended_action": "TURN_LEFT",
+                    "decision_scope": "immediate_next_action",
+                    "action_confidence": 0.9,
+                    "verifier_confidence": 0.9,
+                },
+            )
+
+    registry.register(LegacyRecommendedActionSkill())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "MOVE_FORWARD"
+    assert result.runtime_metadata["visual_readback"][
+        "action_hint_override_failure_reason"
+    ] == "candidate_action_valid"
+
+
+def test_image_read_action_override_ignores_legacy_text_direction_without_recommended_action(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["TURN_LEFT"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(
+        ActionHintVisualReadSkill(
+            audit_action_hint=(
+                "The target doorway is to the right of the fireplace, but this "
+                "describes a landmark relation rather than an immediate action."
+            ),
+            recommended_action="",
+            decision_scope="landmark_relation",
+        )
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "TURN_LEFT"
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["action_hint_executed_after_visual_read"] is False
+    assert visual_readback["action_hint_override_failure_reason"] == (
+        "not_immediate_next_action"
+    )
+
+
+def test_image_read_action_override_does_not_execute_goal_not_visible_action(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "goal", "step_id": 4},
+        reason="risky_stop",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["STOP"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(
+        ActionHintVisualReadSkill(
+            labels=["goal_not_visible"],
+            recommended_action="MOVE_FORWARD",
+            decision_scope="immediate_next_action",
+            action_confidence=0.95,
+        )
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "STOP"
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["action_hint_executed_after_visual_read"] is False
+    assert visual_readback["action_hint_override_failure_reason"] == (
+        "unsupported_verifier_labels"
+    )
+
+
+def test_image_read_action_override_respects_episode_override_limit(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["MOVE_FORWARD", "MOVE_FORWARD"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(ActionHintVisualReadSkill(recommended_action="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+            visual_readback_max_action_overrides_per_episode=1,
+        ),
+    )
+
+    first = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+    second = runtime.step(
+        make_state(step_id=5),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert first.action_text == "TURN_LEFT"
+    assert second.action_text == "MOVE_FORWARD"
+    visual_readback = second.runtime_metadata["visual_readback"]
+    assert visual_readback["action_hint_executed_after_visual_read"] is False
+    assert visual_readback["action_hint_override_failure_reason"] == (
+        "max_action_overrides_per_episode_reached"
+    )
+
+
+def test_image_read_action_override_adaptive_judges_each_action_without_step_budget(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["MOVE_FORWARD", "MOVE_FORWARD"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(ActionHintVisualReadSkill(recommended_action="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+            visual_readback_max_action_overrides_per_episode="adaptive",
+        ),
+    )
+
+    first = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+    second = runtime.step(
+        make_state(step_id=5),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert first.action_text == "TURN_LEFT"
+    assert second.action_text == "TURN_LEFT"
+    visual_readback = second.runtime_metadata["visual_readback"]
+    assert visual_readback["action_hint_executed_after_visual_read"] is True
+    assert visual_readback["executed_action_changed_after_visual_read"] is True
+    assert visual_readback["action_override_budget_policy"] == "adaptive"
+    assert visual_readback["action_override_budget_limit"] == "per_decision"
+
+
+def test_same_action_recommendation_does_not_consume_override_budget(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["TURN_LEFT", "MOVE_FORWARD"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    visual_skill = ActionHintVisualReadSkill(recommended_action="TURN_LEFT")
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+            visual_readback_max_action_overrides_per_episode=1,
+        ),
+    )
+
+    first = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+    visual_skill.recommended_action = "TURN_RIGHT"
+    second = runtime.step(
+        make_state(step_id=5),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert first.action_text == "TURN_LEFT"
+    assert second.action_text == "TURN_RIGHT"
+    assert first.runtime_metadata["visual_readback"][
+        "executed_action_changed_after_visual_read"
+    ] is False
+    assert second.runtime_metadata["visual_readback"][
+        "executed_action_changed_after_visual_read"
+    ] is True
+
+
+def test_sparse_action_override_skips_plain_move_forward_readback(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="ordinary_forward",
+        planner_backend="gateway",
+    )
+    navigation = SequenceNavigationSkill(["MOVE_FORWARD"])
+    visual_skill = ActionHintVisualReadSkill(audit_action_hint="TURN_LEFT")
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "MOVE_FORWARD"
+    assert visual_skill.calls == []
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["read_status"] == "skipped"
+    assert visual_readback["skip_reason"] == "no_trigger"
+    assert visual_readback["trigger_rule"] == ""
+    assert visual_readback["trigger_policy"] == "sparse_action_override"
+    assert visual_readback["action_hint_override_failure_reason"] == "readback_not_completed"
+    assert result.runtime_metadata["visual_readback_config"][
+        "visual_readback_trigger_policy"
+    ] == "sparse_action_override"
+
+
+def test_sparse_action_override_reads_saved_keyframe_turn_event(tmp_path):
+    current = tmp_path / "current.png"
+    target = tmp_path / "keyframes" / "s1" / "e1" / "step_000010.png"
+    prior = tmp_path / "keyframes" / "s1" / "e1" / "step_000000.png"
+    current.write_text("current", encoding="utf-8")
+    prior.parent.mkdir(parents=True, exist_ok=True)
+    prior.write_text("prior", encoding="utf-8")
+    run_id = str(tmp_path / "run-1")
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="NavigationPolicySkill",
+        arguments={},
+        reason="ordinary_gateway_act",
+        planner_backend="gateway",
+    )
+    navigation = SequenceNavigationSkill(["TURN_RIGHT"])
+    visual_skill = ActionHintVisualReadSkill(audit_action_hint="TURN_LEFT")
+    registry = SkillRegistry()
+    registry.register(navigation)
+    registry.register(visual_skill)
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            keyframe_policy_mode="event_gated_smoke",
+            keyframe_min_gap_steps=5,
+        ),
+    )
+    runtime.event_gated_keyframe_ledger.append(
+        {
+            "run_id": run_id,
+            "scene_id": "s1",
+            "episode_id": "e1",
+            "step_id": 0,
+            "memory_id": "image-backed-local-0",
+            "memory_type": "semantic_frame",
+            "memory_namespace": "episode:s1:e1",
+            "source_image_role": "event_gated_keyframe",
+            "image_path": str(prior),
+            "retrieval_text": "prior hallway keyframe",
+            "confidence": 1.0,
+        }
+    )
+
+    result = runtime.step(
+        make_state(step_id=10),
+        payload={
+            "run_id": run_id,
+            "current_image_path": str(current),
+            "keyframe_target_path": str(target),
+        },
+    )
+
+    assert result.action_text == "TURN_LEFT"
+    assert visual_skill.calls[0]["candidate_action"] == "TURN_RIGHT"
+    assert visual_skill.calls[0]["trigger_rule"] == "decision_point"
+    assert visual_skill.calls[0]["memory_hits"][0].image_path == str(prior)
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["trigger_policy"] == "sparse_action_override"
+    assert visual_readback["candidate_pool_attached_count"] == 1
+    assert visual_readback["action_hint_executed_after_visual_read"] is True
+    assert result.runtime_metadata["keyframe_gate"]["save_decision"] == "save"
+
+
+def test_image_read_action_override_rejects_invalid_recommended_action(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    decision = OpenClawPlanDecision(
+        intent="recall_memory",
+        tool_name="MemoryQuerySkill",
+        arguments={"text": "route", "step_id": 4},
+        reason="motion_consistency_check",
+        planner_backend="gateway",
+    )
+    registry = SkillRegistry()
+    registry.register(SequenceNavigationSkill(["MOVE_FORWARD"]))
+    registry.register(ImageMemoryContextSkill(str(memory)))
+    registry.register(
+        ActionHintVisualReadSkill(
+            audit_action_hint="fly upward",
+            recommended_action="fly upward",
+        )
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        allow_planner_action_override=False,
+        config=HarnessConfig(
+            memory_backend="image_backed_local",
+            visual_readback_mode="image_read_action_override",
+            visual_readback_trigger_policy="dense_action_override",
+        ),
+    )
+
+    result = runtime.step(
+        make_state(step_id=4),
+        payload={"current_image_path": str(current)},
+    )
+
+    assert result.action_text == "MOVE_FORWARD"
+    visual_readback = result.runtime_metadata["visual_readback"]
+    assert visual_readback["action_hint_executed_after_visual_read"] is False
+    assert visual_readback["action_hint_override_failure_reason"] == (
+        "invalid_recommended_action"
+    )
 
 
 def test_runtime_records_recall_usage_metadata():

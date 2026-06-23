@@ -17,6 +17,13 @@ class NoopVisualReadbackAdapter:
         del request
         return {
             "verifier_labels": ["insufficient_evidence"],
+            "audit_action_hint": "",
+            "candidate_action_valid": True,
+            "should_override": False,
+            "invalid_reason": "",
+            "recommended_action": "",
+            "decision_scope": "",
+            "action_confidence": 0.0,
             "readback_confidence": 0.0,
             "verifier_confidence": 0.0,
             "visual_grounding_status": "unverified",
@@ -110,8 +117,26 @@ class QwenDirectVisualReadbackAdapter:
             "Use verifier_labels from this closed set only: route_conflict, "
             "goal_not_visible, insufficient_evidence. If current and memory views "
             "show conflicting landmarks/layouts, use route_conflict.\n"
+            "First judge whether candidate_action is reasonable as the immediate "
+            "next action from the current view. Set candidate_action_valid to true "
+            "when the candidate should be allowed to execute, even if another action "
+            "might also work. Set candidate_action_valid to false only when visual "
+            "evidence shows the candidate is wrong or unsafe. Set should_override "
+            "to true only when candidate_action_valid is false and the visual "
+            "evidence supports a concrete replacement action from the current view. "
+            "If should_override is true, set recommended_action to exactly one of "
+            "TURN_LEFT, TURN_RIGHT, MOVE_FORWARD, STOP, decision_scope to "
+            "immediate_next_action, action_confidence from 0.0 to 1.0, and "
+            "invalid_reason to route_conflict, risky_stop, obstacle, or "
+            "insufficient_evidence. If the candidate is valid or evidence only "
+            "supports landmark relations, route diagnosis, or uncertainty, set "
+            "should_override to false, recommended_action to null, decision_scope "
+            "to landmark_relation or route_diagnosis_only, and action_confidence "
+            "to 0.0.\n"
             "Return only compact JSON with keys: verifier_labels, matched_memory_ids, "
-            "visual_evidence, audit_action_hint, evidence_sources, readback_confidence, "
+            "visual_evidence, audit_action_hint, candidate_action_valid, "
+            "should_override, invalid_reason, recommended_action, decision_scope, "
+            "action_confidence, evidence_sources, readback_confidence, "
             "verifier_confidence, visual_grounding_status."
             )
 
@@ -228,6 +253,13 @@ class VisualMemoryReadSkill(Skill):
             "model_image_count": {"type": "integer"},
             "verifier_labels": {"type": "array"},
             "matched_memory_ids": {"type": "array"},
+            "audit_action_hint": {"type": "string"},
+            "candidate_action_valid": {"type": "boolean"},
+            "should_override": {"type": "boolean"},
+            "invalid_reason": {"type": "string"},
+            "recommended_action": {"type": "string"},
+            "decision_scope": {"type": "string"},
+            "action_confidence": {"type": "number"},
             "evidence_sources": {"type": "array"},
             "memory_evidence_used_count": {"type": "integer"},
             "current_only_evidence_count": {"type": "integer"},

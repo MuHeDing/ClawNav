@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict
 
 from harness.config import (
     HarnessConfig,
+    parse_action_override_budget,
     parse_visual_readback_bool,
     validate_visual_readback_config,
 )
@@ -112,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--openclaw_allow_planner_action_override", action="store_true", default=False)
     parser.add_argument("--visual_readback_mode", type=str, default=None)
+    parser.add_argument("--visual_readback_trigger_policy", type=str, default=None)
     parser.add_argument("--visual_readback_top_k", type=int, default=None)
     parser.add_argument("--visual_readback_timeout_ms", type=int, default=None)
     parser.add_argument("--visual_readback_low_confidence", type=float, default=None)
@@ -122,6 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual_readback_fixed_case_manifest", type=str, default=None)
     parser.add_argument("--visual_readback_stop_fallback_policy", type=str, default=None)
     parser.add_argument("--visual_readback_smoke_seed_memory", type=parse_bool, default=None)
+    parser.add_argument(
+        "--visual_readback_max_action_overrides_per_episode",
+        type=parse_action_override_budget,
+        default=None,
+    )
     parser.add_argument("--keyframe_policy_mode", type=str, default=None)
     parser.add_argument("--keyframe_min_gap_steps", type=int, default=None)
     parser.add_argument("--keyframe_episode_cap", type=int, default=None)
@@ -219,6 +226,13 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             defaults.visual_readback_mode,
             str,
         ),
+        visual_readback_trigger_policy=_config_value(
+            args,
+            "visual_readback_trigger_policy",
+            "OPENCLAW_VISUAL_READBACK_TRIGGER_POLICY",
+            defaults.visual_readback_trigger_policy,
+            str,
+        ),
         visual_readback_top_k=_config_value(
             args,
             "visual_readback_top_k",
@@ -288,6 +302,13 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             "OPENCLAW_VISUAL_READBACK_SMOKE_SEED_MEMORY",
             defaults.visual_readback_smoke_seed_memory,
             parse_visual_readback_bool,
+        ),
+        visual_readback_max_action_overrides_per_episode=_config_value(
+            args,
+            "visual_readback_max_action_overrides_per_episode",
+            "OPENCLAW_VISUAL_READBACK_MAX_ACTION_OVERRIDES_PER_EPISODE",
+            defaults.visual_readback_max_action_overrides_per_episode,
+            parse_action_override_budget,
         ),
         keyframe_policy_mode=_config_value(
             args,

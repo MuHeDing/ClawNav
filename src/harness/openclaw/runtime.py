@@ -42,6 +42,17 @@ ACTION_ARGUMENT_KEYS = (
     "preferred_action",
     "forced_action_text",
 )
+VISUAL_READBACK_POST_POLICY_MODES = {
+    "image_read_controller",
+    "current_only_controller",
+    "image_read_replan_prompt",
+    "image_read_action_override",
+}
+VISUAL_READBACK_MEMORY_ATTACHMENT_MODES = {
+    "image_read_controller",
+    "image_read_replan_prompt",
+    "image_read_action_override",
+}
 
 OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX = "openclaw_cli_agent_fallback:"
 OPENCLAW_CLI_MODEL_FALLBACK_REASON_PREFIX = "openclaw_cli_model_fallback:"
@@ -94,6 +105,9 @@ class OpenClawVLNRuntime:
         self._stop_state_episode_key = ("", "")
         self.last_executed_non_stop_action = ""
         self.last_executed_non_stop_action_age = 0
+        self.controller_private_replan_state: Dict[str, Any] = {}
+        self.visual_readback_replans_this_episode = 0
+        self.visual_readback_action_overrides_this_episode = 0
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -309,7 +323,7 @@ class OpenClawVLNRuntime:
             )
         policy_context_available = self._navigation_payload_has_memory(nav_payload)
         context_engine_context_available = bool(runtime_payload.get("memory_context_text"))
-        if self._control_only_visual_readback_enabled():
+        if self._clean_candidate_policy_required():
             nav_payload = self._clean_policy_payload(nav_payload)
         final_policy_payload_has_memory = self._navigation_payload_has_memory(nav_payload)
 
@@ -355,6 +369,19 @@ class OpenClawVLNRuntime:
                 action_text,
                 visual_readback["trace"],
             )
+            action_text = self._apply_visual_readback_action_override(
+                action_text,
+                visual_readback["trace"],
+            )
+            replan_result = self._execute_visual_readback_replan(
+                state=state,
+                clean_nav_payload=nav_payload,
+                candidate_action=visual_readback["trace"].get("candidate_action", action_text),
+                trace=visual_readback["trace"],
+            )
+            if replan_result:
+                tool_calls.append(replan_result["tool_call"])
+                action_text = replan_result["action_text"]
         if keyframe_gate:
             self._finalize_keyframe_gate(keyframe_gate, action_text)
         metadata = self._metadata(
@@ -365,7 +392,13 @@ class OpenClawVLNRuntime:
             runtime_context=runtime_payload,
             action_text=action_text,
             causal_recall=causal_recall,
-            policy_payload_has_memory=final_policy_payload_has_memory,
+            policy_payload_has_memory=(
+                final_policy_payload_has_memory
+                or bool(
+                    visual_readback
+                    and visual_readback["trace"].get("readback_state_used_by_policy")
+                )
+            ),
         )
         if planner_error:
             metadata["planner_error"] = planner_error
@@ -1083,11 +1116,11 @@ class OpenClawVLNRuntime:
             if key in NAVIGATION_CONTEXT_KEYS
         }
 
-    def _control_only_visual_readback_enabled(self) -> bool:
-        return self.config.visual_readback_mode in {
-            "image_read_controller",
-            "current_only_controller",
-        }
+    def _post_policy_visual_readback_enabled(self) -> bool:
+        return self.config.visual_readback_mode in VISUAL_READBACK_POST_POLICY_MODES
+
+    def _clean_candidate_policy_required(self) -> bool:
+        return self.config.visual_readback_mode in VISUAL_READBACK_POST_POLICY_MODES
 
     def _clean_policy_payload(self, nav_payload: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -1301,7 +1334,7 @@ class OpenClawVLNRuntime:
         context_engine_context_available: bool,
         final_policy_payload_has_memory: bool,
     ) -> Dict[str, Any]:
-        if not self._control_only_visual_readback_enabled():
+        if not self._post_policy_visual_readback_enabled():
             return {}
         if self.tool_adapter.get_tool_schema("VisualMemoryReadSkill") is None:
             return {}
@@ -1311,10 +1344,12 @@ class OpenClawVLNRuntime:
         )
         base_trace = {
             "mode": self.config.visual_readback_mode,
+            "trigger_policy": self.config.visual_readback_trigger_policy,
             "trigger_source": str(
                 runtime_payload.get("visual_readback_trigger_source")
                 or "online_controller"
             ),
+            "step_id": state.step_id,
             "trigger_rule": trigger_rule,
             "candidate_action": candidate_action,
             "policy_context_available": policy_context_available,
@@ -1326,7 +1361,10 @@ class OpenClawVLNRuntime:
         }
         if not trigger_rule:
             base_trace.update({"read_status": "skipped", "skip_reason": "no_trigger"})
-            return {"trace": base_trace, "tool_call": self._skipped_visual_readback_call(base_trace)}
+            return {
+                "trace": base_trace,
+                "tool_call": self._skipped_visual_readback_call(base_trace),
+            }
         current_image_path = str(runtime_payload.get("current_image_path") or "")
         if not current_image_path:
             base_trace.update(
@@ -1338,7 +1376,7 @@ class OpenClawVLNRuntime:
         candidate_pool_trace: Dict[str, Any] = {}
         if (
             self.config.keyframe_policy_mode == "event_gated_smoke"
-            and self.config.visual_readback_mode == "image_read_controller"
+            and self.config.visual_readback_mode in VISUAL_READBACK_MEMORY_ATTACHMENT_MODES
         ):
             memory_hits, candidate_pool_trace = self._event_gated_smoke_candidate_pool(
                 state=state,
@@ -1346,9 +1384,9 @@ class OpenClawVLNRuntime:
                 current_image_path=current_image_path,
             )
             base_trace.update(candidate_pool_trace)
-        elif self.config.visual_readback_mode == "image_read_controller":
+        elif self.config.visual_readback_mode in VISUAL_READBACK_MEMORY_ATTACHMENT_MODES:
             memory_hits = self._latest_memory_hits(tool_calls)
-        if self.config.visual_readback_mode == "image_read_controller" and not memory_hits:
+        if self.config.visual_readback_mode in VISUAL_READBACK_MEMORY_ATTACHMENT_MODES and not memory_hits:
             skip_reason = (
                 "no_eligible_prior_keyframe"
                 if self.config.keyframe_policy_mode == "event_gated_smoke"
@@ -1373,6 +1411,214 @@ class OpenClawVLNRuntime:
             trace.update(payload)
         trace.update(candidate_pool_trace)
         return {"trace": trace, "tool_call": tool_call}
+
+    def _execute_visual_readback_replan(
+        self,
+        state: VLNState,
+        clean_nav_payload: Dict[str, Any],
+        candidate_action: str,
+        trace: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        trace.setdefault("replan_executed_after_visual_read", False)
+        trace.setdefault("replan_attempted_after_visual_read", False)
+        trace.setdefault("replan_action_changed_after_visual_read", False)
+        trace.setdefault("replan_failure_reason", "")
+        if self.config.visual_readback_mode != "image_read_replan_prompt":
+            return {}
+        if not trace.get("replan_request_logged_after_visual_read"):
+            return {}
+        if self.visual_readback_replans_this_episode >= self.config.max_replans_per_episode:
+            trace["replan_failure_reason"] = "max_replans_per_episode_reached"
+            return {}
+        original_action = self._normalize_action_text(candidate_action) or "STOP"
+        replan_payload = self._visual_readback_replan_payload(
+            clean_nav_payload=clean_nav_payload,
+            candidate_action=str(candidate_action or ""),
+            trace=trace,
+        )
+        trace["replan_attempted_after_visual_read"] = True
+        trace["replan_policy_payload_has_readback"] = True
+        trace["replan_policy_payload_has_memory_images"] = bool(
+            replan_payload.get("memory_images")
+        )
+        tool_call = self.tool_adapter.call_tool(
+            "NavigationPolicySkill",
+            replan_payload,
+            state=state,
+        )
+        if not tool_call.get("ok"):
+            trace["replan_failure_reason"] = (
+                str(tool_call.get("error") or "") or "navigation_replan_failed"
+            )
+            return {"tool_call": tool_call, "action_text": original_action}
+
+        payload = tool_call.get("payload") if isinstance(tool_call.get("payload"), dict) else {}
+        replan_action = self._normalize_action_text(payload.get("action_text"))
+        if not replan_action:
+            trace["replan_failure_reason"] = "navigation_replan_invalid_action"
+            return {"tool_call": tool_call, "action_text": original_action}
+
+        self.visual_readback_replans_this_episode += 1
+        self.controller_private_replan_state = {
+            "route_stage": "visual_route_conflict_reassess",
+            "source": "visual_readback",
+            "labels": list(trace.get("verifier_labels") or []),
+            "candidate_action": original_action,
+            "replan_action": replan_action,
+        }
+        trace["controller_private_replan_state"] = dict(self.controller_private_replan_state)
+        trace["controller_decision"] = "execute_replan"
+        trace["replan_executed_after_visual_read"] = True
+        trace["readback_state_used_by_policy"] = True
+        trace["used_by_policy"] = True
+        trace["replan_action_text"] = replan_action
+        trace["final_action"] = replan_action
+        trace["executed_action_changed_after_visual_read"] = replan_action != original_action
+        trace["replan_action_changed_after_visual_read"] = replan_action != original_action
+        return {"tool_call": tool_call, "action_text": replan_action}
+
+    def _visual_readback_replan_payload(
+        self,
+        clean_nav_payload: Dict[str, Any],
+        candidate_action: str,
+        trace: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload = self._clean_policy_payload(dict(clean_nav_payload))
+        evidence_items = trace.get("visual_evidence") or []
+        if not isinstance(evidence_items, list):
+            evidence_items = [str(evidence_items)]
+        evidence_text = "; ".join(str(item) for item in evidence_items if str(item))
+        label_text = ", ".join(str(label) for label in trace.get("verifier_labels") or [])
+        prompt_lines = [
+            "Visual readback requested a route reassessment.",
+            f"Candidate action before reassessment: {self._normalize_action_text(candidate_action) or candidate_action}",
+        ]
+        if label_text:
+            prompt_lines.append(f"Verifier labels: {label_text}.")
+        if evidence_text:
+            prompt_lines.append(f"Visual evidence: {evidence_text}")
+        prompt_lines.append(
+            "Choose the next navigation action from the current view; do not follow audit action hints directly."
+        )
+        replan_context = "\n".join(prompt_lines)
+        payload["active_subgoal"] = "Reassess the route after verified visual readback conflict."
+        payload["memory_context_text"] = replan_context
+        return payload
+
+    def _apply_visual_readback_action_override(
+        self,
+        current_action: str,
+        trace: Dict[str, Any],
+    ) -> str:
+        trace.setdefault("action_hint_override_attempted_after_visual_read", False)
+        trace.setdefault("action_hint_executed_after_visual_read", False)
+        trace.setdefault("action_hint_used_as_executable_action", False)
+        trace.setdefault("action_hint_action_text", "")
+        trace.setdefault("action_hint_override_failure_reason", "")
+        trace.setdefault("readback_state_used_by_controller", False)
+        if self.config.visual_readback_mode != "image_read_action_override":
+            return current_action
+
+        original_action = self._normalize_action_text(
+            trace.get("candidate_action")
+        ) or self._normalize_action_text(current_action) or "STOP"
+        if trace.get("read_status") != "completed":
+            trace["action_hint_override_failure_reason"] = "readback_not_completed"
+            return current_action
+        labels = set(str(label) for label in trace.get("verifier_labels") or [])
+        high_confidence = float(trace.get("verifier_confidence") or 0.0) >= float(
+            self.config.visual_readback_high_confidence
+        )
+        if not high_confidence:
+            trace["action_hint_override_failure_reason"] = "low_verifier_confidence"
+            return current_action
+
+        candidate_action_valid = bool(trace.get("candidate_action_valid", True))
+        should_override = bool(trace.get("should_override", False))
+        if candidate_action_valid:
+            trace["action_hint_override_failure_reason"] = "candidate_action_valid"
+            return current_action
+        if not should_override:
+            trace["action_hint_override_failure_reason"] = "override_not_requested"
+            return current_action
+
+        decision_scope = str(trace.get("decision_scope") or "").strip().lower()
+        if decision_scope != "immediate_next_action":
+            trace["action_hint_override_failure_reason"] = (
+                "not_immediate_next_action"
+                if decision_scope
+                else "missing_decision_scope"
+            )
+            return current_action
+
+        action_confidence = float(trace.get("action_confidence") or 0.0)
+        if action_confidence < float(self.config.visual_readback_high_confidence):
+            trace["action_hint_override_failure_reason"] = "low_action_confidence"
+            return current_action
+
+        raw_recommended_action = str(trace.get("recommended_action") or "").strip()
+        hinted_action = self._normalize_action_text(raw_recommended_action)
+        if not hinted_action:
+            trace["action_hint_override_failure_reason"] = (
+                "invalid_recommended_action"
+                if raw_recommended_action
+                else "missing_recommended_action"
+            )
+            return current_action
+        trace["action_hint_action_text"] = hinted_action
+
+        supported_by_label = "route_conflict" in labels
+        if not supported_by_label:
+            trace["action_hint_override_failure_reason"] = "unsupported_verifier_labels"
+            return current_action
+        if hinted_action == "STOP" and bool(
+            {"goal_not_visible", "insufficient_evidence"} & labels
+        ):
+            trace["action_hint_override_failure_reason"] = "contradictory_stop_hint"
+            return current_action
+        changes_action = hinted_action != original_action
+        budget_policy, budget_limit = self._visual_readback_action_override_budget(
+            trace
+        )
+        trace["action_override_budget_policy"] = budget_policy
+        trace["action_override_budget_limit"] = budget_limit
+        trace["action_override_budget_used"] = (
+            self.visual_readback_action_overrides_this_episode
+        )
+        trace["action_override_budget_requires_change"] = changes_action
+        if not changes_action:
+            trace["final_action"] = current_action
+            trace["executed_action_changed_after_visual_read"] = False
+            return current_action
+        if (
+            budget_policy != "adaptive"
+            and self.visual_readback_action_overrides_this_episode >= budget_limit
+        ):
+            trace["action_hint_override_failure_reason"] = (
+                "max_action_overrides_per_episode_reached"
+            )
+            return current_action
+
+        trace["action_hint_override_attempted_after_visual_read"] = True
+        trace["action_hint_executed_after_visual_read"] = True
+        trace["action_hint_used_as_executable_action"] = True
+        trace["readback_state_used_by_controller"] = True
+        trace["controller_decision"] = "execute_action_hint"
+        trace["controller_decision_changed_after_visual_read"] = True
+        trace["final_action"] = hinted_action
+        trace["executed_action_changed_after_visual_read"] = True
+        self.visual_readback_action_overrides_this_episode += 1
+        return hinted_action
+
+    def _visual_readback_action_override_budget(
+        self,
+        trace: Dict[str, Any],
+    ) -> tuple[str, Any]:
+        del trace
+        configured_budget = self.config.visual_readback_max_action_overrides_per_episode
+        if str(configured_budget).strip().lower() != "adaptive":
+            return "fixed", int(configured_budget)
+        return "adaptive", "per_decision"
 
     def _apply_visual_readback_controller(
         self,
@@ -1457,10 +1703,44 @@ class OpenClawVLNRuntime:
         if explicit:
             return explicit
         action = self._normalize_action_text(candidate_action) or ""
+        if self.config.visual_readback_mode == "image_read_action_override":
+            if self.config.visual_readback_trigger_policy == "dense_action_override":
+                return self._dense_action_override_trigger_rule(action)
+            return self._sparse_action_override_trigger_rule(action, runtime_payload)
+        return self._default_visual_readback_trigger_rule(action)
+
+    def _default_visual_readback_trigger_rule(self, action: str) -> str:
         if action == "STOP":
             return "risky_stop"
         if action in {"TURN_LEFT", "TURN_RIGHT"}:
             return "decision_point"
+        return ""
+
+    def _dense_action_override_trigger_rule(self, action: str) -> str:
+        if action == "MOVE_FORWARD":
+            return "motion_consistency_check"
+        return self._default_visual_readback_trigger_rule(action)
+
+    def _sparse_action_override_trigger_rule(
+        self,
+        action: str,
+        runtime_payload: Dict[str, Any],
+    ) -> str:
+        if action == "STOP":
+            return "risky_stop"
+        keyframe_gate = runtime_payload.get("keyframe_gate")
+        if not isinstance(keyframe_gate, dict):
+            return ""
+        if keyframe_gate.get("save_decision") != "save":
+            return ""
+        save_reason = str(keyframe_gate.get("save_reason") or "")
+        if (
+            save_reason == "candidate_decision_point"
+            and action in {"TURN_LEFT", "TURN_RIGHT"}
+        ):
+            return "decision_point"
+        if save_reason == "coverage_gap" and action == "MOVE_FORWARD":
+            return "motion_consistency_check"
         return ""
 
     def _event_gated_smoke_candidate_pool(
@@ -1573,6 +1853,7 @@ class OpenClawVLNRuntime:
     def _visual_readback_config_metadata(self) -> Dict[str, Any]:
         return {
             "visual_readback_mode": self.config.visual_readback_mode,
+            "visual_readback_trigger_policy": self.config.visual_readback_trigger_policy,
             "visual_readback_top_k": self.config.visual_readback_top_k,
             "visual_readback_timeout_ms": self.config.visual_readback_timeout_ms,
             "visual_readback_low_confidence": self.config.visual_readback_low_confidence,
@@ -1588,6 +1869,9 @@ class OpenClawVLNRuntime:
             ),
             "visual_readback_smoke_seed_memory": (
                 self.config.visual_readback_smoke_seed_memory
+            ),
+            "visual_readback_max_action_overrides_per_episode": (
+                self.config.visual_readback_max_action_overrides_per_episode
             ),
             "keyframe_policy_mode": self.config.keyframe_policy_mode,
             "keyframe_min_gap_steps": self.config.keyframe_min_gap_steps,
@@ -1605,6 +1889,9 @@ class OpenClawVLNRuntime:
         self._stop_state_episode_key = episode_key
         self.last_executed_non_stop_action = ""
         self.last_executed_non_stop_action_age = 0
+        self.controller_private_replan_state = {}
+        self.visual_readback_replans_this_episode = 0
+        self.visual_readback_action_overrides_this_episode = 0
 
     def _update_stop_fallback_state(self, action_text: str) -> None:
         action = self._normalize_action_text(action_text)
