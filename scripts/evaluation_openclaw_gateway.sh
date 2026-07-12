@@ -2,7 +2,9 @@
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra}
-OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway3}
+RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
+OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway3_${RUN_TIMESTAMP}}
+POLICY_BACKEND=${POLICY_BACKEND:-janus_policy}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4}
 MASTER_PORT=${MASTER_PORT:-20401}
 TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
@@ -19,6 +21,18 @@ OPENCLAW_SERVICE_HOST=${OPENCLAW_SERVICE_HOST:-127.0.0.1}
 NO_PROXY=${NO_PROXY:-127.0.0.1,localhost,::1}
 no_proxy=${no_proxy:-${NO_PROXY}}
 
+should_enable_flag() {
+  local v="${1:-}"
+  case "${v,,}" in
+    1|true|yes|y|on)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 HARNESS_MEMORY_BACKEND=${HARNESS_MEMORY_BACKEND:-fake}
 HARNESS_MEMORY_SOURCE=${HARNESS_MEMORY_SOURCE:-episode-local}
 SPATIAL_MEMORY_URL=${SPATIAL_MEMORY_URL:-http://127.0.0.1:8022}
@@ -28,6 +42,10 @@ OPENCLAW_EXECUTOR_BACKEND=${OPENCLAW_EXECUTOR_BACKEND:-habitat}
 OPENCLAW_ROBOT_EXECUTOR_URL=${OPENCLAW_ROBOT_EXECUTOR_URL:-}
 OPENCLAW_ENABLE_SUBAGENT_CRITIC=${OPENCLAW_ENABLE_SUBAGENT_CRITIC:-0}
 OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR=${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR:-0}
+SAVE_VIDEO=${SAVE_VIDEO:-0}
+SAVE_VIDEO_RATIO=${SAVE_VIDEO_RATIO:-0.05}
+SAVE_STEP_ARTIFACTS=${SAVE_STEP_ARTIFACTS:-0}
+SAVE_STEP_ARTIFACTS_WITH_VIDEO_ONLY=${SAVE_STEP_ARTIFACTS_WITH_VIDEO_ONLY:-0}
 
 HARNESS_SELECTED_EPISODES=(
   "2azQ1b91cZZ:11"
@@ -110,6 +128,18 @@ fi
 if [[ "${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR}" == "1" ]]; then
   extra_args+=(--openclaw_enable_subagent_memory_curator)
 fi
+if should_enable_flag "${SAVE_VIDEO}"; then
+  extra_args+=(--save_video)
+fi
+if [[ -n "${SAVE_VIDEO_RATIO}" ]]; then
+  extra_args+=(--save_video_ratio "${SAVE_VIDEO_RATIO}")
+fi
+if should_enable_flag "${SAVE_STEP_ARTIFACTS}"; then
+  extra_args+=(--save_step_artifacts)
+fi
+if should_enable_flag "${SAVE_STEP_ARTIFACTS_WITH_VIDEO_ONLY}"; then
+  extra_args+=(--save_step_artifacts_with_video_only)
+fi
 
 echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
@@ -121,6 +151,7 @@ echo "Use default episode keys: ${HARNESS_USE_DEFAULT_EPISODE_KEYS}"
 echo "Episode keys: ${HARNESS_EPISODE_KEYS:-all}"
 echo "Max steps per episode: ${MAX_STEPS}"
 echo "Output path: ${OUTPUT_PATH}"
+echo "Policy backend: ${POLICY_BACKEND}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES}"
 echo "Torch processes: ${NPROC_PER_NODE}"
 
@@ -153,6 +184,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
   --master_port="${MASTER_PORT}" \
   src/evaluation_harness.py \
   --model_path "${MODEL_PATH}" \
+  --policy_backend "${POLICY_BACKEND}" \
   --habitat_config_path config/vln_r2r.yaml \
   --eval_split "${EVAL_SPLIT}" \
   --max_steps "${MAX_STEPS}" \

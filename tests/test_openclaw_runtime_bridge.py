@@ -186,11 +186,11 @@ class EchoReplannerSkill(Skill):
         return SkillResult.ok_result("replan", {"active_subgoal": "recover hallway"})
 
 
-def make_state(step_id=1):
+def make_state(step_id=1, instruction="go to kitchen"):
     return VLNState(
         scene_id="s1",
         episode_id="e1",
-        instruction="go to kitchen",
+        instruction=instruction,
         step_id=step_id,
         current_image=None,
     )
@@ -383,6 +383,83 @@ def test_runtime_mirrors_memory_writes_into_context_engine_retrieval(tmp_path):
     assert second.runtime_metadata["context_engine"]["recorded"] is True
     assert planner.payloads[1]["retrieved_memory_ids"] == ["mem_000001"]
     assert "blue doorway ahead" in planner.payloads[1]["memory_context_text"]
+
+
+def test_runtime_seeds_saved_keyframes_into_context_engine_retrieval(tmp_path):
+    keyframe = tmp_path / "step_000000.png"
+    current = tmp_path / "step_000001.png"
+    keyframe.write_bytes(b"keyframe")
+    current.write_bytes(b"current")
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "MOVE_FORWARD",
+                    "confidence": 0.9,
+                    "progress_state": "approaching archway",
+                    "stop_evidence": "none",
+                },
+                reason="archway remains ahead",
+                planner_backend="gateway",
+            ),
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "MOVE_FORWARD",
+                    "confidence": 0.9,
+                    "progress_state": "approaching archway",
+                    "stop_evidence": "none",
+                },
+                reason="use retrieved archway keyframe",
+                planner_backend="gateway",
+            ),
+        ]
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    first = runtime.step(
+        make_state(step_id=0),
+        payload={
+            "run_id": str(tmp_path),
+            "current_image_path": str(keyframe),
+            "keyframe_candidate": {
+                "step_id": 0,
+                "reason": "central archway keyframe",
+                "image_path": str(keyframe),
+            },
+        },
+    )
+    second = runtime.step(
+        make_state(step_id=1),
+        payload={
+            "run_id": str(tmp_path),
+            "current_image_path": str(current),
+            "memory_query": "central archway",
+        },
+    )
+
+    assert first.runtime_metadata["context_engine"]["seeded_keyframe_memory_ids"] == [
+        "mem_000001"
+    ]
+    assert second.runtime_metadata["context_engine"]["memory_context_used"] is True
+    assert planner.payloads[1]["retrieved_memory_ids"] == ["mem_000001"]
+    assert planner.payloads[1]["retrieved_memory_image_paths"] == [str(keyframe)]
+    assert planner.payloads[1]["retrieved_memory_images"] == [
+        {
+            "memory_id": "mem_000001",
+            "image_path": str(keyframe),
+            "source": "openclaw_retrieved_memory",
+            "step_id": 0,
+        }
+    ]
 
 
 def test_runtime_falls_back_to_rule_planner_when_gateway_fails():
@@ -671,6 +748,522 @@ def test_runtime_stops_on_openclaw_cli_model_fallback_without_policy_call():
     )
     assert result.runtime_metadata["context_audit"]["planner_step_mode"] == "fast_text"
     assert result.runtime_metadata["tool_calls"] == []
+
+
+def test_qwen_direct_runtime_uses_context_audit_for_forward_stall_gate():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="QwenDirectPolicy",
+        arguments={
+            "action_text": "MOVE_FORWARD",
+            "confidence": 0.9,
+            "progress_state": "unknown",
+            "stop_evidence": "none",
+        },
+        reason="qwen direct",
+        planner_backend="gateway",
+        runtime_metadata={
+            "context_audit": {
+                "policy_backend": "qwen_direct",
+                "planner_step_mode": "fast_text",
+                "planner_authority": "qwen",
+            }
+        },
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    result = runtime.step(
+        make_state(step_id=12),
+        payload={
+            "recent_actions": [
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+            ]
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "TURN_LEFT"
+    assert result.runtime_metadata["forward_stall_gate_decision"] == "blocked"
+    assert result.runtime_metadata["final_action_source"] == "forward_stall_gate"
+
+
+def test_qwen_direct_blocked_stop_requeries_for_non_stop_action():
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "STOP",
+                    "confidence": 0.9,
+                    "visual_summary": "Archway target reached environment.",
+                    "progress_state": "arrival assumed from step count",
+                    "stop_evidence": "instruction_complete",
+                    "reason": "The archway destination is assumed reached.",
+                },
+                reason="weak stop",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            ),
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "TURN_RIGHT",
+                    "confidence": 0.72,
+                    "visual_summary": "Archway is not centered in the current view.",
+                    "progress_state": "needs_reorientation",
+                    "stop_evidence": "none",
+                    "reason": "STOP was rejected, so reorient toward the target.",
+                },
+                reason="blocked stop recovery",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            ),
+        ]
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    result = runtime.step(
+        make_state(step_id=12),
+        payload={"recent_actions": ["MOVE_FORWARD", "MOVE_FORWARD", "TURN_LEFT"]},
+    )
+
+    assert result.ok is True
+    assert result.action_text == "TURN_RIGHT"
+    assert len(planner.payloads) == 2
+    feedback = planner.payloads[1]["blocked_stop_feedback"]
+    assert feedback["blocked_action"] == "STOP"
+    assert feedback["allowed_actions"] == [
+        "MOVE_FORWARD",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+    ]
+    assert feedback["stop_evidence"] == "instruction_complete"
+    assert "MOVE_FORWARD only" in feedback["reason"]
+    assert planner.payloads[1]["control_context"]["force_non_stop_action"] is True
+    assert result.runtime_metadata["qwen_direct_requery_triggered"] is True
+    assert result.runtime_metadata["qwen_direct_requery_reason"] == "blocked_stop_gate"
+    assert result.runtime_metadata["qwen_direct_initial_candidate_action"] == "STOP"
+    assert result.runtime_metadata["candidate_action"] == "TURN_RIGHT"
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_structural_stop_confirmation_moves_forward_without_requery():
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "STOP",
+                    "confidence": 0.9,
+                    "visual_summary": (
+                        "At the archway threshold, framed by the wooden archway."
+                    ),
+                    "progress_state": "Target reached.",
+                    "stop_evidence": "visible_goal",
+                    "current_target": "central archway",
+                    "target_relation": "at_threshold",
+                    "semantic_stop_state": "at_or_inside_target",
+                    "reason": "The current image shows the agent at the threshold.",
+                },
+                reason="early threshold stop",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            )
+        ]
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    result = runtime.step(
+        make_state(
+            step_id=15,
+            instruction="Walk across the floor and wait the archway. ",
+        ),
+        payload={"recent_actions": ["MOVE_FORWARD"] * 11},
+    )
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert len(planner.payloads) == 1
+    assert result.runtime_metadata["stop_gate_decision"] == "blocked"
+    assert result.runtime_metadata["stop_gate_block_reason"] == (
+        "structural_stop_confirmation_required"
+    )
+    assert result.runtime_metadata["stop_gate_structural_confirmation_forward_count"] == 0
+    assert result.runtime_metadata["final_action_source"] == "blocked_stop_gate"
+    assert result.runtime_metadata["fallback_policy"] == (
+        "structural_stop_confirm_forward"
+    )
+    assert "qwen_direct_requery_triggered" not in result.runtime_metadata
+
+
+def test_qwen_direct_structural_stop_passes_after_confirming_forward_progress():
+    stop_decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="QwenDirectPolicy",
+        arguments={
+            "action_text": "STOP",
+            "confidence": 0.9,
+            "visual_summary": "At the archway threshold, framed by the wooden archway.",
+            "progress_state": "Target reached.",
+            "stop_evidence": "visible_goal",
+            "current_target": "central archway",
+            "target_relation": "at_threshold",
+            "semantic_stop_state": "at_or_inside_target",
+            "reason": "The current image shows the agent at the threshold.",
+        },
+        reason="threshold stop",
+        planner_backend="gateway",
+        runtime_metadata={
+            "context_audit": {
+                "policy_backend": "qwen_direct",
+                "planner_step_mode": "visual_update",
+                "planner_authority": "qwen",
+            }
+        },
+    )
+    planner = SequencePlanner([stop_decision, stop_decision])
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    first = runtime.step(
+        make_state(
+            step_id=15,
+            instruction="Walk across the floor and wait the archway. ",
+        ),
+        payload={"recent_actions": ["MOVE_FORWARD"] * 11},
+    )
+    second = runtime.step(
+        make_state(
+            step_id=24,
+            instruction="Walk across the floor and wait the archway. ",
+        ),
+        payload={"recent_actions": ["MOVE_FORWARD"] * 19},
+    )
+
+    assert first.action_text == "MOVE_FORWARD"
+    assert second.ok is True
+    assert second.action_text == "STOP"
+    assert second.runtime_metadata["stop_gate_decision"] == "passed"
+    assert second.runtime_metadata["stop_gate_structural_confirmation_forward_count"] == 1
+
+
+def test_qwen_direct_structural_stop_confirmation_counts_for_capped_recent_actions():
+    stop_decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="QwenDirectPolicy",
+        arguments={
+            "action_text": "STOP",
+            "confidence": 0.9,
+            "visual_summary": "At the archway threshold, framed by the wooden archway.",
+            "progress_state": "Target reached.",
+            "stop_evidence": "visible_goal",
+            "current_target": "central archway",
+            "target_relation": "at_threshold",
+            "semantic_stop_state": "at_or_inside_target",
+            "reason": "The current image shows the agent at the threshold.",
+        },
+        reason="threshold stop",
+        planner_backend="gateway",
+        runtime_metadata={
+            "context_audit": {
+                "policy_backend": "qwen_direct",
+                "planner_step_mode": "visual_update",
+                "planner_authority": "qwen",
+            }
+        },
+    )
+    planner = SequencePlanner([stop_decision, stop_decision])
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    capped_recent_actions = ["MOVE_FORWARD"] * 20
+    first = runtime.step(
+        make_state(
+            step_id=59,
+            instruction="Walk across the floor and wait the archway. ",
+        ),
+        payload={"recent_actions": capped_recent_actions},
+    )
+    second = runtime.step(
+        make_state(
+            step_id=60,
+            instruction="Walk across the floor and wait the archway. ",
+        ),
+        payload={"recent_actions": capped_recent_actions},
+    )
+
+    assert first.action_text == "MOVE_FORWARD"
+    assert first.runtime_metadata["stop_gate_decision"] == "blocked"
+    assert first.runtime_metadata["stop_gate_structural_confirmation_forward_count"] == 0
+    assert second.action_text == "STOP"
+    assert second.runtime_metadata["stop_gate_decision"] == "passed"
+    assert second.runtime_metadata["stop_gate_structural_confirmation_forward_count"] == 1
+    assert second.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_multi_waypoint_stop_requery_preserves_block_reason():
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "STOP",
+                    "confidence": 0.9,
+                    "visual_summary": (
+                        "The view shows an opening leading directly to an outdoor area, "
+                        "indicating the agent is at the exit threshold."
+                    ),
+                    "progress_state": "The final destination area has been reached.",
+                    "stop_evidence": "instruction_complete",
+                    "current_target": "outdoor foyer",
+                    "target_relation": "at the outdoor foyer entrance",
+                    "semantic_stop_state": "instruction_complete_at_target",
+                    "reason": "The exit is directly ahead, so the instruction is complete.",
+                },
+                reason="early outdoor stop",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            ),
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "MOVE_FORWARD",
+                    "confidence": 0.72,
+                    "visual_summary": "Doorway remains visible.",
+                    "progress_state": "Continuing because the waypoint chain is incomplete.",
+                    "stop_evidence": "none",
+                    "reason": "STOP was rejected, so continue toward the route.",
+                },
+                reason="blocked stop recovery",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            ),
+        ]
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    result = runtime.step(
+        make_state(
+            step_id=11,
+            instruction=(
+                "Go through living room, through the door on the to the right, "
+                "through the den, through the dining to, to the outdoor foyer. "
+                "Stop before going outside. "
+            ),
+        ),
+        payload={"recent_actions": ["MOVE_FORWARD", "TURN_RIGHT", "TURN_RIGHT"]},
+    )
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert result.runtime_metadata["qwen_direct_requery_triggered"] is True
+    assert result.runtime_metadata["qwen_direct_requery_reason"] == "blocked_stop_gate"
+    assert result.runtime_metadata["stop_gate_block_reason"] == (
+        "missing_multi_waypoint_progress"
+    )
+    assert result.runtime_metadata["stop_gate_missing_waypoints"] == [
+        "den",
+        "dining",
+        "outdoor foyer",
+    ]
+    assert result.runtime_metadata["candidate_action"] == "MOVE_FORWARD"
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_forward_stall_requeries_for_non_forward_action():
+    planner = SequencePlanner(
+        [
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "MOVE_FORWARD",
+                    "confidence": 0.86,
+                    "visual_summary": "Still approaching the central archway.",
+                    "progress_state": "Destination not yet reached.",
+                    "stop_evidence": "none",
+                    "reason": "The route remains ahead, so continue forward.",
+                },
+                reason="forward stall",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            ),
+            OpenClawPlanDecision(
+                intent="act",
+                tool_name="QwenDirectPolicy",
+                arguments={
+                    "action_text": "TURN_RIGHT",
+                    "confidence": 0.74,
+                    "visual_summary": "The archway is no longer centered after repeated forward motion.",
+                    "progress_state": "reorienting toward target after no progress",
+                    "stop_evidence": "none",
+                    "reason": "Forward was rejected due to no progress, so reorient right.",
+                },
+                reason="forward stall recovery",
+                planner_backend="gateway",
+                runtime_metadata={
+                    "context_audit": {
+                        "policy_backend": "qwen_direct",
+                        "planner_step_mode": "visual_update",
+                        "planner_authority": "qwen",
+                    }
+                },
+            ),
+        ]
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    result = runtime.step(
+        make_state(step_id=12),
+        payload={
+            "recent_actions": [
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+            ]
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "TURN_RIGHT"
+    assert len(planner.payloads) == 2
+    feedback = planner.payloads[1]["forward_stall_feedback"]
+    assert feedback["blocked_action"] == "MOVE_FORWARD"
+    assert feedback["allowed_actions"] == ["TURN_LEFT", "TURN_RIGHT"]
+    assert feedback["progress_state"] == "Destination not yet reached."
+    assert "fallback_action" not in feedback
+    assert planner.payloads[1]["control_context"]["force_non_forward_action"] is True
+    assert result.runtime_metadata["qwen_direct_requery_triggered"] is True
+    assert result.runtime_metadata["qwen_direct_requery_reason"] == "forward_stall_gate"
+    assert result.runtime_metadata["qwen_direct_initial_candidate_action"] == "MOVE_FORWARD"
+    assert result.runtime_metadata["qwen_direct_initial_fallback_action"] == "TURN_LEFT"
+    assert result.runtime_metadata["forward_stall_gate_decision"] == "blocked"
+    assert result.runtime_metadata["blocked_action"] == "MOVE_FORWARD"
+    assert result.runtime_metadata["candidate_action"] == "TURN_RIGHT"
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_runtime_allows_forward_when_context_audit_has_visual_update():
+    decision = OpenClawPlanDecision(
+        intent="act",
+        tool_name="QwenDirectPolicy",
+        arguments={
+            "action_text": "MOVE_FORWARD",
+            "confidence": 0.9,
+            "progress_state": "unknown",
+            "stop_evidence": "none",
+        },
+        reason="qwen direct",
+        planner_backend="gateway",
+        runtime_metadata={
+            "context_audit": {
+                "policy_backend": "qwen_direct",
+                "planner_step_mode": "visual_update",
+                "planner_authority": "qwen",
+            }
+        },
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=StaticPlanner(decision),
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+    )
+
+    result = runtime.step(
+        make_state(step_id=12),
+        payload={
+            "recent_actions": [
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+                "MOVE_FORWARD",
+            ]
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert "forward_stall_gate_decision" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
 
 
 def test_runtime_passes_memory_context_to_navigation_policy():

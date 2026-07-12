@@ -181,11 +181,27 @@ def collect_run_summary(
     visual_not_qwen_authority_examples: List[Dict[str, Any]] = []
     visual_no_image_examples: List[Dict[str, Any]] = []
     visual_image_over_budget_examples: List[Dict[str, Any]] = []
+    direct_janus_loaded_examples: List[Dict[str, Any]] = []
+    direct_navigation_policy_skill_examples: List[Dict[str, Any]] = []
+    direct_planned_navigation_policy_skill_examples: List[Dict[str, Any]] = []
+    qwen_candidate_final_action_diff_examples: List[Dict[str, Any]] = []
     fast_assembled_tokens: List[float] = []
     visual_assembled_tokens: List[float] = []
     visual_provider_tokens: List[float] = []
+    policy_backend_counts: Counter[str] = Counter()
+    final_action_source_counts: Counter[str] = Counter()
 
     qwen_api_called = 0
+    qwen_candidate_requested = 0
+    qwen_model_called = 0
+    qwen_failure_count = 0
+    qwen_missing_confidence_count = 0
+    qwen_missing_stop_evidence_count = 0
+    qwen_visual_summary_present_count = 0
+    qwen_candidate_final_action_diff_count = 0
+    direct_policy_rows = 0
+    janus_loaded_count = 0
+    navigation_policy_skill_called_count = 0
     fast_qwen_api_called = 0
     visual_qwen_api_called = 0
     max_model_image_count = 0
@@ -197,6 +213,48 @@ def collect_run_summary(
     for row in trace_rows:
         audit = row.get("context_audit") if isinstance(row.get("context_audit"), dict) else {}
         step_mode = str(audit.get("planner_step_mode") or row.get("planner_step_mode") or "")
+        policy_backend = str(row.get("policy_backend") or audit.get("policy_backend") or "")
+        if policy_backend:
+            policy_backend_counts[policy_backend] += 1
+        direct_policy = row.get("direct_policy") is True or policy_backend == "qwen_direct"
+        if direct_policy:
+            direct_policy_rows += 1
+            if row.get("qwen_confidence") in (None, ""):
+                qwen_missing_confidence_count += 1
+            if row.get("qwen_stop_evidence") in (None, ""):
+                qwen_missing_stop_evidence_count += 1
+            if row.get("qwen_visual_summary_present") is True:
+                qwen_visual_summary_present_count += 1
+            candidate_action = str(row.get("candidate_action") or "")
+            final_action = str(row.get("final_action") or "")
+            if candidate_action and final_action and candidate_action != final_action:
+                qwen_candidate_final_action_diff_count += 1
+                _append_example(qwen_candidate_final_action_diff_examples, row)
+        final_action_source = str(row.get("final_action_source") or "")
+        if final_action_source:
+            final_action_source_counts[final_action_source] += 1
+        if row.get("janus_loaded") is True or audit.get("janus_loaded") is True:
+            janus_loaded_count += 1
+            if direct_policy:
+                _append_example(direct_janus_loaded_examples, row)
+        planned_tool = str(row.get("planned_tool") or row.get("skill") or "")
+        navigation_policy_called = (
+            row.get("navigation_policy_skill_called") is True
+            or planned_tool == "NavigationPolicySkill"
+            and direct_policy
+        )
+        if navigation_policy_called:
+            navigation_policy_skill_called_count += 1
+        if direct_policy and row.get("navigation_policy_skill_called") is True:
+            _append_example(direct_navigation_policy_skill_examples, row)
+        if direct_policy and planned_tool == "NavigationPolicySkill":
+            _append_example(direct_planned_navigation_policy_skill_examples, row)
+        if audit.get("qwen_candidate_requested") is True:
+            qwen_candidate_requested += 1
+        if audit.get("qwen_model_called") is True:
+            qwen_model_called += 1
+        if row.get("qwen_failure") is True or audit.get("qwen_failure") is True:
+            qwen_failure_count += 1
         if step_mode:
             mode_counts[step_mode] += 1
         planner_reason = str(row.get("planner_reason") or row.get("reason") or "")
@@ -267,6 +325,18 @@ def collect_run_summary(
         "result_count": result_count,
         "trace_rows": len(trace_rows),
         "mode_counts": dict(sorted(mode_counts.items())),
+        "policy_backend_counts": dict(sorted(policy_backend_counts.items())),
+        "final_action_source_counts": dict(sorted(final_action_source_counts.items())),
+        "direct_policy_rows": direct_policy_rows,
+        "janus_loaded_count": janus_loaded_count,
+        "navigation_policy_skill_called_count": navigation_policy_skill_called_count,
+        "qwen_candidate_requested": qwen_candidate_requested,
+        "qwen_model_called": qwen_model_called,
+        "qwen_failure_count": qwen_failure_count,
+        "qwen_missing_confidence_count": qwen_missing_confidence_count,
+        "qwen_missing_stop_evidence_count": qwen_missing_stop_evidence_count,
+        "qwen_visual_summary_present_count": qwen_visual_summary_present_count,
+        "qwen_candidate_final_action_diff_count": qwen_candidate_final_action_diff_count,
         "fallback_count": fallback_count,
         "planner_fallback_count": planner_fallback_count,
         "cli_fallback_count": cli_fallback_count,
@@ -296,6 +366,10 @@ def collect_run_summary(
         "visual_not_qwen_authority_examples": visual_not_qwen_authority_examples,
         "visual_no_image_examples": visual_no_image_examples,
         "visual_image_over_budget_examples": visual_image_over_budget_examples,
+        "direct_janus_loaded_examples": direct_janus_loaded_examples,
+        "direct_navigation_policy_skill_examples": direct_navigation_policy_skill_examples,
+        "direct_planned_navigation_policy_skill_examples": direct_planned_navigation_policy_skill_examples,
+        "qwen_candidate_final_action_diff_examples": qwen_candidate_final_action_diff_examples,
         "trace_parse_errors": trace_errors,
         "result_parse_errors": result_errors,
     }
@@ -410,6 +484,29 @@ def validate_large_eval_gate(
         key="visual_image_over_budget_examples",
         code="visual_model_image_over_budget",
         message="visual_update rows exceeded OPENCLAW_MODEL_MAX_IMAGES",
+    )
+    _append_count_failure(
+        failures,
+        summary,
+        key="janus_loaded_count",
+        code="direct_janus_loaded",
+        message="direct-policy trace rows reported Janus as loaded",
+        examples_key="direct_janus_loaded_examples",
+    )
+    _append_count_failure(
+        failures,
+        summary,
+        key="navigation_policy_skill_called_count",
+        code="direct_navigation_policy_skill_called",
+        message="direct-policy trace rows called NavigationPolicySkill",
+        examples_key="direct_navigation_policy_skill_examples",
+    )
+    _append_example_failure(
+        failures,
+        summary,
+        key="direct_planned_navigation_policy_skill_examples",
+        code="direct_planned_navigation_policy_skill",
+        message="direct-policy trace rows planned NavigationPolicySkill",
     )
     if require_complete:
         if summary.get("trace_parse_errors"):

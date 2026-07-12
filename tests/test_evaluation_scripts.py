@@ -47,6 +47,8 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     assert "--enforce_timeout_budget" in contents
     assert "--harness_debug_max_episodes" in contents
     assert "--max_steps" in contents
+    assert "POLICY_BACKEND=${POLICY_BACKEND:-janus_policy}" in contents
+    assert "--policy_backend" in contents
 
 
 def test_openclaw_gateway_script_can_disable_default_episode_keys_for_custom_data():
@@ -133,10 +135,13 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
     assert "OPENCLAW_MODEL=${OPENCLAW_MODEL:-qwen/qwen3.5-flash}" in contents
     assert "OPENCLAW_MODEL_PROVIDER=${OPENCLAW_MODEL_PROVIDER:-qwen_api}" in contents
+    assert 'if [[ "${POLICY_BACKEND}" == "qwen_direct" ]]; then' in contents
+    assert "OPENCLAW_MODEL_MAX_IMAGES=${OPENCLAW_MODEL_MAX_IMAGES:-8}" in contents
     assert "OPENCLAW_MODEL_MAX_IMAGES=${OPENCLAW_MODEL_MAX_IMAGES:-3}" in contents
     assert "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-20}" in contents
     assert "OPENCLAW_MODEL_FAST_MODE=${OPENCLAW_MODEL_FAST_MODE:-qwen_text_only}" in contents
     assert "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT=${OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT:-1}" in contents
+    assert "POLICY_BACKEND=${POLICY_BACKEND:-janus_policy}" in contents
     assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents
     assert "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}" in contents
     assert "--openclaw_visual_mode" in contents
@@ -148,7 +153,19 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "--openclaw_model_image_interval_steps" in contents
     assert "--openclaw_model_fast_mode" in contents
     assert "--openclaw_model_fast_use_memory_context" in contents
+    assert "--policy_backend" in contents
     assert "--agent_max_input_tokens" in contents
+
+
+def test_run_qwen_starts_gateway_in_qwen_direct_mode():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_qwen.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    gateway_start_block = contents.split("./scripts/start_openclaw_cli_plan_gateway.sh &", 1)[0]
+
+    assert "POLICY_BACKEND=qwen_direct \\" in gateway_start_block
+    assert 'OPENCLAW_MODEL_MAX_IMAGES="${OPENCLAW_MODEL_MAX_IMAGES:-8}" \\' in gateway_start_block
 
 
 def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():
@@ -189,3 +206,29 @@ def test_openclaw_gateway_script_respects_empty_service_registry_override():
     assert "OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY-" in contents
     assert 'if [[ -n "${OPENCLAW_SERVICE_REGISTRY}" ]]; then' in contents
     assert '--openclaw_service_registry_path "${OPENCLAW_SERVICE_REGISTRY}"' in contents
+
+
+def test_qwen_direct_policy_runbook_documents_smoke_and_redaction_contract():
+    repo_root = Path(__file__).resolve().parents[1]
+    runbook = repo_root / "docs" / "runbooks" / "openclaw-qwen-direct-policy-eval.md"
+    contents = runbook.read_text(encoding="utf-8")
+
+    assert "POLICY_BACKEND=qwen_direct" in contents
+    assert "janus_loaded=false" in contents
+    assert "navigation_policy_skill_called=false" in contents
+    assert "qwen_candidate_requested=true" in contents
+    assert "qwen_model_called=true" in contents
+    assert "final_action_source" in contents
+    assert "qwen_direct_requery_triggered" in contents
+    assert "provider_payload_logged=false" in contents
+    assert "run_id" in contents
+    assert "raw image paths" in contents
+    assert "share-safe" in contents
+    assert "both_success" in contents
+    assert "qwen_only" in contents
+    assert "janus_only" in contents
+    assert "both_fail" in contents
+    assert "2azQ1b91cZZ:11" in contents
+    assert "all-forward" in contents
+    assert "action distribution" in contents
+    assert "retrieved memory/keyframe image count" in contents

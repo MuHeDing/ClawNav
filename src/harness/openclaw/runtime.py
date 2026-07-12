@@ -1,9 +1,15 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Protocol
 
 from harness.memory.context_engine import MemoryAwareContextEngine
+from harness.openclaw.control_gates import QwenDirectControlGates
 from harness.openclaw.executor import HabitatOpenClawExecutor
+from harness.openclaw.keyframe_gate import (
+    EventGatedKeyframeGate,
+    candidate_action_status_from_tool_result,
+)
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
 from harness.skill_registry import SkillRegistry
 from harness.types import VLNState
@@ -38,6 +44,7 @@ ACTION_ARGUMENT_KEYS = (
 
 OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX = "openclaw_cli_agent_fallback:"
 OPENCLAW_CLI_MODEL_FALLBACK_REASON_PREFIX = "openclaw_cli_model_fallback:"
+QWEN_DIRECT_POLICY_BACKEND = "qwen_direct"
 
 
 @dataclass
@@ -66,15 +73,31 @@ class OpenClawVLNRuntime:
         executor: HabitatOpenClawExecutor,
         fallback_planner: OpenClawPlannerProtocol = None,
         allow_planner_action_override: bool = True,
+        policy_backend: str = "janus_policy",
+        keyframe_policy_mode: str = "interval",
+        keyframe_min_gap_steps: int = 5,
+        keyframe_episode_cap: int = 64,
+        keyframe_coverage_gap_steps: int = 20,
+        keyframe_debug_save_all_eligible: bool = False,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
         self.executor = executor
         self.fallback_planner = fallback_planner
         self.allow_planner_action_override = allow_planner_action_override
+        self.policy_backend = policy_backend
+        self.qwen_direct_gates = QwenDirectControlGates()
+        self.keyframe_policy_mode = str(keyframe_policy_mode or "interval")
+        self.keyframe_gate = EventGatedKeyframeGate(
+            min_gap_steps=int(keyframe_min_gap_steps),
+            episode_cap=int(keyframe_episode_cap),
+            coverage_gap_steps=int(keyframe_coverage_gap_steps),
+            debug_save_all_eligible=bool(keyframe_debug_save_all_eligible),
+        )
         self.recent_visual_memories: List[Dict[str, Any]] = []
         self.max_recent_visual_memories = 10
         self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
+        self.qwen_direct_episode_state: Dict[str, Dict[str, Any]] = {}
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -251,6 +274,88 @@ class OpenClawVLNRuntime:
             nav_payload["active_subgoal"] = decision.reason
 
         planned_action_text = self._planned_action_text(decision.arguments)
+        if self.policy_backend == QWEN_DIRECT_POLICY_BACKEND:
+            gate_context = self._qwen_direct_gate_context(
+                runtime_payload,
+                decision,
+                state=state,
+            )
+            gate_result = self.qwen_direct_gates.apply(decision.arguments, gate_context)
+            requery_metadata: Dict[str, Any] = {}
+            if self._qwen_direct_should_requery_gate(runtime_payload, gate_result):
+                requery_decision = self._qwen_direct_requery_after_gate(
+                    state,
+                    runtime_payload,
+                    decision,
+                    gate_result,
+                )
+                if requery_decision is not None:
+                    requery_metadata = self._qwen_direct_requery_metadata(
+                        decision,
+                        gate_result,
+                    )
+                    decision = requery_decision
+                    self._merge_planner_visual_observations(runtime_payload, decision)
+                    gate_context = self._qwen_direct_gate_context(
+                        runtime_payload,
+                        decision,
+                        state=state,
+                    )
+                    gate_result = self.qwen_direct_gates.apply(
+                        decision.arguments,
+                        gate_context,
+                    )
+            metadata = self._metadata(
+                decision,
+                tool_calls,
+                image_paths_used,
+                state=state,
+                runtime_context=runtime_payload,
+                action_text=gate_result.final_action,
+                causal_recall=causal_recall,
+            )
+            metadata.update(
+                self._qwen_direct_schema_metadata(decision.arguments, decision.reason)
+            )
+            metadata.update(gate_result.metadata)
+            metadata.update(requery_metadata)
+            metadata["policy_backend"] = QWEN_DIRECT_POLICY_BACKEND
+            metadata["direct_policy"] = True
+            metadata.setdefault("janus_loaded", False)
+            metadata.setdefault("navigation_policy_skill_called", False)
+            self._update_qwen_direct_episode_state(
+                state,
+                runtime_payload,
+                decision.arguments,
+                gate_result,
+            )
+            keyframe_gate = self._run_keyframe_gate_for_action(
+                state=state,
+                runtime_payload=runtime_payload,
+                raw_candidate_action=planned_action_text or gate_result.final_action,
+                candidate_action_status="ok",
+            )
+            if keyframe_gate:
+                metadata["keyframe_gate"] = keyframe_gate
+            if planner_error:
+                metadata["planner_error"] = planner_error
+            metadata["planner_fallback"] = planner_fallback
+            self._record_context_engine_step(
+                metadata,
+                context_engine,
+                state,
+                runtime_payload,
+                gate_result.final_action,
+                metadata.get("planner_reason", ""),
+                True,
+                tool_calls=tool_calls,
+            )
+            return OpenClawRuntimeStepResult(
+                ok=True,
+                action_text=gate_result.final_action,
+                executor_command=self.executor.command_for_action(gate_result.final_action),
+                runtime_metadata=metadata,
+            )
         if planned_action_text and self.allow_planner_action_override:
             metadata = self._metadata(
                 decision,
@@ -263,6 +368,14 @@ class OpenClawVLNRuntime:
             )
             metadata["planner_action_override"] = planned_action_text
             metadata["policy_skipped"] = True
+            keyframe_gate = self._run_keyframe_gate_for_action(
+                state=state,
+                runtime_payload=runtime_payload,
+                raw_candidate_action=planned_action_text,
+                candidate_action_status="ok",
+            )
+            if keyframe_gate:
+                metadata["keyframe_gate"] = keyframe_gate
             if planner_error:
                 metadata["planner_error"] = planner_error
             metadata["planner_fallback"] = planner_fallback
@@ -290,6 +403,12 @@ class OpenClawVLNRuntime:
         tool_calls.append(nav_result)
 
         action_text = str(nav_result.get("payload", {}).get("action_text") or "STOP")
+        keyframe_gate = self._run_keyframe_gate_for_action(
+            state=state,
+            runtime_payload=runtime_payload,
+            raw_candidate_action=action_text,
+            candidate_action_status=candidate_action_status_from_tool_result(nav_result),
+        )
         metadata = self._metadata(
             decision,
             tool_calls,
@@ -304,6 +423,8 @@ class OpenClawVLNRuntime:
         metadata["planner_fallback"] = planner_fallback
         if planned_action_text and not self.allow_planner_action_override:
             metadata["planner_action_guidance"] = planned_action_text
+        if keyframe_gate:
+            metadata["keyframe_gate"] = keyframe_gate
         if not nav_result.get("ok"):
             self._record_context_engine_step(
                 metadata,
@@ -340,6 +461,275 @@ class OpenClawVLNRuntime:
             runtime_metadata=metadata,
         )
 
+    def _run_keyframe_gate_for_action(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        raw_candidate_action: str,
+        candidate_action_status: str,
+    ) -> Dict[str, Any]:
+        if self.keyframe_policy_mode != "event_gated_smoke":
+            return {}
+        gate = self.keyframe_gate.evaluate(
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+            step_id=state.step_id,
+            raw_candidate_action=raw_candidate_action,
+            candidate_action_status=candidate_action_status,
+            current_image_path=str(runtime_payload.get("current_image_path") or ""),
+            keyframe_target_path=str(runtime_payload.get("keyframe_target_path") or ""),
+        )
+        if gate.get("save_decision") == "save":
+            self._promote_keyframe(gate)
+            self._attach_promoted_keyframe_candidate(runtime_payload, gate)
+        runtime_payload["keyframe_gate"] = gate
+        return gate
+
+    def _promote_keyframe(self, gate: Dict[str, Any]) -> None:
+        source = Path(str(gate.get("current_image_path") or ""))
+        target = Path(str(gate.get("keyframe_target_path") or ""))
+        if not source.exists():
+            gate["promotion_status"] = "failed"
+            gate["failure_reason"] = "missing_current_image"
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            gate["promotion_status"] = "failed"
+            gate["failure_reason"] = f"promotion_failed:{exc.__class__.__name__}"
+            return
+        gate["promotion_status"] = "promoted"
+        gate["promoted_image_path"] = str(target)
+
+    def _attach_promoted_keyframe_candidate(
+        self,
+        runtime_payload: Dict[str, Any],
+        gate: Dict[str, Any],
+    ) -> None:
+        if gate.get("promotion_status") != "promoted":
+            return
+        image_path = str(
+            gate.get("promoted_image_path")
+            or gate.get("keyframe_target_path")
+            or ""
+        )
+        if not image_path:
+            return
+        runtime_payload["keyframe_candidate"] = {
+            "step_id": gate.get("step_id"),
+            "reason": gate.get("save_reason"),
+            "event_type": gate.get("candidate_event_type"),
+            "image_path": image_path,
+            "keyframe_gate": dict(gate),
+        }
+
+    def _qwen_direct_should_requery_gate(
+        self,
+        runtime_payload: Dict[str, Any],
+        gate_result,
+    ) -> bool:
+        if runtime_payload.get("_qwen_direct_gate_requery"):
+            return False
+        return bool(self._qwen_direct_requery_reason(gate_result))
+
+    def _qwen_direct_requery_after_gate(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        decision,
+        gate_result,
+    ) -> Optional[Any]:
+        requery_reason = self._qwen_direct_requery_reason(gate_result)
+        if requery_reason == "blocked_stop_gate":
+            feedback_key = "blocked_stop_feedback"
+            feedback = self._qwen_direct_blocked_stop_feedback(decision, gate_result)
+            control_flags = {"force_non_stop_action": True}
+        elif requery_reason == "forward_stall_gate":
+            feedback_key = "forward_stall_feedback"
+            feedback = self._qwen_direct_forward_stall_feedback(
+                decision,
+                gate_result,
+                runtime_payload,
+            )
+            control_flags = {"force_non_forward_action": True}
+        else:
+            return None
+        requery_payload = dict(runtime_payload)
+        requery_payload["_qwen_direct_gate_requery"] = True
+        requery_payload[feedback_key] = feedback
+        control_context = dict(requery_payload.get("control_context") or {})
+        control_context.update(control_flags)
+        control_context["allowed_actions"] = list(feedback["allowed_actions"])
+        control_context[feedback_key] = feedback
+        requery_payload["control_context"] = control_context
+        try:
+            return self.planner.plan(state, runtime_context=requery_payload)
+        except Exception:
+            return None
+
+    def _qwen_direct_requery_reason(self, gate_result) -> str:
+        metadata = getattr(gate_result, "metadata", {}) or {}
+        if (
+            metadata.get("stop_gate_decision") == "blocked"
+            and metadata.get("blocked_action") == "STOP"
+        ):
+            if (
+                metadata.get("stop_gate_block_reason")
+                == "structural_stop_confirmation_required"
+            ):
+                return ""
+            return "blocked_stop_gate"
+        if (
+            metadata.get("forward_stall_gate_decision") == "blocked"
+            and metadata.get("blocked_action") == "MOVE_FORWARD"
+        ):
+            return "forward_stall_gate"
+        return ""
+
+    def _qwen_direct_blocked_stop_feedback(
+        self,
+        decision,
+        gate_result,
+    ) -> Dict[str, Any]:
+        arguments = getattr(decision, "arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        feedback = {
+            "gate_decision": "blocked",
+            "blocked_action": "STOP",
+            "allowed_actions": ["MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"],
+            "reason": (
+                "STOP was rejected because current evidence did not prove "
+                "arrival, route progress, or wait completion. Choose a non-STOP "
+                "corrective action. Use MOVE_FORWARD only when the current "
+                "image clearly shows the route continues forward; otherwise "
+                "turn to recheck alignment or target evidence."
+            ),
+            "fallback_action": gate_result.final_action,
+            "stop_evidence": self._bounded_metadata_text(arguments.get("stop_evidence")),
+            "current_target": self._bounded_metadata_text(arguments.get("current_target")),
+            "target_relation": self._bounded_metadata_text(arguments.get("target_relation")),
+            "semantic_stop_state": self._bounded_metadata_text(
+                arguments.get("semantic_stop_state")
+            ),
+            "visual_summary": self._bounded_metadata_text(arguments.get("visual_summary")),
+            "progress_state": self._bounded_metadata_text(arguments.get("progress_state")),
+            "qwen_reason": self._bounded_metadata_text(
+                arguments.get("reason") or getattr(decision, "reason", "")
+            ),
+        }
+        gate_metadata = getattr(gate_result, "metadata", {}) or {}
+        for key in (
+            "stop_gate_block_reason",
+            "stop_gate_missing_waypoints",
+            "stop_gate_missing_route_waypoints",
+            "stop_gate_route_missing_reasons",
+            "stop_gate_min_step_id",
+            "stop_gate_current_step_id",
+            "stop_gate_min_forward_actions",
+            "stop_gate_forward_action_count",
+        ):
+            value = gate_metadata.get(key)
+            if value not in (None, "", []):
+                feedback[key] = value
+        return feedback
+
+    def _qwen_direct_forward_stall_feedback(
+        self,
+        decision,
+        gate_result,
+        runtime_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        arguments = getattr(decision, "arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        recent_actions = runtime_payload.get("recent_actions") or []
+        if not isinstance(recent_actions, list):
+            recent_actions = []
+        return {
+            "gate_decision": "blocked",
+            "blocked_action": "MOVE_FORWARD",
+            "allowed_actions": ["TURN_LEFT", "TURN_RIGHT"],
+            "reason": (
+                "MOVE_FORWARD was rejected because recent forward actions did "
+                "not show visual progress. Choose a turn to regain alignment."
+            ),
+            "recent_actions": [
+                self._normalize_action_text(action)
+                for action in recent_actions[-4:]
+                if self._normalize_action_text(action)
+            ],
+            "visual_summary": self._bounded_metadata_text(arguments.get("visual_summary")),
+            "progress_state": self._bounded_metadata_text(arguments.get("progress_state")),
+            "qwen_reason": self._bounded_metadata_text(
+                arguments.get("reason") or getattr(decision, "reason", "")
+            ),
+        }
+
+    def _qwen_direct_requery_metadata(
+        self,
+        decision,
+        gate_result,
+    ) -> Dict[str, Any]:
+        arguments = getattr(decision, "arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        requery_reason = self._qwen_direct_requery_reason(gate_result)
+        metadata = {
+            "qwen_direct_requery_triggered": True,
+            "qwen_direct_requery_reason": requery_reason,
+            "qwen_direct_initial_candidate_action": (
+                self._normalize_action_text(arguments.get("action_text"))
+                or gate_result.metadata.get("candidate_action")
+                or ""
+            ),
+            "qwen_direct_initial_fallback_action": gate_result.final_action,
+            "qwen_direct_initial_final_action_source": gate_result.metadata.get(
+                "final_action_source"
+            ),
+        }
+        if requery_reason == "blocked_stop_gate":
+            for key in (
+                "stop_gate_block_reason",
+                "stop_gate_missing_waypoints",
+                "stop_gate_missing_route_waypoints",
+                "stop_gate_route_missing_reasons",
+                "stop_gate_min_step_id",
+                "stop_gate_current_step_id",
+                "stop_gate_min_forward_actions",
+                "stop_gate_forward_action_count",
+            ):
+                value = gate_result.metadata.get(key)
+                if value:
+                    metadata[key] = value
+            metadata.update(
+                {
+                    "qwen_direct_initial_stop_evidence": self._bounded_metadata_text(
+                        arguments.get("stop_evidence")
+                    ),
+                    "qwen_direct_initial_current_target": self._bounded_metadata_text(
+                        arguments.get("current_target")
+                    ),
+                    "qwen_direct_initial_target_relation": self._bounded_metadata_text(
+                        arguments.get("target_relation")
+                    ),
+                    "qwen_direct_initial_semantic_stop_state": (
+                        self._bounded_metadata_text(arguments.get("semantic_stop_state"))
+                    ),
+                    "stop_gate_decision": "blocked",
+                    "blocked_action": "STOP",
+                }
+            )
+        elif requery_reason == "forward_stall_gate":
+            metadata.update(
+                {
+                    "forward_stall_gate_decision": "blocked",
+                    "blocked_action": "MOVE_FORWARD",
+                }
+            )
+        return metadata
+
     def _context_engine_for_payload(
         self,
         payload: Dict[str, Any],
@@ -369,7 +759,14 @@ class OpenClawVLNRuntime:
             step_id=state.step_id,
             payload=payload,
         )
-        for key in ("task_state", "recent_step_summary", "retrieved_memory_ids"):
+        for key in (
+            "task_state",
+            "recent_step_summary",
+            "retrieved_memory_ids",
+            "retrieved_memory_image_paths",
+            "retrieved_memory_images",
+            "memory_images",
+        ):
             value = context.get(key)
             if value:
                 payload[key] = value
@@ -396,6 +793,13 @@ class OpenClawVLNRuntime:
             state,
             tool_calls or [],
         )
+        seeded_keyframe_memory_ids = self._seed_keyframe_memory_to_context_engine(
+            context_engine,
+            state,
+            payload,
+            planner_reason=planner_reason,
+            action_text=action_text,
+        )
         record = context_engine.record_step(
             run_id=str(payload.get("run_id") or ""),
             scene_id=state.scene_id,
@@ -410,11 +814,58 @@ class OpenClawVLNRuntime:
         )
         if mirrored_memory_ids:
             record["mirrored_memory_ids"] = mirrored_memory_ids
+        if seeded_keyframe_memory_ids:
+            record["seeded_keyframe_memory_ids"] = seeded_keyframe_memory_ids
         if state.step_id > 0 and state.step_id % context_engine.review_interval_steps == 0:
             record["review"] = context_engine.review_and_compact(
                 current_step_id=state.step_id
             )
         metadata["context_engine"] = record
+
+    def _seed_keyframe_memory_to_context_engine(
+        self,
+        context_engine: MemoryAwareContextEngine,
+        state: VLNState,
+        payload: Dict[str, Any],
+        planner_reason: str,
+        action_text: str,
+    ) -> List[str]:
+        candidate = payload.get("keyframe_candidate")
+        if not isinstance(candidate, dict):
+            return []
+        image_path = str(candidate.get("image_path") or "")
+        if not image_path:
+            return []
+        if context_engine.has_memory_image(
+            image_path=image_path,
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+        ):
+            return []
+        text_parts = [
+            state.instruction,
+            candidate.get("reason"),
+            candidate.get("summary"),
+            candidate.get("caption"),
+            planner_reason,
+            action_text,
+        ]
+        text = "\n".join(str(part) for part in text_parts if part)
+        tags = ["openclaw_keyframe", "episode_keyframe"]
+        for key in ("tags", "landmarks", "objects", "spatial_cues"):
+            values = candidate.get(key)
+            if isinstance(values, list):
+                tags.extend(str(value) for value in values if str(value))
+        memory_id = context_engine.add_memory(
+            text=text or state.instruction or "OpenClaw saved keyframe",
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+            step_id=int(candidate.get("step_id") or state.step_id),
+            image_path=image_path,
+            tags=tags,
+            importance=0.7,
+        )
+        return [memory_id]
 
     def _mirror_memory_writes_to_context_engine(
         self,
@@ -513,6 +964,202 @@ class OpenClawVLNRuntime:
         if recall_usage:
             metadata["recall_usage"] = recall_usage
         return metadata
+
+    def _qwen_direct_gate_context(
+        self,
+        runtime_payload: Dict[str, Any],
+        decision,
+        state: Optional[VLNState] = None,
+    ) -> Dict[str, Any]:
+        gate_context = dict(runtime_payload)
+        if state is not None:
+            gate_context.setdefault("current_step_id", state.step_id)
+            if state.instruction:
+                gate_context.setdefault("instruction", state.instruction)
+            self._attach_qwen_direct_episode_gate_context(gate_context, state)
+        planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        if isinstance(planner_runtime_metadata, dict):
+            context_audit = planner_runtime_metadata.get("context_audit")
+            if isinstance(context_audit, dict):
+                for key in (
+                    "planner_step_mode",
+                    "visual_memory_age_steps",
+                    "model_image_count",
+                    "current_image_last",
+                ):
+                    if key in context_audit and key not in gate_context:
+                        gate_context[key] = context_audit[key]
+                if context_audit.get("planner_step_mode") == "visual_update":
+                    gate_context.setdefault("current_visual_evidence", True)
+        control_context = gate_context.get("control_context")
+        if isinstance(control_context, dict):
+            for key in ("force_visual_refresh", "recent_forward_count", "visual_age_steps"):
+                if key in control_context and key not in gate_context:
+                    gate_context[key] = control_context[key]
+        return gate_context
+
+    def _attach_qwen_direct_episode_gate_context(
+        self,
+        gate_context: Dict[str, Any],
+        state: VLNState,
+    ) -> None:
+        episode_state = self._qwen_direct_state_for_episode(state)
+        observed_visual_summaries = episode_state.get("observed_visual_summaries")
+        if isinstance(observed_visual_summaries, list) and observed_visual_summaries:
+            existing = gate_context.get("observed_visual_summaries")
+            if isinstance(existing, list):
+                gate_context["observed_visual_summaries"] = [
+                    *observed_visual_summaries,
+                    *existing,
+                ]
+            else:
+                gate_context["observed_visual_summaries"] = list(
+                    observed_visual_summaries
+                )
+
+        start_index = episode_state.get("structural_stop_confirmation_action_index")
+        stored_forward_count = episode_state.get(
+            "structural_stop_confirmation_forward_count"
+        )
+        if start_index is None and stored_forward_count is None:
+            return
+        try:
+            start_index = max(0, int(start_index))
+        except (TypeError, ValueError):
+            start_index = 0
+        if stored_forward_count is None:
+            recent_actions = self._normalized_recent_actions(
+                gate_context.get("recent_actions")
+            )
+            forward_count = sum(
+                1
+                for action in recent_actions[start_index:]
+                if action == "MOVE_FORWARD"
+            )
+        else:
+            forward_count = self._nonnegative_int(stored_forward_count)
+        gate_context.setdefault("structural_stop_confirmation_active", True)
+        gate_context.setdefault(
+            "structural_stop_confirmation_action_index",
+            start_index,
+        )
+        gate_context.setdefault(
+            "structural_stop_confirmation_forward_count",
+            forward_count,
+        )
+
+    def _update_qwen_direct_episode_state(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        arguments: Dict[str, Any],
+        gate_result,
+    ) -> None:
+        episode_state = self._qwen_direct_state_for_episode(state)
+        visual_summary = self._bounded_metadata_text(arguments.get("visual_summary"))
+        if visual_summary:
+            summaries = list(episode_state.get("observed_visual_summaries") or [])
+            summaries.append(visual_summary)
+            episode_state["observed_visual_summaries"] = summaries[-24:]
+
+        metadata = getattr(gate_result, "metadata", {}) or {}
+        if metadata.get("stop_gate_decision") == "passed":
+            episode_state.pop("structural_stop_confirmation_action_index", None)
+            episode_state.pop("structural_stop_confirmation_forward_count", None)
+            return
+        final_action = self._normalize_action_text(
+            getattr(gate_result, "final_action", "")
+        )
+        active = (
+            "structural_stop_confirmation_action_index" in episode_state
+            or "structural_stop_confirmation_forward_count" in episode_state
+        )
+        structural_blocked = metadata.get("stop_gate_block_reason") == (
+            "structural_stop_confirmation_required"
+        )
+        if structural_blocked and not active:
+            episode_state["structural_stop_confirmation_action_index"] = len(
+                self._normalized_recent_actions(runtime_payload.get("recent_actions"))
+            )
+            episode_state["structural_stop_confirmation_forward_count"] = 0
+            active = True
+        if active and final_action == "MOVE_FORWARD":
+            episode_state["structural_stop_confirmation_forward_count"] = (
+                self._nonnegative_int(
+                    episode_state.get("structural_stop_confirmation_forward_count")
+                )
+                + 1
+            )
+
+    def _nonnegative_int(self, value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _qwen_direct_state_for_episode(self, state: VLNState) -> Dict[str, Any]:
+        key = f"{state.scene_id}::{state.episode_id}"
+        return self.qwen_direct_episode_state.setdefault(key, {})
+
+    def _normalized_recent_actions(self, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        actions: List[str] = []
+        for item in value:
+            action = self._normalize_action_text(item)
+            if action:
+                actions.append(action)
+        return actions
+
+    def _qwen_direct_schema_metadata(
+        self,
+        arguments: Dict[str, Any],
+        decision_reason: str = "",
+    ) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        confidence = self._float_or_none(arguments.get("confidence"))
+        if confidence is not None:
+            metadata["qwen_confidence"] = confidence
+        progress_state = self._bounded_metadata_text(arguments.get("progress_state"))
+        if progress_state:
+            metadata["qwen_progress_state"] = progress_state
+        stop_evidence = self._bounded_metadata_text(arguments.get("stop_evidence"))
+        if stop_evidence:
+            metadata["qwen_stop_evidence"] = stop_evidence
+        current_target = self._bounded_metadata_text(arguments.get("current_target"))
+        if current_target:
+            metadata["qwen_current_target"] = current_target
+        target_relation = self._bounded_metadata_text(arguments.get("target_relation"))
+        if target_relation:
+            metadata["qwen_target_relation"] = target_relation
+        semantic_stop_state = self._bounded_metadata_text(
+            arguments.get("semantic_stop_state")
+        )
+        if semantic_stop_state:
+            metadata["qwen_semantic_stop_state"] = semantic_stop_state
+        visual_summary = self._bounded_metadata_text(arguments.get("visual_summary"))
+        metadata["qwen_visual_summary_present"] = bool(visual_summary)
+        if visual_summary:
+            metadata["qwen_visual_summary"] = visual_summary
+        reason = self._bounded_metadata_text(arguments.get("reason") or decision_reason)
+        if reason:
+            metadata["qwen_reason"] = reason
+        return metadata
+
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _bounded_metadata_text(value: Any, limit: int = 500) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()[:limit]
 
     def _after_recall_decision(
         self,

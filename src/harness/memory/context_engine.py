@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set
 
 MAX_RECENT_STEP_SUMMARY_CHARS = 500
 MAX_MEMORY_CONTEXT_CHARS = 1500
-MAX_RETRIEVED_MEMORIES = 3
+MAX_RETRIEVED_MEMORIES = 8
 REVIEW_INTERVAL_STEPS = 10
 
 
@@ -98,6 +98,12 @@ class MemoryAwareContextEngine:
                 record.memory_id for record in retrieved
             ]
             context["memory_context_text"] = self._memory_context_text(retrieved)
+            image_records = self._retrieved_memory_images(retrieved)
+            if image_records:
+                image_paths = [record["image_path"] for record in image_records]
+                context["memory_images"] = image_paths
+                context["retrieved_memory_image_paths"] = image_paths
+                context["retrieved_memory_images"] = image_records
         return context
 
     def record_step(
@@ -115,6 +121,14 @@ class MemoryAwareContextEngine:
     ) -> Dict[str, Any]:
         now = self._now()
         summary = self._step_summary(step_id, action_text, planner_reason, ok, error)
+        memory_context_used = bool(
+            payload.get("memory_context_text")
+            or payload.get("memory_images")
+            or payload.get("retrieved_memory_ids")
+            or payload.get("retrieved_memory_image_paths")
+        )
+        control_context_used = bool(payload.get("control_context"))
+        evidence_context_used = bool(payload.get("evidence_context"))
         task_state = {
             "run_id": run_id,
             "scene_id": scene_id,
@@ -142,6 +156,9 @@ class MemoryAwareContextEngine:
                 "planner_reason": planner_reason,
                 "ok": ok,
                 "error": error,
+                "memory_context_used": memory_context_used,
+                "control_context_used": control_context_used,
+                "evidence_context_used": evidence_context_used,
             },
         )
         if error:
@@ -160,6 +177,9 @@ class MemoryAwareContextEngine:
             "task_state_path": str(self.task_state_path),
             "running_summary_path": str(self.summary_path),
             "decision_log_path": str(self.decision_log_path),
+            "memory_context_used": memory_context_used,
+            "control_context_used": control_context_used,
+            "evidence_context_used": evidence_context_used,
         }
 
     def add_memory(
@@ -191,6 +211,21 @@ class MemoryAwareContextEngine:
             f"- {record.memory_id} step={step_id} image={image_path} {record.text}\n",
         )
         return memory_id
+
+    def has_memory_image(
+        self,
+        image_path: str,
+        scene_id: str,
+        episode_id: str,
+    ) -> bool:
+        if not image_path:
+            return False
+        return any(
+            record.scene_id == scene_id
+            and record.episode_id == episode_id
+            and record.image_path == image_path
+            for record in self._load_memories()
+        )
 
     def retrieve(
         self,
@@ -304,6 +339,24 @@ class MemoryAwareContextEngine:
             if record.text
         ]
         return self._bounded_text("\n".join(lines), MAX_MEMORY_CONTEXT_CHARS)
+
+    def _retrieved_memory_images(
+        self,
+        records: List[ContextMemoryRecord],
+    ) -> List[Dict[str, Any]]:
+        images: List[Dict[str, Any]] = []
+        for record in records:
+            if not record.image_path:
+                continue
+            images.append(
+                {
+                    "memory_id": record.memory_id,
+                    "image_path": record.image_path,
+                    "source": "openclaw_retrieved_memory",
+                    "step_id": int(record.step_id),
+                }
+            )
+        return images
 
     def _bounded_task_state(self, task_state: Dict[str, Any]) -> Dict[str, Any]:
         allowed = (

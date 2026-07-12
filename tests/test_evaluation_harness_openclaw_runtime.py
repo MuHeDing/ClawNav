@@ -2,7 +2,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from evaluation_harness import HarnessModelProxy, build_harness_components
+from evaluation_harness import (
+    HarnessModelProxy,
+    QwenDirectPolicyProxy,
+    build_harness_components,
+)
 
 
 class FakeBaseModel:
@@ -27,6 +31,30 @@ class SaveableFrame:
         path.write_text(self.text, encoding="utf-8")
 
 
+class FakeDirectRuntimeResult:
+    ok = True
+    action_text = "MOVE_FORWARD"
+    executor_command = {"action_index": 1, "runtime_executor": "openclaw_habitat"}
+    error = ""
+    runtime_metadata = {
+        "planned_intent": "act",
+        "planned_tool": "QwenDirectPolicy",
+        "planner_reason": "direct test",
+        "policy_backend": "qwen_direct",
+        "direct_policy": True,
+        "janus_loaded": False,
+    }
+
+
+class FakeDirectRuntime:
+    def __init__(self):
+        self.calls = []
+
+    def step(self, state, payload):
+        self.calls.append((state, dict(payload)))
+        return FakeDirectRuntimeResult()
+
+
 def make_args(tmp_path, **overrides):
     data = {
         "harness_mode": "memory_recall",
@@ -40,6 +68,11 @@ def make_args(tmp_path, **overrides):
         "output_path": str(tmp_path),
         "num_history": 8,
         "expose_sim_pose_online": False,
+        "keyframe_policy_mode": "interval",
+        "keyframe_min_gap_steps": 5,
+        "keyframe_episode_cap": 64,
+        "keyframe_coverage_gap_steps": 20,
+        "keyframe_debug_save_all_eligible": False,
         "harness_runtime": "openclaw_bridge",
         "openclaw_workspace_path": "",
         "openclaw_service_registry_path": "",
@@ -53,6 +86,10 @@ def make_args(tmp_path, **overrides):
         "openclaw_enable_subagent_critic": False,
         "openclaw_enable_subagent_memory_curator": False,
         "openclaw_allow_planner_action_override": False,
+        "policy_backend": "janus_policy",
+        "save_video": False,
+        "save_video_ratio": 0.0,
+        "harness_stream_video": False,
     }
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -63,6 +100,85 @@ def test_build_components_creates_openclaw_runtime_when_requested(tmp_path):
 
     assert components["openclaw_runtime"] is not None
     assert components["config"].harness_runtime == "openclaw_bridge"
+
+
+def test_build_components_qwen_direct_leaves_navigation_policy_unregistered(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+
+    assert "NavigationPolicySkill" not in components["skill_registry"].names()
+    assert components["openclaw_runtime"] is not None
+
+
+def test_qwen_direct_proxy_requires_openclaw_runtime(tmp_path):
+    components = build_harness_components(
+        make_args(tmp_path, policy_backend="qwen_direct", harness_runtime="phase2"),
+        model=None,
+    )
+
+    try:
+        QwenDirectPolicyProxy(components)
+    except ValueError as exc:
+        assert "openclaw_runtime" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_qwen_direct_proxy_exposes_evaluator_compatibility_attrs(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+
+    proxy = QwenDirectPolicyProxy(components)
+
+    assert proxy.processor is None
+    assert proxy.tokenizer is None
+    assert proxy.model.past_key_values_vggt is None
+    assert proxy.model.config is not None
+
+
+def test_qwen_direct_proxy_uses_runtime_without_base_model(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+    runtime = FakeDirectRuntime()
+    components["openclaw_runtime"] = runtime
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+
+    action = proxy.call_model([SaveableFrame("frame0")], "go to kitchen", step_id=0)
+
+    assert action == ["MOVE_FORWARD"]
+    assert proxy.consume_last_visual_prune_profile() is None
+    state, payload = runtime.calls[0]
+    assert state.scene_id == "scene-a"
+    assert state.episode_id == "episode-1"
+    assert payload["run_id"] == str(tmp_path)
+    trace_path = tmp_path / "harness_traces" / "harness_trace_rank0.jsonl"
+    record = json.loads(trace_path.read_text(encoding="utf-8").strip())
+    assert record["policy_backend"] == "qwen_direct"
+    assert record["direct_policy"] is True
+    assert record["janus_loaded"] is False
+    assert record["planned_tool"] == "QwenDirectPolicy"
 
 
 def test_build_components_registers_visual_memory_curator_when_enabled(tmp_path):
@@ -121,6 +237,37 @@ def test_proxy_start_episode_resets_last_action_and_updates_state_identity(tmp_p
     assert records[0]["episode_id"] == "episode-1"
     assert records[1]["scene_id"] == "scene-b"
     assert records[1]["episode_id"] == "episode-2"
+
+
+def test_proxy_save_video_does_not_enable_duplicate_harness_stream_video_by_default(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(
+        make_args(tmp_path, save_video=True, save_video_ratio=1.0),
+        model=base_model,
+    )
+    proxy = HarnessModelProxy(base_model, components)
+
+    proxy.start_episode("scene-a", "episode-1")
+
+    assert proxy._episode_save_video is False
+
+
+def test_proxy_can_enable_harness_stream_video_explicitly(tmp_path):
+    base_model = FakeBaseModel()
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            save_video=True,
+            save_video_ratio=1.0,
+            harness_stream_video=True,
+        ),
+        model=base_model,
+    )
+    proxy = HarnessModelProxy(base_model, components)
+
+    proxy.start_episode("scene-a", "episode-1")
+
+    assert proxy._episode_save_video is True
 
 
 def test_service_registry_can_supply_spatial_memory_url(tmp_path):
@@ -213,6 +360,67 @@ def test_proxy_payload_exposes_current_image_path_and_recent_keyframe_paths(tmp_
     assert Path(second_payload["current_image_path"]).exists()
     assert first_payload["current_image_path"].endswith("step_000000.png")
     assert second_payload["current_image_path"].endswith("step_000001.png")
+
+
+def test_qwen_direct_proxy_payload_includes_structured_control_context(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    working_memory = components["working_memory"]
+    for _ in range(4):
+        working_memory.append_action("MOVE_FORWARD")
+    working_memory.append_online_metrics(
+        {
+            "distance_to_goal": 0.2,
+            "collision": True,
+        }
+    )
+
+    payload = proxy._runtime_payload([SaveableFrame("current")], step_id=4)
+
+    assert payload["policy_input"]["policy_backend"] == "qwen_direct"
+    assert payload["policy_input"]["action_scale"]["MOVE_FORWARD"]["distance_m"] == 0.25
+    assert payload["policy_input"]["action_scale"]["TURN_LEFT"]["angle_degrees"] == 15
+    assert payload["policy_input"]["action_scale"]["TURN_RIGHT"]["angle_degrees"] == 15
+    assert "distance_to_goal" not in json.dumps(payload["policy_input"])
+    assert payload["control_context"]["recent_action_counts"]["MOVE_FORWARD"] == 4
+    assert payload["control_context"]["recent_forward_count"] == 4
+    assert payload["control_context"]["non_oracle_metrics"] == {"collision": True}
+    assert "distance_to_goal" not in json.dumps(payload["control_context"])
+    assert payload["evidence_context"]["has_current_image"] is True
+    assert payload["evidence_context"]["current_image_path"] == payload["current_image_path"]
+
+
+def test_proxy_start_episode_resets_episode_local_working_memory(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    working_memory = components["working_memory"]
+    for _ in range(14):
+        working_memory.append_action("MOVE_FORWARD")
+
+    proxy.start_episode("scene-a", "episode-2")
+    payload = proxy._runtime_payload([SaveableFrame("current")], step_id=0)
+
+    assert payload["recent_actions"] == []
+    assert payload["control_context"]["recent_forward_count"] == 0
+    assert payload["control_context"]["recent_action_count"] == 0
 
 
 def test_proxy_saves_keyframe_artifact_for_write_memory(tmp_path):

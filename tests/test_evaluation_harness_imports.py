@@ -46,6 +46,52 @@ def test_parser_helper_includes_harness_args():
     assert args.memory_manifest_path == ""
     assert args.harness_debug_max_episodes == 1
     assert args.harness_episode_keys == "2azQ1b91cZZ:11,zsNo4HB9uLZ:2"
+    assert args.harness_stream_video is False
+
+
+def test_parser_can_enable_harness_stream_video_separately_from_save_video():
+    module = importlib.import_module("evaluation_harness")
+    parser = module.build_parser()
+    args = parser.parse_args(
+        [
+            "--model_path",
+            "model",
+            "--output_path",
+            "out",
+            "--save_video",
+            "--harness_stream_video",
+        ]
+    )
+
+    assert args.save_video is True
+    assert args.harness_stream_video is True
+
+
+def test_parser_allows_qwen_direct_without_model_path():
+    module = importlib.import_module("evaluation_harness")
+    parser = module.build_parser()
+
+    args = parser.parse_args(
+        [
+            "--policy_backend",
+            "qwen_direct",
+            "--output_path",
+            "out",
+        ]
+    )
+
+    module.validate_args(args)
+    assert args.policy_backend == "qwen_direct"
+    assert args.model_path == ""
+
+
+def test_validate_args_requires_model_path_for_janus_policy():
+    module = importlib.import_module("evaluation_harness")
+    parser = module.build_parser()
+    args = parser.parse_args(["--output_path", "out"])
+
+    with pytest.raises(SystemExit):
+        module.validate_args(args)
 
 
 def test_parser_rejects_non_positive_max_steps():

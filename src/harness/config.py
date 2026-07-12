@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class HarnessConfig:
+    policy_backend: str = "janus_policy"
     harness_mode: str = "memory_recall"
     harness_runtime: str = "phase2"
     memory_backend: str = "fake"
@@ -29,3 +30,8 @@ class HarnessConfig:
     allow_oracle_metrics_for_decision: bool = False
     memory_source: str = "episode-local"
     expose_sim_pose_online: bool = False
+    keyframe_policy_mode: str = "interval"
+    keyframe_min_gap_steps: int = 5
+    keyframe_episode_cap: int = 64
+    keyframe_coverage_gap_steps: int = 20
+    keyframe_debug_save_all_eligible: bool = False

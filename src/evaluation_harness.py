@@ -1,6 +1,11 @@
 import argparse
+import os
+import random
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
+
+import numpy as np
 
 from harness.config import HarnessConfig
 from harness.controller import HarnessController
@@ -29,6 +34,19 @@ ACTIONS2IDX = {
     "TURN_LEFT": 2,
     "TURN_RIGHT": 3,
 }
+ACTION_SCALE_CONTEXT = {
+    "MOVE_FORWARD": {"effect": "advance", "distance_m": 0.25},
+    "TURN_LEFT": {"effect": "rotate_left", "angle_degrees": 15},
+    "TURN_RIGHT": {"effect": "rotate_right", "angle_degrees": 15},
+    "STOP": {"effect": "stop"},
+}
+
+JANUS_POLICY_BACKEND = "janus_policy"
+QWEN_DIRECT_POLICY_BACKEND = "qwen_direct"
+
+
+def action_scale_context() -> Dict[str, Dict[str, Any]]:
+    return {action: dict(details) for action, details in ACTION_SCALE_CONTEXT.items()}
 
 
 def positive_int(value: str) -> int:
@@ -38,9 +56,25 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ClawNav OpenClaw-style harness evaluation")
-    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--model_path", type=str, default="")
+    parser.add_argument(
+        "--policy_backend",
+        choices=(JANUS_POLICY_BACKEND, QWEN_DIRECT_POLICY_BACKEND),
+        default=JANUS_POLICY_BACKEND,
+    )
     parser.add_argument("--habitat_config_path", type=str, default="config/vln_r2r.yaml")
     parser.add_argument("--eval_split", type=str, default="val_unseen")
     parser.add_argument("--output_path", type=str, required=True)
@@ -61,6 +95,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument("--save_video_ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--harness_stream_video",
+        action="store_true",
+        default=False,
+        help=(
+            "Also write raw harness current-frame mp4s under videos/. "
+            "By default --save_video writes only the evaluator vis_<epoch>/ mp4."
+        ),
+    )
     parser.add_argument("--save_step_artifacts", action="store_true", default=False)
     parser.add_argument("--save_step_artifacts_with_video_only", action="store_true", default=False)
     parser.add_argument("--disable_qualitative_json", action="store_true", default=False)
@@ -80,6 +123,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--harness_trace_rank", type=int, default=0)
     parser.add_argument("--expose_sim_pose_online", action="store_true", default=False)
+    parser.add_argument(
+        "--keyframe_policy_mode",
+        type=str,
+        default=os.environ.get("OPENCLAW_KEYFRAME_POLICY_MODE", "interval"),
+    )
+    parser.add_argument(
+        "--keyframe_min_gap_steps",
+        type=int,
+        default=env_int("OPENCLAW_KEYFRAME_MIN_GAP_STEPS", 5),
+    )
+    parser.add_argument(
+        "--keyframe_episode_cap",
+        type=int,
+        default=env_int("OPENCLAW_KEYFRAME_EPISODE_CAP", 64),
+    )
+    parser.add_argument(
+        "--keyframe_coverage_gap_steps",
+        type=int,
+        default=env_int("OPENCLAW_KEYFRAME_COVERAGE_GAP_STEPS", 20),
+    )
+    parser.add_argument(
+        "--keyframe_debug_save_all_eligible",
+        action="store_true",
+        default=env_bool("OPENCLAW_KEYFRAME_DEBUG_SAVE_ALL_ELIGIBLE", False),
+    )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
     parser.add_argument("--openclaw_service_registry_path", type=str, default="")
@@ -99,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--openclaw_allow_planner_action_override", action="store_true", default=False)
     return parser
+
+
+def validate_args(args: argparse.Namespace) -> argparse.Namespace:
+    policy_backend = getattr(args, "policy_backend", JANUS_POLICY_BACKEND)
+    if policy_backend == JANUS_POLICY_BACKEND and not getattr(args, "model_path", ""):
+        raise SystemExit("--model_path is required when --policy_backend=janus_policy")
+    return args
 
 
 def _canonical_episode_scene_id(scene_id: Any) -> str:
@@ -141,6 +216,7 @@ def filter_harness_episodes_by_keys(episodes: list[Any], raw_keys: str) -> list[
 
 def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
     config = HarnessConfig(
+        policy_backend=getattr(args, "policy_backend", JANUS_POLICY_BACKEND),
         harness_mode=args.harness_mode,
         memory_backend=args.harness_memory_backend,
         spatial_memory_url=args.spatial_memory_url,
@@ -149,6 +225,11 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         recall_interval_steps=args.harness_recall_interval_steps,
         memory_source=args.harness_memory_source,
         expose_sim_pose_online=args.expose_sim_pose_online,
+        keyframe_policy_mode=args.keyframe_policy_mode,
+        keyframe_min_gap_steps=args.keyframe_min_gap_steps,
+        keyframe_episode_cap=args.keyframe_episode_cap,
+        keyframe_coverage_gap_steps=args.keyframe_coverage_gap_steps,
+        keyframe_debug_save_all_eligible=args.keyframe_debug_save_all_eligible,
         harness_runtime=args.harness_runtime,
         openclaw_workspace_path=args.openclaw_workspace_path,
         openclaw_service_registry_path=args.openclaw_service_registry_path,
@@ -199,6 +280,9 @@ def build_harness_components(
     model: Any = None,
 ) -> Dict[str, Any]:
     config = build_harness_config(args)
+    direct_policy = config.policy_backend == QWEN_DIRECT_POLICY_BACKEND
+    if direct_policy and model is not None:
+        raise ValueError("qwen_direct policy backend must not receive a Janus model")
     memory_client = build_memory_client(config)
     memory_manager = MemoryManager(memory_client, config)
     task_memory = TaskMemory()
@@ -228,6 +312,11 @@ def build_harness_components(
         from harness.openclaw.executor import HabitatOpenClawExecutor
         from harness.openclaw.planner import RuleOpenClawPlanner
         from harness.openclaw.runtime import OpenClawVLNRuntime
+
+        if direct_policy and config.openclaw_enable_subagent_planner:
+            raise ValueError("qwen_direct policy backend does not support subagent planner fallback")
+        if direct_policy and config.openclaw_planner_backend != "gateway":
+            raise ValueError("qwen_direct policy backend requires openclaw_planner_backend=gateway")
 
         if config.openclaw_enable_subagent_planner:
             from harness.openclaw.planner import SubagentOpenClawPlanner
@@ -276,6 +365,12 @@ def build_harness_components(
                 recall_interval_steps=config.recall_interval_steps,
             ),
             allow_planner_action_override=config.openclaw_allow_planner_action_override,
+            policy_backend=config.policy_backend,
+            keyframe_policy_mode=config.keyframe_policy_mode,
+            keyframe_min_gap_steps=config.keyframe_min_gap_steps,
+            keyframe_episode_cap=config.keyframe_episode_cap,
+            keyframe_coverage_gap_steps=config.keyframe_coverage_gap_steps,
+            keyframe_debug_save_all_eligible=config.keyframe_debug_save_all_eligible,
         )
     logger = HarnessLogger(
         Path(args.output_path) / "harness_traces",
@@ -285,6 +380,7 @@ def build_harness_components(
     return {
         "config": config,
         "memory_client": memory_client,
+        "args": args,
         "memory_manager": memory_manager,
         "task_memory": task_memory,
         "working_memory": working_memory,
@@ -302,22 +398,44 @@ class HarnessModelProxy:
         self.base_model = base_model
         self.model = base_model.model
         self.components = components
+        args = components.get("args")
+        self.save_video = (
+            bool(getattr(args, "save_video", False))
+            and bool(getattr(args, "harness_stream_video", False))
+            if args is not None
+            else False
+        )
+        self.save_video_ratio = float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
         self.last_action_text = None
         self.current_scene_id = ""
         self.current_episode_id = ""
         self.recent_keyframe_paths = []
+        self._episode_video_writer = None
+        self._episode_save_video = False
+        self._episode_video_disabled = False
+        self._episode_video_frame_count = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base_model, name)
 
     def start_episode(self, scene_id: str, episode_id: str) -> None:
+        self.finalize_episode()
+        working_memory = self.components.get("working_memory")
+        if working_memory is not None and hasattr(working_memory, "reset"):
+            working_memory.reset()
         self.current_scene_id = str(scene_id or "")
         self.current_episode_id = str(episode_id or "")
         self.last_action_text = None
         self.recent_keyframe_paths = []
+        self._episode_save_video = self.save_video and (
+            random.random() < self.save_video_ratio
+        )
+        self._episode_video_disabled = False
+        self._episode_video_frame_count = 0
 
     def call_model(self, images, task, step_id):
         current_image = images[-1] if images else None
+        self._record_video_frame(current_image)
         state = self._build_proxy_state(task, step_id, current_image)
         runtime = self.components.get("openclaw_runtime")
         if runtime is not None:
@@ -326,6 +444,7 @@ class HarnessModelProxy:
                 self._runtime_payload(images, step_id),
             )
             action_text = runtime_result.action_text if runtime_result.ok else "STOP"
+            self._remember_promoted_keyframe_from_runtime(runtime_result)
             self.last_action_text = action_text
             self._append_working_memory(images, action_text)
             self._log_runtime_step(state, runtime_result, action_text)
@@ -348,10 +467,19 @@ class HarnessModelProxy:
         current_image = images[-1] if images else None
         payload = {
             "recent_frames": list(images[:-1]),
+            "recent_actions": list(self.components["working_memory"].actions),
             "policy_action": self.last_action_text,
             "run_id": str(self.components.get("output_path") or ""),
+            "keyframe_policy_mode": self.components["config"].keyframe_policy_mode,
         }
-        if self.components["working_memory"].should_promote_keyframe(step_id):
+        keyframe_target_path = self._keyframe_target_path(current_image, step_id)
+        payload["keyframe_target_path"] = keyframe_target_path
+        if self.components["config"].keyframe_policy_mode == "event_gated_smoke":
+            payload["current_image_path"] = self._save_current_image_if_needed(
+                current_image,
+                step_id,
+            )
+        elif self.components["working_memory"].should_promote_keyframe(step_id):
             image_path = self._save_keyframe_if_needed(current_image, step_id)
             if image_path:
                 self._remember_keyframe_path(image_path)
@@ -368,7 +496,47 @@ class HarnessModelProxy:
                 step_id,
             )
         payload["recent_keyframe_paths"] = list(self.recent_keyframe_paths)
+        self._attach_structured_runtime_context(
+            payload,
+            step_id=step_id,
+            has_current_image=current_image is not None,
+        )
         return payload
+
+    def _attach_structured_runtime_context(
+        self,
+        payload: Dict[str, Any],
+        step_id: int,
+        has_current_image: bool,
+    ) -> None:
+        working_memory = self.components["working_memory"]
+        recent_actions = list(payload.get("recent_actions") or [])
+        action_counts: Dict[str, int] = {}
+        for action in recent_actions:
+            action_text = str(action or "")
+            if not action_text:
+                continue
+            action_counts[action_text] = action_counts.get(action_text, 0) + 1
+        non_oracle_metrics = working_memory.decision_metrics()
+        payload["policy_input"] = {
+            "policy_backend": self.components["config"].policy_backend,
+            "step_id": step_id,
+            "last_action_text": self.last_action_text or "",
+            "action_scale": action_scale_context(),
+        }
+        payload["control_context"] = {
+            "recent_action_counts": action_counts,
+            "recent_forward_count": action_counts.get("MOVE_FORWARD", 0),
+            "recent_action_count": len(recent_actions),
+            "last_action_text": self.last_action_text or "",
+            "current_step_id": step_id,
+            "non_oracle_metrics": non_oracle_metrics,
+        }
+        payload["evidence_context"] = {
+            "has_current_image": bool(has_current_image),
+            "current_image_path": str(payload.get("current_image_path") or ""),
+            "recent_keyframe_count": len(payload.get("recent_keyframe_paths") or []),
+        }
 
     def _save_keyframe_if_needed(self, image, step_id: int) -> str:
         return self._save_image_artifact(image, "keyframes", step_id)
@@ -379,15 +547,23 @@ class HarnessModelProxy:
     def _save_image_artifact(self, image, root_dir_name: str, step_id: int) -> str:
         if image is None:
             return ""
-        image_dir = self._episode_artifact_dir(root_dir_name)
-        image_dir.mkdir(parents=True, exist_ok=True)
+        path = self._image_artifact_path(image, root_dir_name, step_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
         if hasattr(image, "save"):
-            path = image_dir / f"step_{step_id:06d}.png"
             image.save(path)
         else:
-            path = image_dir / f"step_{step_id:06d}.txt"
             path.write_text(str(image), encoding="utf-8")
         return str(path)
+
+    def _keyframe_target_path(self, image, step_id: int) -> str:
+        if image is None:
+            return ""
+        return str(self._image_artifact_path(image, "keyframes", step_id))
+
+    def _image_artifact_path(self, image, root_dir_name: str, step_id: int) -> Path:
+        image_dir = self._episode_artifact_dir(root_dir_name)
+        suffix = "png" if hasattr(image, "save") else "txt"
+        return image_dir / f"step_{step_id:06d}.{suffix}"
 
     def _episode_artifact_dir(self, root_dir_name: str) -> Path:
         root_dir = Path(self.components["output_path"]) / root_dir_name
@@ -405,6 +581,112 @@ class HarnessModelProxy:
             return
         self.recent_keyframe_paths.append(image_path)
         self.recent_keyframe_paths = self.recent_keyframe_paths[-8:]
+
+    def _remember_promoted_keyframe_from_runtime(self, runtime_result) -> None:
+        metadata = getattr(runtime_result, "runtime_metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            return
+        gate = metadata.get("keyframe_gate") or {}
+        if not isinstance(gate, dict):
+            return
+        if gate.get("promotion_status") != "promoted":
+            return
+        image_path = str(
+            gate.get("promoted_image_path")
+            or gate.get("keyframe_image_path")
+            or gate.get("image_path")
+            or ""
+        )
+        if image_path:
+            self._remember_keyframe_path(image_path)
+
+    def finalize_episode(self):
+        self._release_video_writer()
+
+    def _output_path(self) -> Path:
+        return self.components["output_path"]
+
+    def _episode_video_path(self) -> Path:
+        safe_scene = self._safe_path_part(self.current_scene_id or "scene")
+        safe_episode = self._safe_path_part(self.current_episode_id or "episode")
+        return (
+            self._output_path()
+            / "videos"
+            / safe_scene
+            / f"{safe_episode}.mp4"
+        )
+
+    def _episode_video_tmp_path(self) -> Path:
+        final_path = self._episode_video_path()
+        return final_path.with_name(f"{final_path.stem}.part{final_path.suffix}")
+
+    def _record_video_frame(self, image) -> None:
+        if not self._episode_save_video or self._episode_video_disabled:
+            return
+        frame_bgr = self._to_video_frame_bgr(image)
+        if frame_bgr is None:
+            return
+        if self._episode_video_writer is None:
+            self._init_video_writer(frame_bgr.shape[1], frame_bgr.shape[0])
+        if self._episode_video_writer is None:
+            return
+        self._episode_video_writer.write(frame_bgr)
+        self._episode_video_frame_count += 1
+
+    def _to_video_frame_bgr(self, image):
+        frame_rgb = self._to_rgb_frame(image)
+        if frame_rgb is None:
+            return None
+        import cv2
+
+        return cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+    def _to_rgb_frame(self, image):
+        if image is None:
+            return None
+        if hasattr(image, "convert"):
+            img = image.convert("RGB")
+            return np.array(img)
+        if isinstance(image, np.ndarray):
+            frame = image
+            if frame.ndim == 2:
+                frame = np.stack([frame] * 3, axis=-1)
+            if frame.ndim == 3 and frame.shape[2] > 3:
+                frame = frame[:, :, :3]
+            if frame.ndim != 3:
+                return None
+            return frame.astype(np.uint8)
+        return None
+
+    def _init_video_writer(self, width: int, height: int) -> None:
+        import cv2
+
+        output_path = self._episode_video_tmp_path()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            6,
+            (width, height),
+        )
+        if not writer.isOpened():
+            self._episode_video_disabled = True
+            writer.release()
+            return
+        self._episode_video_writer = writer
+
+    def _release_video_writer(self) -> None:
+        if self._episode_video_writer is not None:
+            self._episode_video_writer.release()
+            tmp_path = self._episode_video_tmp_path()
+            final_path = self._episode_video_path()
+            if self._episode_video_frame_count > 0 and tmp_path.exists():
+                tmp_path.replace(final_path)
+        self._episode_video_writer = None
 
     def consume_last_visual_prune_profile(self):
         return self.base_model.consume_last_visual_prune_profile()
@@ -475,6 +757,109 @@ class HarnessModelProxy:
         return dict(runtime_items[-1])
 
 
+class _InertQwenDirectBackbone:
+    def __init__(self) -> None:
+        self.past_key_values_vggt = None
+        self.config = SimpleNamespace()
+
+
+class QwenDirectPolicyProxy:
+    def __init__(self, components: Dict[str, Any]) -> None:
+        if components.get("openclaw_runtime") is None:
+            raise ValueError("qwen_direct policy backend requires openclaw_runtime")
+        args = components.get("args")
+        self.save_video = (
+            bool(getattr(args, "save_video", False))
+            and bool(getattr(args, "harness_stream_video", False))
+            if args is not None
+            else False
+        )
+        self.save_video_ratio = float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
+        self.processor = None
+        self.tokenizer = None
+        self.model = _InertQwenDirectBackbone()
+        self.components = components
+        self.last_action_text = None
+        self.current_scene_id = ""
+        self.current_episode_id = ""
+        self._episode_video_writer = None
+        self._episode_save_video = False
+        self._episode_video_disabled = False
+        self._episode_video_frame_count = 0
+        self.recent_keyframe_paths = []
+
+    start_episode = HarnessModelProxy.start_episode
+    finalize_episode = HarnessModelProxy.finalize_episode
+    _runtime_payload = HarnessModelProxy._runtime_payload
+    _save_keyframe_if_needed = HarnessModelProxy._save_keyframe_if_needed
+    _save_current_image_if_needed = HarnessModelProxy._save_current_image_if_needed
+    _save_image_artifact = HarnessModelProxy._save_image_artifact
+    _keyframe_target_path = HarnessModelProxy._keyframe_target_path
+    _image_artifact_path = HarnessModelProxy._image_artifact_path
+    _episode_artifact_dir = HarnessModelProxy._episode_artifact_dir
+    _output_path = HarnessModelProxy._output_path
+    _episode_video_path = HarnessModelProxy._episode_video_path
+    _episode_video_tmp_path = HarnessModelProxy._episode_video_tmp_path
+    _record_video_frame = HarnessModelProxy._record_video_frame
+    _to_video_frame_bgr = HarnessModelProxy._to_video_frame_bgr
+    _to_rgb_frame = HarnessModelProxy._to_rgb_frame
+    _init_video_writer = HarnessModelProxy._init_video_writer
+    _release_video_writer = HarnessModelProxy._release_video_writer
+    _safe_path_part = HarnessModelProxy._safe_path_part
+    _remember_keyframe_path = HarnessModelProxy._remember_keyframe_path
+    _remember_promoted_keyframe_from_runtime = (
+        HarnessModelProxy._remember_promoted_keyframe_from_runtime
+    )
+    _attach_structured_runtime_context = HarnessModelProxy._attach_structured_runtime_context
+    _build_proxy_state = HarnessModelProxy._build_proxy_state
+    _append_working_memory = HarnessModelProxy._append_working_memory
+    _latest_runtime = HarnessModelProxy._latest_runtime
+
+    def call_model(self, images, task, step_id):
+        current_image = images[-1] if images else None
+        self._record_video_frame(current_image)
+        state = self._build_proxy_state(task, step_id, current_image)
+        runtime_result = self.components["openclaw_runtime"].step(
+            state,
+            self._runtime_payload(images, step_id),
+        )
+        action_text = runtime_result.action_text if runtime_result.ok else "STOP"
+        self._remember_promoted_keyframe_from_runtime(runtime_result)
+        self.last_action_text = action_text
+        self._append_working_memory(images, action_text)
+        self._log_runtime_step(state, runtime_result, action_text)
+        return [action_text]
+
+    def consume_last_visual_prune_profile(self):
+        return None
+
+    def _log_runtime_step(self, state, runtime_result, action_text: str) -> None:
+        metadata = dict(runtime_result.runtime_metadata)
+        metadata.setdefault("policy_backend", QWEN_DIRECT_POLICY_BACKEND)
+        metadata.setdefault("direct_policy", True)
+        metadata.setdefault("janus_loaded", False)
+        metadata.setdefault("navigation_policy_skill_called", False)
+        executor_command = runtime_result.executor_command or {}
+        if "runtime_executor" in executor_command:
+            metadata["runtime_executor"] = executor_command["runtime_executor"]
+        metadata["runtime_status"] = "completed" if runtime_result.ok else "failed"
+        if runtime_result.error:
+            metadata["error_type"] = "openclaw_runtime_error"
+
+        self.components["logger"].log_step(
+            state,
+            intent=metadata.get("planned_intent", "act"),
+            skill=metadata.get("planned_tool", ""),
+            reason=metadata.get("planner_reason", runtime_result.error),
+            memory_backend=self.components["config"].memory_backend,
+            memory_source=self.components["config"].memory_source,
+            action_text=action_text,
+            fallback=not runtime_result.ok,
+            decision_inputs={},
+            runtime=metadata,
+        )
+
+
 def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
     import json
     import os
@@ -485,8 +870,12 @@ def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
     import evaluation as eval_mod
     from utils.dist import get_rank, get_world_size
 
+    policy_backend = getattr(args, "policy_backend", JANUS_POLICY_BACKEND)
     components = build_harness_components(args, model=model)
-    proxy_model = HarnessModelProxy(model, components)
+    if policy_backend == QWEN_DIRECT_POLICY_BACKEND:
+        proxy_model = QwenDirectPolicyProxy(components)
+    else:
+        proxy_model = HarnessModelProxy(model, components)
 
     class HarnessVLNEvaluator(eval_mod.VLNEvaluator):
         def config_env(self):
@@ -509,6 +898,8 @@ def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
         args=args,
     )
     sucs, spls, oss, ones, ep_num = evaluator.eval_action(get_rank())
+    if hasattr(proxy_model, "finalize_episode"):
+        proxy_model.finalize_episode()
 
     ep_num_all = [torch.zeros_like(ep_num) for _ in range(world_size)]
     dist.all_gather(ep_num_all, ep_num)
@@ -543,21 +934,24 @@ def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = validate_args(parser.parse_args())
     # Heavy imports and model loading are intentionally delayed until main().
     import evaluation as eval_mod  # pylint: disable=import-outside-toplevel
-    from evaluation import JanusVLN_Inference  # pylint: disable=import-outside-toplevel
     from utils.dist import init_distributed_mode  # pylint: disable=import-outside-toplevel
 
     init_distributed_mode(args)
     eval_mod.max_pixels = args.max_pixels
     eval_mod.min_pixels = args.min_pixels
-    model = JanusVLN_Inference(
-        args.model_path,
-        device=f"cuda:{args.local_rank}",
-        kv_start_size=args.kv_start_size,
-        kv_recent_size=args.kv_recent_size,
-    )
+    model = None
+    if args.policy_backend == JANUS_POLICY_BACKEND:
+        from evaluation import JanusVLN_Inference  # pylint: disable=import-outside-toplevel
+
+        model = JanusVLN_Inference(
+            args.model_path,
+            device=f"cuda:{args.local_rank}",
+            kv_start_size=args.kv_start_size,
+            kv_recent_size=args.kv_recent_size,
+        )
     evaluate_harness(model, args)
 
 

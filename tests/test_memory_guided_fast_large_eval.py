@@ -84,6 +84,124 @@ def test_collect_summary_accepts_valid_memory_guided_fast_trace(tmp_path):
     assert validate_large_eval_gate(summary) == []
 
 
+def test_collect_summary_counts_qwen_direct_policy_proof_fields(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(
+        run_dir / "harness_traces" / "harness_trace_rank0.jsonl",
+        [
+            {
+                "scene_id": "2azQ1b91cZZ",
+                "episode_id": "11",
+                "step_id": 0,
+                "policy_backend": "qwen_direct",
+                "direct_policy": True,
+                "janus_loaded": False,
+                "navigation_policy_skill_called": False,
+                "planned_tool": "QwenDirectPolicy",
+                "candidate_action": "MOVE_FORWARD",
+                "final_action": "TURN_LEFT",
+                "final_action_source": "uncertainty_gate",
+                "qwen_confidence": 0.2,
+                "qwen_progress_state": "uncertain",
+                "qwen_stop_evidence": "none",
+                "qwen_visual_summary_present": True,
+                "context_audit": {
+                    "policy_backend": "qwen_direct",
+                    "planner_authority": "qwen",
+                    "qwen_candidate_requested": True,
+                    "qwen_model_called": True,
+                    "qwen_provider": "qwen_api",
+                    "qwen_api_called": True,
+                },
+            },
+            {
+                "scene_id": "2azQ1b91cZZ",
+                "episode_id": "11",
+                "step_id": 1,
+                "policy_backend": "qwen_direct",
+                "direct_policy": True,
+                "janus_loaded": False,
+                "navigation_policy_skill_called": False,
+                "planned_tool": "QwenDirectPolicy",
+                "qwen_failure": True,
+                "qwen_failure_reason": "invalid json",
+                "candidate_action": "STOP",
+                "final_action": "STOP",
+                "final_action_source": "qwen_failure_stop",
+                "fallback_policy": "hard_failure_stop",
+                "context_audit": {
+                    "policy_backend": "qwen_direct",
+                    "planner_authority": "qwen",
+                    "qwen_candidate_requested": True,
+                    "qwen_model_called": True,
+                    "qwen_provider": "qwen_api",
+                    "qwen_api_called": True,
+                    "qwen_failure": True,
+                },
+            },
+        ],
+    )
+    _write_jsonl(
+        run_dir / "result.json",
+        [{"scene_id": "2azQ1b91cZZ", "episode_id": 11, "success": 1.0, "spl": 1.0}],
+    )
+
+    summary = collect_run_summary(run_dir, expected_episodes=1, model_max_images=2)
+
+    assert summary["policy_backend_counts"] == {"qwen_direct": 2}
+    assert summary["direct_policy_rows"] == 2
+    assert summary["janus_loaded_count"] == 0
+    assert summary["navigation_policy_skill_called_count"] == 0
+    assert summary["qwen_candidate_requested"] == 2
+    assert summary["qwen_model_called"] == 2
+    assert summary["qwen_failure_count"] == 1
+    assert summary["qwen_missing_confidence_count"] == 1
+    assert summary["qwen_missing_stop_evidence_count"] == 1
+    assert summary["qwen_visual_summary_present_count"] == 1
+    assert summary["qwen_candidate_final_action_diff_count"] == 1
+    assert summary["final_action_source_counts"] == {
+        "uncertainty_gate": 1,
+        "qwen_failure_stop": 1,
+    }
+    assert validate_large_eval_gate(summary) == []
+
+
+def test_direct_policy_gate_rejects_navigation_policy_skill_call(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_jsonl(
+        run_dir / "harness_traces" / "harness_trace_rank0.jsonl",
+        [
+            {
+                "scene_id": "2azQ1b91cZZ",
+                "episode_id": "11",
+                "step_id": 0,
+                "policy_backend": "qwen_direct",
+                "direct_policy": True,
+                "janus_loaded": False,
+                "navigation_policy_skill_called": True,
+                "planned_tool": "NavigationPolicySkill",
+                "context_audit": {
+                    "policy_backend": "qwen_direct",
+                    "planner_authority": "qwen",
+                    "qwen_candidate_requested": True,
+                    "qwen_model_called": True,
+                },
+            }
+        ],
+    )
+    _write_jsonl(
+        run_dir / "result.json",
+        [{"scene_id": "2azQ1b91cZZ", "episode_id": 11, "success": 0.0, "spl": 0.0}],
+    )
+
+    summary = collect_run_summary(run_dir, expected_episodes=1, model_max_images=2)
+    failures = validate_large_eval_gate(summary)
+
+    failure_codes = {failure["code"] for failure in failures}
+    assert "direct_navigation_policy_skill_called" in failure_codes
+    assert "direct_planned_navigation_policy_skill" in failure_codes
+
+
 def test_gate_rejects_planner_fallback_and_keeps_context(tmp_path):
     run_dir = tmp_path / "run"
     _write_jsonl(

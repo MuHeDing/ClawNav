@@ -4,6 +4,7 @@ set -euo pipefail
 MODEL_PATH=${MODEL_PATH:-/ssd/dingmuhe/Embodied-task/JanusVLN/JanusVLN_Model/misstl/JanusVLN_Extra}
 DATA_PATH=${DATA_PATH:-/ssd/dingmuhe/Embodied-task/JanusVLN/data/datasets/r2r/val_unseen/val_unseen.json.gz}
 OUTPUT_PATH=${OUTPUT_PATH:-results/clawnav_openclaw_gateway_val_unseen_full}
+POLICY_BACKEND=${POLICY_BACKEND:-janus_policy}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,5}
 MASTER_PORT=${MASTER_PORT:-20401}
 TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
@@ -46,6 +47,7 @@ fi
 echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
 echo "Dataset: ${DATA_PATH}"
 echo "Output path: ${OUTPUT_PATH}"
+echo "Policy backend: ${POLICY_BACKEND}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
 echo "Memory backend/source: ${HARNESS_MEMORY_BACKEND}/${HARNESS_MEMORY_SOURCE}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES}"
@@ -63,6 +65,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} \
   --master_port="${MASTER_PORT}" \
   src/evaluation_harness.py \
   --model_path "${MODEL_PATH}" \
+  --policy_backend "${POLICY_BACKEND}" \
   --habitat_config_path config/vln_r2r.yaml \
   --eval_split "${EVAL_SPLIT}" \
   --data_path "${DATA_PATH}" \

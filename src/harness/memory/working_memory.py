@@ -48,6 +48,13 @@ class WorkingMemory:
     def append_diagnostics(self, metrics: Dict[str, Any]) -> None:
         self.diagnostic_metric_history.append(dict(metrics))
 
+    def reset(self) -> None:
+        self.frames.clear()
+        self.actions.clear()
+        self.poses.clear()
+        self.online_metric_history.clear()
+        self.diagnostic_metric_history.clear()
+
     def get_recent_frames(self, n: Optional[int] = None) -> List[Any]:
         frames = list(self.frames)
         if n is None:
