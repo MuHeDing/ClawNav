@@ -739,6 +739,14 @@ class VLNEvaluator:
                         indices = np.linspace(0, history_len, self.num_history + 1, dtype=int)
                         images = [rgb_list[i] for i in indices]
 
+                    if hasattr(self.model, "observe_environment_state"):
+                        self.model.observe_environment_state(
+                            env=env,
+                            episode=episode,
+                            observations=observations,
+                            metrics=info,
+                            step_id=step_id,
+                        )
                     action = self.model.call_model(images, episode_instruction, step_id)[0]
                     self._log_visual_prune_profile(
                         scene_id=scene_id,

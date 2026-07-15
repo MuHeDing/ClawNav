@@ -54,13 +54,39 @@ PROMPT_RUNTIME_CONTEXT_KEYS = (
     "policy_input",
     "control_context",
     "evidence_context",
+    "input_regime",
+    "map_assist_mode",
+    "map_frame_interval_steps",
+    "motion_feedback_enabled",
+    "forward_stall_odometry_enabled",
+    "map_collision_overlay_enabled",
+    "motion_feedback",
+    "map_context",
     "blocked_stop_feedback",
     "forward_stall_feedback",
+    "stop_verification_feedback",
+    "route_progress",
     "task_state",
     "recent_step_summary",
     "retrieved_memory_ids",
 )
 PROMPT_KEYFRAME_KEYS = ("step_id", "reason", "image_path")
+PROMPT_MAP_CONTEXT_KEYS = (
+    "mode",
+    "input_regime",
+    "map_frame_interval_steps",
+    "map_step_id",
+    "map_frame_due",
+    "map_available",
+    "map_source",
+    "pose_source",
+    "map_safety",
+    "visited_trail_count",
+    "collision_overlay_enabled",
+    "collision_point_count",
+    "map_image_label",
+    "map_generation_error",
+)
 PROMPT_TASK_STATE_KEYS = (
     "scene_id",
     "episode_id",
@@ -92,6 +118,17 @@ DIRECT_PROMPT_OMIT_KEYS = {
     "memory_images",
     "retrieved_memory_image_paths",
     "image_path",
+    "map_image_path",
+    "map_image_hash",
+    "internal_only",
+    "_map_internal_context",
+    "raw_pose",
+    "pose_history",
+    "sim_position",
+    "sim_rotation",
+    "diagnostic_pose",
+    "full_pose_history",
+    "local_artifact_path",
 }
 
 
@@ -1098,13 +1135,29 @@ class OpenClawCliPlanPlanner:
         planner_step_mode = ""
         if isinstance(runtime_context, dict):
             planner_step_mode = str(runtime_context.get("planner_step_mode") or "")
+        attached_order = (
+            runtime_context.get("attached_image_order")
+            if isinstance(runtime_context, dict)
+            else None
+        )
+        has_map_view = bool(
+            isinstance(attached_order, dict)
+            and "map_view" in (attached_order.get("sources") or [])
+        )
         image_instruction = (
             "No image is attached for this step. Use compact cached visual and memory evidence only."
             if planner_step_mode == "fast_text"
             else (
+                "Attached images are ordered as optional map_view floorplan first, then retrieved "
+                "history memory, then recent_current frames from oldest to newest, with the final "
+                "image as the current observation. Use map_view for coarse spatial layout and "
+                "visited-trail context only; base immediate action feasibility on the final current RGB image."
+                if has_map_view
+                else (
                 "Attached images are ordered as retrieved history memory first, then recent_current "
                 "frames from oldest to newest, with the final image as the current t observation. "
                 "Base the action on the final current image and use earlier images only for progress context."
+                )
             )
         )
         return "\n".join(
@@ -1125,8 +1178,11 @@ class OpenClawCliPlanPlanner:
                 "For multi-step routes, do not STOP just because the final object is visible; visual_summary must mention observed intermediate landmarks such as objects or rooms passed on the route, not only progress_state or reason claims.",
                 "For archway, doorway, or entrance targets, beside_target or next-to evidence is too loose. Do not STOP on the outside face of an archway, doorway, or entrance; if the opening is centered and traversable, choose MOVE_FORWARD and let the runtime controller confirm arrival.",
                 "Use current_target for the current final landmark/room/object and target_relation for the agent-to-target relation in the final current image.",
+                "When motion_feedback reports actual_effect=blocked or recommended_constraint=avoid_forward, avoid MOVE_FORWARD unless the final current RGB image clearly shows a newly aligned open path.",
                 "When blocked_stop_feedback is present, do not choose STOP. Use MOVE_FORWARD only when the current image clearly shows the route continues forward; otherwise use TURN_LEFT or TURN_RIGHT to recheck alignment or target evidence.",
                 "When forward_stall_feedback is present, do not choose MOVE_FORWARD; choose only TURN_LEFT or TURN_RIGHT and explain the corrective visual reason.",
+                "When stop_verification_feedback is present, do not choose MOVE_FORWARD. Recheck the same current observation and choose STOP only if the agent is already at or inside the structural target boundary; otherwise choose TURN_LEFT or TURN_RIGHT to inspect.",
+                "When route_progress is present, treat negated waypoint mentions as unseen. Do not claim a walk-past waypoint is complete until it appears in passed_waypoints, and do not choose final STOP while turn_round_completed is false or required_waypoints are not passed.",
                 image_instruction,
                 "Payload:",
                 compact_payload,
@@ -1192,6 +1248,9 @@ class OpenClawCliPlanPlanner:
         else:
             mode = "fast_text"
             reason = "cached_visual_memory"
+        map_context = runtime_context.get("map_context")
+        if not isinstance(map_context, dict):
+            map_context = {}
         return {
             "planner_step_mode": mode,
             "fast_break_reason": reason,
@@ -1209,6 +1268,17 @@ class OpenClawCliPlanPlanner:
                 and isinstance(memory, dict)
                 and memory.get("last_visual_summary")
             ),
+            "input_regime": runtime_context.get("input_regime")
+            or map_context.get("input_regime"),
+            "map_assist_mode": runtime_context.get("map_assist_mode")
+            or map_context.get("mode"),
+            "map_frame_interval_steps": runtime_context.get(
+                "map_frame_interval_steps"
+            )
+            or map_context.get("map_frame_interval_steps"),
+            "map_frame_due": map_context.get("map_frame_due"),
+            "map_step_id": map_context.get("map_step_id"),
+            "map_available": map_context.get("map_available"),
         }
 
     def _force_visual_refresh_requested(self, runtime_context: Dict[str, Any]) -> bool:
@@ -1364,33 +1434,70 @@ class OpenClawCliPlanPlanner:
         current_image_path = runtime_context.get("current_image_path")
         current_path = current_image_path if isinstance(current_image_path, str) else ""
         current_budget = 1 if current_path else 0
+        map_candidate = self._map_view_image_candidate(runtime_context)
+        map_candidates = [map_candidate] if map_candidate else []
+        pinned_budget = current_budget + len(map_candidates)
         recent_candidates = self._recent_current_frame_candidates(
             current_path,
             limit=MAX_DIRECT_RECENT_CURRENT_IMAGES,
         )
+        excluded_paths = {
+            str(candidate.get("path") or "")
+            for candidate in map_candidates
+            if candidate.get("path")
+        }
         recent_paths = {
             str(candidate.get("path") or "")
             for candidate in recent_candidates
-            if candidate.get("path")
+            if candidate.get("path") and candidate.get("path") not in excluded_paths
         }
-        history_budget = max(0, self.openclaw_model_max_images - current_budget)
+        history_budget = max(0, self.openclaw_model_max_images - pinned_budget)
         history_budget = min(MAX_DIRECT_RETRIEVED_MEMORY_IMAGES, history_budget)
         memory_candidates = self._retrieved_memory_image_candidates(
             runtime_context,
             current_path=current_path,
-            exclude_paths=recent_paths,
+            exclude_paths=recent_paths | excluded_paths,
         )[:history_budget]
         recent_budget = max(
             0,
-            self.openclaw_model_max_images - len(memory_candidates) - current_budget,
+            self.openclaw_model_max_images
+            - len(map_candidates)
+            - len(memory_candidates)
+            - current_budget,
         )
         if recent_budget < len(recent_candidates):
             recent_candidates = recent_candidates[-recent_budget:] if recent_budget else []
-        candidates = list(memory_candidates)
+        candidates = list(map_candidates)
+        candidates.extend(memory_candidates)
         candidates.extend(recent_candidates[:recent_budget])
         if current_path:
             candidates.append({"path": current_path, "source": "current"})
         return self._dedupe_model_image_candidates(candidates)
+
+    def _map_view_image_candidate(
+        self,
+        runtime_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        map_context = runtime_context.get("map_context")
+        if not isinstance(map_context, dict):
+            return None
+        if not map_context.get("map_frame_due") or not map_context.get("map_available"):
+            return None
+        internal = runtime_context.get("_map_internal_context")
+        if not isinstance(internal, dict):
+            internal = map_context.get("internal_only")
+        if not isinstance(internal, dict):
+            internal = {}
+        path = internal.get("map_image_path") or map_context.get("map_image_path")
+        if not isinstance(path, str) or not path:
+            return None
+        return {
+            "path": path,
+            "source": "map_view",
+            "map_step_id": map_context.get("map_step_id"),
+            "map_image_hash": internal.get("map_image_hash")
+            or map_context.get("map_image_hash"),
+        }
 
     def _recent_current_frame_candidates(
         self,
@@ -1509,15 +1616,25 @@ class OpenClawCliPlanPlanner:
         if not self._is_qwen_direct_policy():
             return metadata
 
+        map_view = [
+            candidate
+            for candidate in selected_candidates
+            if candidate.get("source") == "map_view"
+        ]
+        missing_map_view = [
+            candidate
+            for candidate in missing_candidates
+            if candidate.get("source") == "map_view"
+        ]
         retrieved = [
             candidate
             for candidate in selected_candidates
-            if candidate.get("source") not in ("current", "recent_current")
+            if candidate.get("source") not in ("current", "recent_current", "map_view")
         ]
         missing_retrieved = [
             candidate
             for candidate in missing_candidates
-            if candidate.get("source") not in ("current", "recent_current")
+            if candidate.get("source") not in ("current", "recent_current", "map_view")
         ]
         recent_current = [
             candidate
@@ -1535,6 +1652,17 @@ class OpenClawCliPlanPlanner:
             if candidate.get("memory_id")
         ]
         metadata["history_frame_source"] = "openclaw_retrieved_memory"
+        metadata["map_view_image_count"] = len(map_view)
+        metadata["map_view_image_paths"] = [
+            str(candidate.get("path") or "")
+            for candidate in map_view
+        ]
+        metadata["map_view_missing_image_paths"] = [
+            str(candidate.get("path") or "")
+            for candidate in missing_map_view
+        ]
+        if map_view and map_view[0].get("map_image_hash"):
+            metadata["map_image_hash"] = str(map_view[0].get("map_image_hash") or "")
         metadata["retrieved_memory_image_count"] = len(retrieved)
         metadata["retrieved_memory_image_paths"] = [
             str(candidate.get("path") or "")
@@ -1579,7 +1707,9 @@ class OpenClawCliPlanPlanner:
             "total": len(sources),
             "sources": sources,
             "semantic_order": (
-                "retrieved_history_first_then_recent_current_oldest_to_newest_current_last"
+                "map_view_first_when_present_then_retrieved_history_then_recent_current_oldest_to_newest_current_last"
+                if "map_view" in sources
+                else "retrieved_history_first_then_recent_current_oldest_to_newest_current_last"
             ),
             "current_image_last": bool(model_images.get("current_image_last")),
         }
@@ -1604,6 +1734,16 @@ class OpenClawCliPlanPlanner:
         context_audit["memory_context_used"] = bool(step_mode.get("memory_context_used"))
         context_audit["fast_break_reason"] = step_mode.get("fast_break_reason")
         context_audit["visual_memory_update_status"] = "not_applicable"
+        for key in (
+            "input_regime",
+            "map_assist_mode",
+            "map_frame_interval_steps",
+            "map_frame_due",
+            "map_step_id",
+            "map_available",
+        ):
+            if step_mode.get(key) is not None:
+                context_audit[key] = step_mode.get(key)
 
     def _update_visual_memory_cache(
         self,
@@ -1819,6 +1959,10 @@ class OpenClawCliPlanPlanner:
                 "model_image_sources",
                 "current_image_last",
                 "history_frame_source",
+                "map_view_image_count",
+                "map_view_image_paths",
+                "map_view_missing_image_paths",
+                "map_image_hash",
                 "retrieved_memory_image_count",
                 "retrieved_memory_image_paths",
                 "retrieved_memory_missing_image_paths",
@@ -1893,6 +2037,7 @@ class OpenClawCliPlanPlanner:
             runtime_context,
             PROMPT_RUNTIME_CONTEXT_KEYS,
         )
+        prompt_runtime_context.pop("map_context", None)
         recent_paths = prompt_runtime_context.get("recent_keyframe_paths")
         if isinstance(recent_paths, list):
             prompt_runtime_context["recent_keyframe_paths"] = recent_paths[
@@ -1957,6 +2102,20 @@ class OpenClawCliPlanPlanner:
             prompt_keyframe = self._copy_keys(keyframe_candidate, PROMPT_KEYFRAME_KEYS)
             if prompt_keyframe:
                 prompt_runtime_context["keyframe_candidate"] = prompt_keyframe
+        map_context = runtime_context.get("map_context")
+        if isinstance(map_context, dict):
+            prompt_map_context = self._copy_keys(
+                map_context,
+                PROMPT_MAP_CONTEXT_KEYS,
+            )
+            if prompt_map_context:
+                prompt_runtime_context["map_context"] = prompt_map_context
+            internal_map_context = map_context.get("internal_only")
+            if isinstance(internal_map_context, dict):
+                prompt_runtime_context["_map_internal_context"] = self._copy_keys(
+                    internal_map_context,
+                    ("map_image_path", "map_image_hash"),
+                )
         if (
             self.openclaw_visual_mode == "describe"
             and prompt_runtime_context
@@ -2252,6 +2411,7 @@ class OpenClawCliPlanPlanner:
         if not action_text:
             raise RuntimeError("qwen direct response missing supported action_text")
         arguments["action_text"] = action_text
+        arguments["reason"] = reason
         return {
             "intent": "act",
             "tool_name": "QwenDirectPolicy",

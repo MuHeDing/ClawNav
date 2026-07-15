@@ -18,6 +18,7 @@ from harness.memory.spatial_memory_client import (
 )
 from harness.memory.task_memory import TaskMemory
 from harness.memory.working_memory import WorkingMemory
+from harness.openclaw.map_context import FloorplanMapContextProvider
 from harness.skill_registry import SkillRegistry
 from harness.skills.memory_query import MemoryQuerySkill
 from harness.skills.memory_write import MemoryWriteSkill
@@ -148,6 +149,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=env_bool("OPENCLAW_KEYFRAME_DEBUG_SAVE_ALL_ELIGIBLE", False),
     )
+    parser.add_argument(
+        "--map_assist_mode",
+        choices=("off", "floorplan_map_assisted"),
+        default=os.environ.get("OPENCLAW_MAP_ASSIST_MODE", "off"),
+    )
+    parser.add_argument(
+        "--map_frame_interval_steps",
+        type=positive_int,
+        default=env_int("OPENCLAW_MAP_FRAME_INTERVAL_STEPS", 5),
+    )
+    parser.add_argument(
+        "--motion_feedback_enabled",
+        action="store_true",
+        default=env_bool("OPENCLAW_MOTION_FEEDBACK_ENABLED", False),
+    )
+    parser.add_argument(
+        "--forward_stall_odometry_enabled",
+        action="store_true",
+        default=env_bool("OPENCLAW_FORWARD_STALL_ODOMETRY_ENABLED", False),
+    )
+    parser.add_argument(
+        "--map_collision_overlay_enabled",
+        action="store_true",
+        default=env_bool("OPENCLAW_MAP_COLLISION_OVERLAY_ENABLED", False),
+    )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
     parser.add_argument("--openclaw_service_registry_path", type=str, default="")
@@ -230,6 +256,11 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         keyframe_episode_cap=args.keyframe_episode_cap,
         keyframe_coverage_gap_steps=args.keyframe_coverage_gap_steps,
         keyframe_debug_save_all_eligible=args.keyframe_debug_save_all_eligible,
+        map_assist_mode=args.map_assist_mode,
+        map_frame_interval_steps=args.map_frame_interval_steps,
+        motion_feedback_enabled=args.motion_feedback_enabled,
+        forward_stall_odometry_enabled=args.forward_stall_odometry_enabled,
+        map_collision_overlay_enabled=args.map_collision_overlay_enabled,
         harness_runtime=args.harness_runtime,
         openclaw_workspace_path=args.openclaw_workspace_path,
         openclaw_service_registry_path=args.openclaw_service_registry_path,
@@ -279,6 +310,7 @@ def build_harness_components(
     args: argparse.Namespace,
     model: Any = None,
 ) -> Dict[str, Any]:
+    output_path = Path(args.output_path).resolve()
     config = build_harness_config(args)
     direct_policy = config.policy_backend == QWEN_DIRECT_POLICY_BACKEND
     if direct_policy and model is not None:
@@ -373,7 +405,7 @@ def build_harness_components(
             keyframe_debug_save_all_eligible=config.keyframe_debug_save_all_eligible,
         )
     logger = HarnessLogger(
-        Path(args.output_path) / "harness_traces",
+        output_path / "harness_traces",
         rank=args.harness_trace_rank,
     )
 
@@ -389,7 +421,7 @@ def build_harness_components(
         "adapter": adapter,
         "openclaw_runtime": openclaw_runtime,
         "logger": logger,
-        "output_path": Path(args.output_path),
+        "output_path": output_path,
     }
 
 
@@ -410,6 +442,9 @@ class HarnessModelProxy:
         self.current_scene_id = ""
         self.current_episode_id = ""
         self.recent_keyframe_paths = []
+        self._pending_env_state = None
+        self._pending_map_context = None
+        self._init_map_context_provider()
         self._episode_video_writer = None
         self._episode_save_video = False
         self._episode_video_disabled = False
@@ -427,11 +462,52 @@ class HarnessModelProxy:
         self.current_episode_id = str(episode_id or "")
         self.last_action_text = None
         self.recent_keyframe_paths = []
+        self._pending_env_state = None
+        self._pending_map_context = None
+        self._reset_map_context_provider()
         self._episode_save_video = self.save_video and (
             random.random() < self.save_video_ratio
         )
         self._episode_video_disabled = False
         self._episode_video_frame_count = 0
+
+    def observe_environment_state(
+        self,
+        env: Any,
+        episode: Any,
+        observations: Dict[str, Any],
+        metrics: Dict[str, Any],
+        step_id: int,
+    ) -> None:
+        adapter = self.components.get("adapter")
+        if adapter is None or not hasattr(adapter, "build_state"):
+            return
+        try:
+            state = adapter.build_state(
+                env,
+                episode,
+                observations,
+                metrics,
+                step_id,
+                last_action=self.last_action_text,
+            )
+        except Exception:
+            self._pending_env_state = None
+            self._pending_map_context = None
+            return
+        self._pending_env_state = state
+        self._update_pending_map_context(
+            env=env,
+            state=state,
+            step_id=step_id,
+        )
+        safe_diagnostics = self._proxy_safe_diagnostics(state.diagnostics)
+        working_memory = self.components.get("working_memory")
+        if working_memory is not None:
+            if state.online_metrics and hasattr(working_memory, "append_online_metrics"):
+                working_memory.append_online_metrics(state.online_metrics)
+            if safe_diagnostics and hasattr(working_memory, "append_diagnostics"):
+                working_memory.append_diagnostics(safe_diagnostics)
 
     def call_model(self, images, task, step_id):
         current_image = images[-1] if images else None
@@ -501,7 +577,71 @@ class HarnessModelProxy:
             step_id=step_id,
             has_current_image=current_image is not None,
         )
+        self._attach_map_context_to_payload(payload)
         return payload
+
+    def _init_map_context_provider(self) -> None:
+        self._map_context_provider = None
+        config = self.components.get("config")
+        if config is None or getattr(config, "map_assist_mode", "off") == "off":
+            return
+        self._map_context_provider = FloorplanMapContextProvider(
+            output_root=self.components["output_path"],
+            mode=getattr(config, "map_assist_mode", "off"),
+            frame_interval_steps=getattr(config, "map_frame_interval_steps", 5),
+            collision_overlay_enabled=getattr(
+                config,
+                "map_collision_overlay_enabled",
+                False,
+            ),
+        )
+
+    def _reset_map_context_provider(self) -> None:
+        provider = getattr(self, "_map_context_provider", None)
+        if provider is not None:
+            provider.reset_episode(self.current_scene_id, self.current_episode_id)
+
+    def _update_pending_map_context(self, env: Any, state: Any, step_id: int) -> None:
+        provider = getattr(self, "_map_context_provider", None)
+        if provider is None:
+            self._pending_map_context = None
+            return
+        try:
+            self._pending_map_context = provider.build_context(
+                env=env,
+                state=state,
+                step_id=step_id,
+                scene_id=self.current_scene_id or getattr(state, "scene_id", ""),
+                episode_id=self.current_episode_id or getattr(state, "episode_id", ""),
+            )
+        except Exception as exc:
+            self._pending_map_context = {
+                "mode": self.components["config"].map_assist_mode,
+                "map_frame_interval_steps": self.components[
+                    "config"
+                ].map_frame_interval_steps,
+                "map_step_id": step_id,
+                "map_frame_due": False,
+                "map_available": False,
+                "map_generation_error": exc.__class__.__name__,
+            }
+
+    def _attach_map_context_to_payload(self, payload: Dict[str, Any]) -> None:
+        config = self.components["config"]
+        if config.map_assist_mode == "off":
+            return
+        payload["map_assist_mode"] = config.map_assist_mode
+        payload["map_frame_interval_steps"] = config.map_frame_interval_steps
+        payload["motion_feedback_enabled"] = config.motion_feedback_enabled
+        payload["forward_stall_odometry_enabled"] = config.forward_stall_odometry_enabled
+        payload["map_collision_overlay_enabled"] = config.map_collision_overlay_enabled
+        map_context = getattr(self, "_pending_map_context", None)
+        if isinstance(map_context, dict):
+            payload["input_regime"] = map_context.get(
+                "input_regime",
+                "rgb_plus_privileged_floorplan_pose",
+            )
+            payload["map_context"] = dict(map_context)
 
     def _attach_structured_runtime_context(
         self,
@@ -694,6 +834,20 @@ class HarnessModelProxy:
     def _build_proxy_state(self, task: str, step_id: int, current_image: Any):
         from harness.types import VLNState
 
+        pending_state = getattr(self, "_pending_env_state", None)
+        if pending_state is not None and pending_state.step_id == step_id:
+            return VLNState(
+                scene_id=self.current_scene_id,
+                episode_id=self.current_episode_id,
+                instruction=task,
+                step_id=step_id,
+                current_image=current_image,
+                online_metrics=dict(pending_state.online_metrics),
+                diagnostics=self._proxy_safe_diagnostics(pending_state.diagnostics),
+                pose=pending_state.pose,
+                diagnostic_pose=pending_state.diagnostic_pose,
+                last_action=self.last_action_text,
+            )
         return VLNState(
             scene_id=self.current_scene_id,
             episode_id=self.current_episode_id,
@@ -704,6 +858,15 @@ class HarnessModelProxy:
             diagnostics={},
             last_action=self.last_action_text,
         )
+
+    def _proxy_safe_diagnostics(self, diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(diagnostics, dict):
+            return {}
+        return {
+            key: value
+            for key, value in diagnostics.items()
+            if key != "raw_metrics"
+        }
 
     def _append_working_memory(self, images, action_text: str) -> None:
         working_memory = self.components["working_memory"]
@@ -782,11 +945,14 @@ class QwenDirectPolicyProxy:
         self.last_action_text = None
         self.current_scene_id = ""
         self.current_episode_id = ""
+        self._pending_env_state = None
+        self._pending_map_context = None
         self._episode_video_writer = None
         self._episode_save_video = False
         self._episode_video_disabled = False
         self._episode_video_frame_count = 0
         self.recent_keyframe_paths = []
+        self._init_map_context_provider()
 
     start_episode = HarnessModelProxy.start_episode
     finalize_episode = HarnessModelProxy.finalize_episode
@@ -806,12 +972,18 @@ class QwenDirectPolicyProxy:
     _init_video_writer = HarnessModelProxy._init_video_writer
     _release_video_writer = HarnessModelProxy._release_video_writer
     _safe_path_part = HarnessModelProxy._safe_path_part
+    observe_environment_state = HarnessModelProxy.observe_environment_state
     _remember_keyframe_path = HarnessModelProxy._remember_keyframe_path
     _remember_promoted_keyframe_from_runtime = (
         HarnessModelProxy._remember_promoted_keyframe_from_runtime
     )
     _attach_structured_runtime_context = HarnessModelProxy._attach_structured_runtime_context
+    _init_map_context_provider = HarnessModelProxy._init_map_context_provider
+    _reset_map_context_provider = HarnessModelProxy._reset_map_context_provider
+    _update_pending_map_context = HarnessModelProxy._update_pending_map_context
+    _attach_map_context_to_payload = HarnessModelProxy._attach_map_context_to_payload
     _build_proxy_state = HarnessModelProxy._build_proxy_state
+    _proxy_safe_diagnostics = HarnessModelProxy._proxy_safe_diagnostics
     _append_working_memory = HarnessModelProxy._append_working_memory
     _latest_runtime = HarnessModelProxy._latest_runtime
 

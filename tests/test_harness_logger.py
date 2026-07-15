@@ -4,6 +4,18 @@ from harness.logging.harness_logger import HarnessLogger
 from harness.types import VLNState
 
 
+class FakeQuaternion:
+    w = 1.0
+    x = 0.0
+    y = 0.0
+    z = 0.0
+
+
+class SelfListingQuaternion(FakeQuaternion):
+    def tolist(self):
+        return self
+
+
 def make_state():
     return VLNState(
         scene_id="scene1",
@@ -40,6 +52,46 @@ def test_oracle_metrics_are_only_under_diagnostics(tmp_path):
     assert "distance_to_goal" not in record["decision_inputs"]
     assert record["oracle_metrics_used_for_decision"] is False
     assert record["oracle_guard_passed"] is True
+
+
+def test_logger_serializes_quaternion_like_values_before_json_write(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+    state = VLNState(
+        scene_id="s1",
+        episode_id="e1",
+        instruction="go",
+        step_id=1,
+        current_image=None,
+        diagnostics={"sim_rotation": FakeQuaternion()},
+    )
+
+    record = logger.log_step(
+        state,
+        intent="act",
+        skill="QwenDirectPolicy",
+        runtime={"context_engine": {"pose": {"rotation": FakeQuaternion()}}},
+    )
+
+    assert record["diagnostics"]["sim_rotation"] == [1.0, 0.0, 0.0, 0.0]
+    assert record["context_engine"]["pose"]["rotation"] == [1.0, 0.0, 0.0, 0.0]
+    saved = json.loads((tmp_path / "harness_trace_rank0.jsonl").read_text())
+    assert saved["diagnostics"]["sim_rotation"] == [1.0, 0.0, 0.0, 0.0]
+
+
+def test_logger_does_not_recurse_when_tolist_returns_self(tmp_path):
+    logger = HarnessLogger(tmp_path, rank=0)
+    state = VLNState(
+        scene_id="s1",
+        episode_id="e1",
+        instruction="go",
+        step_id=1,
+        current_image=None,
+        diagnostics={"sim_rotation": SelfListingQuaternion()},
+    )
+
+    record = logger.log_step(state, intent="act", skill="QwenDirectPolicy")
+
+    assert record["diagnostics"]["sim_rotation"] == [1.0, 0.0, 0.0, 0.0]
 
 
 def test_record_contains_memory_source_and_decision_inputs(tmp_path):

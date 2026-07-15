@@ -16,6 +16,18 @@ class FakeAgentState:
     rotation = [0.0, 0.0, 0.0, 1.0]
 
 
+class FakeRotation:
+    w = 1.0
+    x = 0.0
+    y = 0.0
+    z = 0.0
+
+
+class FakeQuaternionAgentState:
+    position = [1.0, 2.0, 3.0]
+    rotation = FakeRotation()
+
+
 class FakeSim:
     def get_agent_state(self):
         return FakeAgentState()
@@ -23,6 +35,15 @@ class FakeSim:
 
 class FakeEnv:
     sim = FakeSim()
+
+
+class FakeQuaternionSim:
+    def get_agent_state(self):
+        return FakeQuaternionAgentState()
+
+
+class FakeQuaternionEnv:
+    sim = FakeQuaternionSim()
 
 
 def test_adapter_extracts_rgb_and_instruction():
@@ -64,6 +85,20 @@ def test_adapter_separates_online_pose_from_diagnostic_pose():
     )
     assert state.pose is None
     assert state.diagnostics["sim_position"] == [1.0, 2.0, 3.0]
+
+
+def test_adapter_serializes_quaternion_like_rotation_to_plain_list():
+    adapter = HabitatVLNAdapter(expose_pose_online=False)
+    state = adapter.build_state(
+        env=FakeQuaternionEnv(),
+        episode=FakeEpisode(),
+        observations={"rgb": "rgb-frame"},
+        metrics={},
+        step_id=0,
+    )
+
+    assert state.diagnostics["sim_rotation"] == [1.0, 0.0, 0.0, 0.0]
+    assert state.diagnostic_pose["rotation"] == [1.0, 0.0, 0.0, 0.0]
 
 
 def test_oracle_metrics_are_diagnostics_not_online_metrics():

@@ -119,6 +119,15 @@ class HabitatVLNAdapter(BaseEmbodimentAdapter):
             return None
         if hasattr(value, "tolist"):
             return value.tolist()
+        if all(hasattr(value, attr) for attr in ("w", "x", "y", "z")):
+            return [
+                float(value.w),
+                float(value.x),
+                float(value.y),
+                float(value.z),
+            ]
         if isinstance(value, tuple):
             return list(value)
+        if isinstance(value, list):
+            return value
         return value

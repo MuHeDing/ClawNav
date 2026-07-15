@@ -332,7 +332,7 @@ def test_qwen_direct_stop_with_goal_evidence_passes():
     assert result.runtime_metadata["final_action_source"] == "qwen"
 
 
-def test_qwen_direct_stop_accepts_underscore_threshold_relation():
+def test_qwen_direct_stop_accepts_underscore_threshold_after_same_step_verification():
     runtime = make_runtime(
         direct_decision(
             {
@@ -355,13 +355,10 @@ def test_qwen_direct_stop_accepts_underscore_threshold_relation():
     )
 
     assert result.ok is True
-    assert result.action_text == "MOVE_FORWARD"
-    assert result.runtime_metadata["stop_gate_decision"] == "blocked"
-    assert result.runtime_metadata["stop_gate_block_reason"] == (
-        "structural_stop_confirmation_required"
-    )
-    assert result.runtime_metadata["fallback_policy"] == (
-        "structural_stop_confirm_forward"
+    assert result.action_text == "STOP"
+    assert result.runtime_metadata["stop_gate_decision"] == "passed"
+    assert result.runtime_metadata["qwen_direct_requery_reason"] == (
+        "structural_stop_verification"
     )
 
 
@@ -392,7 +389,7 @@ def test_qwen_direct_stop_accepts_underscore_threshold_after_confirmation_forwar
     assert result.runtime_metadata["stop_gate_decision"] == "passed"
 
 
-def test_qwen_direct_stop_blocks_framed_by_relation_before_confirmation_forward():
+def test_qwen_direct_stop_accepts_framed_by_after_same_step_verification():
     runtime = make_runtime(
         direct_decision(
             {
@@ -415,10 +412,10 @@ def test_qwen_direct_stop_blocks_framed_by_relation_before_confirmation_forward(
     )
 
     assert result.ok is True
-    assert result.action_text == "MOVE_FORWARD"
-    assert result.runtime_metadata["stop_gate_decision"] == "blocked"
-    assert result.runtime_metadata["stop_gate_block_reason"] == (
-        "structural_stop_confirmation_required"
+    assert result.action_text == "STOP"
+    assert result.runtime_metadata["stop_gate_decision"] == "passed"
+    assert result.runtime_metadata["qwen_direct_requery_reason"] == (
+        "structural_stop_verification"
     )
 
 
@@ -513,7 +510,7 @@ def test_qwen_direct_route_stop_still_blocks_after_three_forward_actions():
     assert result.runtime_metadata["stop_gate_min_forward_actions"] == 4
 
 
-def test_qwen_direct_route_stop_passes_after_landmark_progress():
+def test_qwen_direct_route_stop_does_not_treat_visible_landmark_as_passed():
     runtime = make_runtime(
         direct_decision(
             {
@@ -555,13 +552,170 @@ def test_qwen_direct_route_stop_passes_after_landmark_progress():
             "observed_visual_summaries": [
                 "Doorway into the billiard table room is visible.",
             ],
+            "route_progress": {
+                "turn_round_required": True,
+                "turn_round_completed": True,
+                "heading_change_from_start_deg": 180.0,
+                "required_waypoints": ["billiard table"],
+                "positively_seen_waypoints": ["billiard table"],
+                "passed_waypoints": [],
+                "negated_waypoint_mentions": [],
+            },
         },
     )
 
     assert result.ok is True
+    assert result.action_text in {"MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"}
+    assert result.runtime_metadata["stop_gate_decision"] == "blocked"
+    assert result.runtime_metadata["stop_gate_route_missing_reasons"] == [
+        "intermediate_waypoint_passed"
+    ]
+    assert result.runtime_metadata["stop_gate_positively_seen_waypoints"] == [
+        "billiard table"
+    ]
+
+
+def test_qwen_direct_route_stop_passes_after_turn_round_and_waypoint_passed():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "STOP",
+                "confidence": 0.95,
+                "visual_summary": "The agent is beside the final wooden-framed window.",
+                "progress_state": "Route complete.",
+                "stop_evidence": "instruction_complete",
+                "current_target": "window",
+                "target_relation": "beside the window",
+                "semantic_stop_state": "instruction_complete_at_target",
+                "reason": "The intermediate route is complete.",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(
+            step_id=12,
+            instruction=(
+                "turn round and walk past the billiard table, walk straight on, "
+                "stop by the window."
+            ),
+        ),
+        payload={
+            "recent_actions": ["MOVE_FORWARD"] * 4,
+            "route_progress": {
+                "turn_round_required": True,
+                "turn_round_completed": True,
+                "heading_change_from_start_deg": 180.0,
+                "required_waypoints": ["billiard table"],
+                "positively_seen_waypoints": ["billiard table"],
+                "passed_waypoints": ["billiard table"],
+                "negated_waypoint_mentions": [],
+            },
+        },
+    )
+
     assert result.action_text == "STOP"
     assert result.runtime_metadata["stop_gate_decision"] == "passed"
-    assert "stop_gate_block_reason" not in result.runtime_metadata
+    assert result.runtime_metadata["stop_permission"] is True
+
+
+def test_qwen_direct_route_stop_rejects_negated_waypoint_mentions():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "STOP",
+                "confidence": 0.95,
+                "visual_summary": "The agent is beside the final wooden-framed window.",
+                "progress_state": "Route complete.",
+                "stop_evidence": "instruction_complete",
+                "current_target": "window",
+                "target_relation": "beside the window",
+                "semantic_stop_state": "instruction_complete_at_target",
+                "reason": "The intermediate route is complete.",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(
+            step_id=12,
+            instruction=(
+                "turn round and walk past the billiard table, walk straight on, "
+                "stop by the window."
+            ),
+        ),
+        payload={
+            "recent_actions": ["MOVE_FORWARD"] * 4,
+            "observed_visual_summaries": [
+                "The billiard table is not visible; the agent needs to locate it.",
+            ],
+            "route_progress": {
+                "turn_round_required": True,
+                "turn_round_completed": True,
+                "heading_change_from_start_deg": 180.0,
+                "required_waypoints": ["billiard table"],
+                "positively_seen_waypoints": [],
+                "passed_waypoints": [],
+                "negated_waypoint_mentions": ["billiard table"],
+            },
+        },
+    )
+
+    assert result.action_text != "STOP"
+    assert result.runtime_metadata["stop_gate_missing_route_waypoints"] == [
+        "billiard table"
+    ]
+    assert result.runtime_metadata["stop_gate_negated_waypoint_mentions"] == [
+        "billiard table"
+    ]
+
+
+def test_qwen_direct_route_stop_requires_turn_round_completion():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "STOP",
+                "confidence": 0.95,
+                "visual_summary": "The agent is beside the final wooden-framed window.",
+                "progress_state": "Route complete.",
+                "stop_evidence": "instruction_complete",
+                "current_target": "window",
+                "target_relation": "beside the window",
+                "semantic_stop_state": "instruction_complete_at_target",
+                "reason": "The intermediate route is complete.",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(
+            step_id=12,
+            instruction=(
+                "turn round and walk past the billiard table, walk straight on, "
+                "stop by the window."
+            ),
+        ),
+        payload={
+            "recent_actions": ["MOVE_FORWARD"] * 4,
+            "route_progress": {
+                "turn_round_required": True,
+                "turn_round_completed": False,
+                "heading_change_from_start_deg": 45.0,
+                "required_waypoints": ["billiard table"],
+                "positively_seen_waypoints": ["billiard table"],
+                "passed_waypoints": ["billiard table"],
+                "negated_waypoint_mentions": [],
+            },
+        },
+    )
+
+    assert result.action_text != "STOP"
+    assert "turn_round_progress" in result.runtime_metadata[
+        "stop_gate_route_missing_reasons"
+    ]
+    assert result.runtime_metadata["stop_gate_heading_change_from_start_deg"] == 45.0
+    assert result.runtime_metadata["stop_gate_turn_round_completed"] is False
+    assert result.runtime_metadata["stop_permission"] is False
 
 
 def test_qwen_direct_route_stop_ignores_unobserved_waypoint_claims():
@@ -901,6 +1055,51 @@ def test_qwen_direct_repeated_turn_loop_chooses_opposite_turn():
     assert result.runtime_metadata["fallback_policy"] == "loop_break_turn"
 
 
+def test_qwen_direct_turn_oscillation_is_audit_only():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "TURN_LEFT",
+                "confidence": 0.8,
+                "stop_evidence": "none",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(),
+        payload={
+            "forward_stall_odometry_enabled": True,
+            "recent_actions": [
+                "TURN_LEFT",
+                "TURN_RIGHT",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+            ],
+            "local_control_context": {
+                "odometry": {
+                    "available": True,
+                    "previous_action": "TURN_RIGHT",
+                    "collision": False,
+                    "consecutive_no_progress_forward": 0,
+                }
+            },
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "TURN_LEFT"
+    assert result.runtime_metadata["turn_oscillation_gate_decision"] == "audit_only"
+    assert result.runtime_metadata["turn_oscillation_detected"] is True
+    assert result.runtime_metadata["loop_pattern"] == "turn_oscillation"
+    assert "replacement_action" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
 def test_qwen_direct_repeated_forward_without_evidence_uses_forward_stall_gate():
     runtime = make_runtime(
         direct_decision(
@@ -966,6 +1165,74 @@ def test_qwen_direct_repeated_forward_with_fresh_visual_but_no_progress_turns():
     assert result.runtime_metadata["forward_stall_gate_decision"] == "blocked"
     assert result.runtime_metadata["blocked_action"] == "MOVE_FORWARD"
     assert result.runtime_metadata["final_action_source"] == "forward_stall_gate"
+
+
+def test_qwen_direct_effective_forward_odometry_overrides_text_stall_signal():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "MOVE_FORWARD",
+                "confidence": 0.82,
+                "visual_summary": "The archway remains centered ahead.",
+                "progress_state": "approaching_target",
+                "stop_evidence": "none",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(),
+        payload={
+            "recent_actions": ["MOVE_FORWARD"] * 4,
+            "planner_step_mode": "visual_update",
+            "forward_stall_odometry_enabled": True,
+            "local_control_context": {
+                "odometry": {
+                    "available": True,
+                    "previous_action": "MOVE_FORWARD",
+                    "last_forward_delta_m": 0.25,
+                    "last_action_had_progress": True,
+                    "consecutive_no_progress_forward": 0,
+                    "collision": False,
+                    "progress_threshold_m": 0.05,
+                }
+            },
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert "forward_stall_gate_decision" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_odometry_mode_ignores_text_stall_when_odometry_is_unavailable():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "MOVE_FORWARD",
+                "confidence": 0.82,
+                "visual_summary": "The archway remains ahead from a similar view.",
+                "progress_state": "Approaching the archway; destination not yet reached.",
+                "stop_evidence": "none",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(),
+        payload={
+            "recent_actions": ["MOVE_FORWARD"] * 4,
+            "planner_step_mode": "visual_update",
+            "forward_stall_odometry_enabled": True,
+            "local_control_context": {"odometry": {"available": False}},
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "MOVE_FORWARD"
+    assert "forward_stall_gate_decision" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
 
 
 def test_qwen_direct_repeated_forward_with_fresh_visual_can_pass():

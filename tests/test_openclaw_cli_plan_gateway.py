@@ -328,6 +328,132 @@ def test_cli_plan_gateway_model_mode_can_call_direct_qwen_api_without_openclaw_c
     assert audit["openclaw_session_mode"] == "stateless_model"
     assert audit["openclaw_session_id"] == ""
     assert audit["provider_input_tokens"] == 321
+
+
+def test_cli_plan_gateway_qwen_direct_attaches_map_view_before_history_and_current_last(tmp_path):
+    map_view = tmp_path / "map.png"
+    memory0 = tmp_path / "memory0.png"
+    memory1 = tmp_path / "memory1.png"
+    current_dir = tmp_path / "openclaw_current_frames" / "scene-a" / "episode-1"
+    current = current_dir / "step_000005.png"
+    for path in (map_view, memory0, memory1, current):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient()
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        openclaw_model_max_images=4,
+        model_client=model_client,
+        policy_backend="qwen_direct",
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene-a",
+                "episode_id": "episode-1",
+                "instruction": "go to kitchen",
+                "step_id": 5,
+            },
+            "runtime_context": {
+                "current_image_path": str(current),
+                "retrieved_memory_image_paths": [str(memory0), str(memory1)],
+                "map_assist_mode": "floorplan_map_assisted",
+                "map_frame_interval_steps": 5,
+                "input_regime": "rgb_plus_privileged_floorplan_pose",
+                "map_context": {
+                    "mode": "floorplan_map_assisted",
+                    "input_regime": "rgb_plus_privileged_floorplan_pose",
+                    "map_frame_interval_steps": 5,
+                    "map_step_id": 5,
+                    "map_frame_due": True,
+                    "map_available": True,
+                    "map_source": "habitat_pathfinder_navmesh",
+                    "pose_source": "sim_agent_state_odometry",
+                    "map_safety": {"contains_goal": False},
+                    "map_image_label": "map_view",
+                    "internal_only": {
+                        "map_image_path": str(map_view),
+                        "map_image_hash": "abc123",
+                    },
+                },
+            },
+        }
+    )
+
+    assert decision["intent"] == "act"
+    assert model_client.calls[0]["image_paths"] == [
+        str(map_view),
+        str(memory0),
+        str(memory1),
+        str(current),
+    ]
+    prompt = model_client.calls[0]["prompt"]
+    assert "map_view floorplan" in prompt
+    assert str(map_view) not in prompt
+    assert "internal_only" not in prompt
+    assert "map_image_path" not in prompt
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["map_assist_mode"] == "floorplan_map_assisted"
+    assert audit["map_frame_due"] is True
+    assert audit["map_view_image_count"] == 1
+    assert audit["model_image_sources"] == [
+        "map_view",
+        "openclaw_retrieved_memory",
+        "openclaw_retrieved_memory",
+        "current",
+    ]
+    assert audit["current_image_last"] is True
+
+
+def test_cli_plan_gateway_qwen_direct_does_not_attach_stale_map_on_non_due_step(tmp_path):
+    map_view = tmp_path / "map.png"
+    current = tmp_path / "openclaw_current_frames" / "scene-a" / "episode-1" / "step_000006.png"
+    for path in (map_view, current):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient()
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        openclaw_model_provider="qwen_api",
+        openclaw_model="qwen/qwen3.5-flash",
+        openclaw_model_max_images=4,
+        model_client=model_client,
+        policy_backend="qwen_direct",
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {
+                "scene_id": "scene-a",
+                "episode_id": "episode-1",
+                "instruction": "go to kitchen",
+                "step_id": 6,
+            },
+            "runtime_context": {
+                "current_image_path": str(current),
+                "map_assist_mode": "floorplan_map_assisted",
+                "map_frame_interval_steps": 5,
+                "map_context": {
+                    "mode": "floorplan_map_assisted",
+                    "map_frame_interval_steps": 5,
+                    "map_step_id": 6,
+                    "map_frame_due": False,
+                    "map_available": False,
+                    "internal_only": {"map_image_path": str(map_view)},
+                },
+            },
+        }
+    )
+
+    assert decision["intent"] == "act"
+    assert model_client.calls[0]["image_paths"] == [str(current)]
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert audit["map_frame_due"] is False
+    assert audit["map_view_image_count"] == 0
+    assert audit["model_image_sources"] == ["current"]
     assert audit["provider_usage_source"] == "reported"
 
 
@@ -379,6 +505,7 @@ def test_cli_plan_gateway_qwen_direct_normalizes_concise_action_json(tmp_path):
     assert decision["arguments"]["current_target"] == "doorway"
     assert decision["arguments"]["target_relation"] == "doorway centered ahead"
     assert decision["arguments"]["semantic_stop_state"] == "not_ready"
+    assert decision["arguments"]["reason"] == "turn toward the visible doorway"
     prompt = model_client.calls[0]["prompt"]
     assert "QwenDirectPolicy" in prompt
     assert "NavigationPolicySkill" not in prompt
@@ -551,6 +678,121 @@ def test_cli_plan_gateway_qwen_direct_prompt_handles_forward_stall_feedback(tmp_
     assert "When forward_stall_feedback is present" in prompt
     assert "do not choose MOVE_FORWARD" in prompt
     assert "choose only TURN_LEFT or TURN_RIGHT" in prompt
+
+
+def test_cli_plan_gateway_qwen_direct_prompt_handles_stop_verification_feedback(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient()
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        model_client=model_client,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "wait at the archway", "step_id": 15},
+            "runtime_context": {
+                "current_image_path": str(current),
+                "stop_verification_feedback": {
+                    "blocked_action": "STOP",
+                    "allowed_actions": ["STOP", "TURN_LEFT", "TURN_RIGHT"],
+                    "reason": "Verify structural arrival without translating.",
+                },
+            },
+        }
+    )
+
+    prompt = model_client.calls[0]["prompt"]
+    assert "When stop_verification_feedback is present" in prompt
+    assert "do not choose MOVE_FORWARD" in prompt
+    assert "choose STOP only" in prompt
+    assert "otherwise choose TURN_LEFT or TURN_RIGHT" in prompt
+
+
+def test_cli_plan_gateway_qwen_direct_prompt_includes_route_progress_contract(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient()
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        model_client=model_client,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {
+                "instruction": (
+                    "turn round and walk past the billiard table, then stop by the window"
+                ),
+                "step_id": 3,
+            },
+            "runtime_context": {
+                "current_image_path": str(current),
+                "route_progress": {
+                    "turn_round_required": True,
+                    "turn_round_completed": False,
+                    "heading_change_from_start_deg": 45.0,
+                    "required_waypoints": ["billiard table"],
+                    "positively_seen_waypoints": [],
+                    "passed_waypoints": [],
+                    "negated_waypoint_mentions": ["billiard table"],
+                },
+            },
+        }
+    )
+
+    prompt = model_client.calls[0]["prompt"]
+    assert "When route_progress is present" in prompt
+    assert "negated waypoint mentions as unseen" in prompt
+    assert "passed_waypoints" in prompt
+    assert '"turn_round_completed": false' in prompt
+    assert '"negated_waypoint_mentions": ["billiard table"]' in prompt
+
+
+def test_cli_plan_gateway_qwen_direct_prompt_includes_motion_feedback_without_raw_pose(tmp_path):
+    current = tmp_path / "current.png"
+    current.write_bytes(b"not-a-real-png-for-command-shape-test")
+    model_client = FakeModelClient()
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        model_client=model_client,
+    )
+
+    planner.plan_payload(
+        {
+            "state": {"instruction": "walk past the billiard table", "step_id": 8},
+            "runtime_context": {
+                "current_image_path": str(current),
+                "motion_feedback_enabled": True,
+                "motion_feedback": {
+                    "last_action": "MOVE_FORWARD",
+                    "expected_effect": "advance about 0.25m",
+                    "actual_effect": "blocked",
+                    "last_forward_delta_m": 0.02,
+                    "distance_source": "rounded_local_odometry",
+                    "collision_recent": True,
+                    "consecutive_no_progress_forward": 2,
+                    "recommended_constraint": "avoid_forward",
+                    "sim_position": [1.0, 2.0, 3.0],
+                    "sim_rotation": [1.0, 0.0, 0.0, 0.0],
+                },
+            },
+        }
+    )
+
+    prompt = model_client.calls[0]["prompt"]
+    assert '"motion_feedback"' in prompt
+    assert '"actual_effect": "blocked"' in prompt
+    assert "When motion_feedback reports actual_effect=blocked" in prompt
+    assert "sim_position" not in prompt
+    assert "sim_rotation" not in prompt
 
 
 def test_cli_plan_gateway_qwen_direct_prompt_omits_run_id_and_image_paths(tmp_path):

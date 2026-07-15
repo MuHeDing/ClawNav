@@ -1,15 +1,21 @@
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional, Protocol
 
 from harness.memory.context_engine import MemoryAwareContextEngine
-from harness.openclaw.control_gates import QwenDirectControlGates
+from harness.openclaw.control_gates import (
+    QwenDirectControlGates,
+    ROUTE_WAYPOINT_PASS_FORWARD_ACTIONS,
+    TURN_ROUND_COMPLETION_THRESHOLD_DEG,
+)
 from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.keyframe_gate import (
     EventGatedKeyframeGate,
     candidate_action_status_from_tool_result,
 )
+from harness.openclaw.motion_feedback import build_motion_feedback
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
 from harness.skill_registry import SkillRegistry
 from harness.types import VLNState
@@ -45,6 +51,8 @@ ACTION_ARGUMENT_KEYS = (
 OPENCLAW_CLI_AGENT_FALLBACK_REASON_PREFIX = "openclaw_cli_agent_fallback:"
 OPENCLAW_CLI_MODEL_FALLBACK_REASON_PREFIX = "openclaw_cli_model_fallback:"
 QWEN_DIRECT_POLICY_BACKEND = "qwen_direct"
+ODOMETRY_PROGRESS_THRESHOLD_M = 0.05
+ODOMETRY_TURN_PROGRESS_THRESHOLD_DEG = 5.0
 
 
 @dataclass
@@ -98,6 +106,7 @@ class OpenClawVLNRuntime:
         self.max_recent_visual_memories = 10
         self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
         self.qwen_direct_episode_state: Dict[str, Dict[str, Any]] = {}
+        self.odometry_episode_state: Dict[str, Dict[str, Any]] = {}
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -129,6 +138,7 @@ class OpenClawVLNRuntime:
                 runtime_payload,
             )
 
+        self._attach_pre_planner_local_control_context(state, runtime_payload)
         image_paths_used = self._image_paths_used(runtime_payload)
         try:
             decision = self.planner.plan(state, runtime_context=runtime_payload)
@@ -275,6 +285,8 @@ class OpenClawVLNRuntime:
 
         planned_action_text = self._planned_action_text(decision.arguments)
         if self.policy_backend == QWEN_DIRECT_POLICY_BACKEND:
+            self._record_qwen_direct_observation(state, decision.arguments)
+            self._attach_route_progress_context(state, runtime_payload)
             gate_context = self._qwen_direct_gate_context(
                 runtime_payload,
                 decision,
@@ -283,21 +295,24 @@ class OpenClawVLNRuntime:
             gate_result = self.qwen_direct_gates.apply(decision.arguments, gate_context)
             requery_metadata: Dict[str, Any] = {}
             if self._qwen_direct_should_requery_gate(runtime_payload, gate_result):
-                requery_decision = self._qwen_direct_requery_after_gate(
+                requery_result = self._qwen_direct_requery_after_gate(
                     state,
                     runtime_payload,
                     decision,
                     gate_result,
                 )
-                if requery_decision is not None:
+                if requery_result is not None:
+                    requery_decision, requery_payload = requery_result
                     requery_metadata = self._qwen_direct_requery_metadata(
                         decision,
                         gate_result,
                     )
                     decision = requery_decision
                     self._merge_planner_visual_observations(runtime_payload, decision)
+                    self._record_qwen_direct_observation(state, decision.arguments)
+                    self._attach_route_progress_context(state, requery_payload)
                     gate_context = self._qwen_direct_gate_context(
-                        runtime_payload,
+                        requery_payload,
                         decision,
                         state=state,
                     )
@@ -323,12 +338,6 @@ class OpenClawVLNRuntime:
             metadata["direct_policy"] = True
             metadata.setdefault("janus_loaded", False)
             metadata.setdefault("navigation_policy_skill_called", False)
-            self._update_qwen_direct_episode_state(
-                state,
-                runtime_payload,
-                decision.arguments,
-                gate_result,
-            )
             keyframe_gate = self._run_keyframe_gate_for_action(
                 state=state,
                 runtime_payload=runtime_payload,
@@ -539,7 +548,7 @@ class OpenClawVLNRuntime:
         runtime_payload: Dict[str, Any],
         decision,
         gate_result,
-    ) -> Optional[Any]:
+    ) -> Optional[tuple[Any, Dict[str, Any]]]:
         requery_reason = self._qwen_direct_requery_reason(gate_result)
         if requery_reason == "blocked_stop_gate":
             feedback_key = "blocked_stop_feedback"
@@ -553,6 +562,16 @@ class OpenClawVLNRuntime:
                 runtime_payload,
             )
             control_flags = {"force_non_forward_action": True}
+        elif requery_reason == "structural_stop_verification":
+            feedback_key = "stop_verification_feedback"
+            feedback = self._qwen_direct_stop_verification_feedback(
+                decision,
+                gate_result,
+            )
+            control_flags = {
+                "force_non_forward_action": True,
+                "force_stop_verification": True,
+            }
         else:
             return None
         requery_payload = dict(runtime_payload)
@@ -563,10 +582,13 @@ class OpenClawVLNRuntime:
         control_context["allowed_actions"] = list(feedback["allowed_actions"])
         control_context[feedback_key] = feedback
         requery_payload["control_context"] = control_context
+        if requery_reason == "structural_stop_verification":
+            requery_payload["structural_stop_verification_active"] = True
         try:
-            return self.planner.plan(state, runtime_context=requery_payload)
+            decision = self.planner.plan(state, runtime_context=requery_payload)
         except Exception:
             return None
+        return decision, requery_payload
 
     def _qwen_direct_requery_reason(self, gate_result) -> str:
         metadata = getattr(gate_result, "metadata", {}) or {}
@@ -578,7 +600,7 @@ class OpenClawVLNRuntime:
                 metadata.get("stop_gate_block_reason")
                 == "structural_stop_confirmation_required"
             ):
-                return ""
+                return "structural_stop_verification"
             return "blocked_stop_gate"
         if (
             metadata.get("forward_stall_gate_decision") == "blocked"
@@ -624,16 +646,55 @@ class OpenClawVLNRuntime:
             "stop_gate_block_reason",
             "stop_gate_missing_waypoints",
             "stop_gate_missing_route_waypoints",
+            "stop_gate_unpassed_route_waypoints",
             "stop_gate_route_missing_reasons",
             "stop_gate_min_step_id",
             "stop_gate_current_step_id",
             "stop_gate_min_forward_actions",
             "stop_gate_forward_action_count",
+            "stop_gate_required_route_waypoints",
+            "stop_gate_positively_seen_waypoints",
+            "stop_gate_passed_waypoints",
+            "stop_gate_negated_waypoint_mentions",
+            "stop_gate_turn_round_required",
+            "stop_gate_turn_round_completed",
+            "stop_gate_heading_change_from_start_deg",
         ):
             value = gate_metadata.get(key)
             if value not in (None, "", []):
                 feedback[key] = value
         return feedback
+
+    def _qwen_direct_stop_verification_feedback(
+        self,
+        decision,
+        gate_result,
+    ) -> Dict[str, Any]:
+        arguments = getattr(decision, "arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return {
+            "gate_decision": "verify",
+            "blocked_action": "STOP",
+            "allowed_actions": ["STOP", "TURN_LEFT", "TURN_RIGHT"],
+            "reason": (
+                "Verify structural arrival from the same observation without "
+                "translating. Choose STOP only if the agent is already at or "
+                "inside the target boundary; otherwise turn to inspect. "
+                "MOVE_FORWARD is forbidden during this verification."
+            ),
+            "fallback_action": gate_result.final_action,
+            "stop_evidence": self._bounded_metadata_text(arguments.get("stop_evidence")),
+            "current_target": self._bounded_metadata_text(arguments.get("current_target")),
+            "target_relation": self._bounded_metadata_text(arguments.get("target_relation")),
+            "semantic_stop_state": self._bounded_metadata_text(
+                arguments.get("semantic_stop_state")
+            ),
+            "visual_summary": self._bounded_metadata_text(arguments.get("visual_summary")),
+            "qwen_reason": self._bounded_metadata_text(
+                arguments.get("reason") or getattr(decision, "reason", "")
+            ),
+        }
 
     def _qwen_direct_forward_stall_feedback(
         self,
@@ -647,7 +708,7 @@ class OpenClawVLNRuntime:
         recent_actions = runtime_payload.get("recent_actions") or []
         if not isinstance(recent_actions, list):
             recent_actions = []
-        return {
+        feedback = {
             "gate_decision": "blocked",
             "blocked_action": "MOVE_FORWARD",
             "allowed_actions": ["TURN_LEFT", "TURN_RIGHT"],
@@ -666,6 +727,21 @@ class OpenClawVLNRuntime:
                 arguments.get("reason") or getattr(decision, "reason", "")
             ),
         }
+        motion_feedback = runtime_payload.get("motion_feedback")
+        if isinstance(motion_feedback, dict) and motion_feedback:
+            feedback["motion_feedback"] = dict(motion_feedback)
+        local_control_context = runtime_payload.get("local_control_context")
+        if isinstance(local_control_context, dict):
+            odometry = local_control_context.get("odometry")
+            if isinstance(odometry, dict) and odometry:
+                feedback["odometry"] = {
+                    "last_forward_delta_m": odometry.get("last_forward_delta_m"),
+                    "collision": odometry.get("collision"),
+                    "consecutive_no_progress_forward": odometry.get(
+                        "consecutive_no_progress_forward"
+                    ),
+                }
+        return feedback
 
     def _qwen_direct_requery_metadata(
         self,
@@ -694,14 +770,22 @@ class OpenClawVLNRuntime:
                 "stop_gate_block_reason",
                 "stop_gate_missing_waypoints",
                 "stop_gate_missing_route_waypoints",
+                "stop_gate_unpassed_route_waypoints",
                 "stop_gate_route_missing_reasons",
                 "stop_gate_min_step_id",
                 "stop_gate_current_step_id",
                 "stop_gate_min_forward_actions",
                 "stop_gate_forward_action_count",
+                "stop_gate_required_route_waypoints",
+                "stop_gate_positively_seen_waypoints",
+                "stop_gate_passed_waypoints",
+                "stop_gate_negated_waypoint_mentions",
+                "stop_gate_turn_round_required",
+                "stop_gate_turn_round_completed",
+                "stop_gate_heading_change_from_start_deg",
             ):
                 value = gate_result.metadata.get(key)
-                if value:
+                if value not in (None, "", []):
                     metadata[key] = value
             metadata.update(
                 {
@@ -726,6 +810,37 @@ class OpenClawVLNRuntime:
                 {
                     "forward_stall_gate_decision": "blocked",
                     "blocked_action": "MOVE_FORWARD",
+                }
+            )
+            for key in (
+                "forward_stall_evidence_source",
+                "forward_stall_gate_reason",
+                "blocked_forward_by_odometry_gate",
+                "forward_stall_odometry_consecutive_no_progress_forward",
+                "forward_stall_odometry_last_forward_delta_m",
+                "forward_stall_odometry_collision",
+            ):
+                value = gate_result.metadata.get(key)
+                if value is not None:
+                    metadata[key] = value
+        elif requery_reason == "structural_stop_verification":
+            metadata.update(
+                {
+                    "qwen_direct_initial_stop_evidence": self._bounded_metadata_text(
+                        arguments.get("stop_evidence")
+                    ),
+                    "qwen_direct_initial_current_target": self._bounded_metadata_text(
+                        arguments.get("current_target")
+                    ),
+                    "qwen_direct_initial_target_relation": self._bounded_metadata_text(
+                        arguments.get("target_relation")
+                    ),
+                    "qwen_direct_initial_semantic_stop_state": (
+                        self._bounded_metadata_text(arguments.get("semantic_stop_state"))
+                    ),
+                    "qwen_direct_initial_stop_gate_block_reason": (
+                        gate_result.metadata.get("stop_gate_block_reason")
+                    ),
                 }
             )
         return metadata
@@ -963,7 +1078,280 @@ class OpenClawVLNRuntime:
         )
         if recall_usage:
             metadata["recall_usage"] = recall_usage
+        self._attach_local_control_metadata(metadata, runtime_context or {})
         return metadata
+
+    def _update_local_odometry_context(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        odometry = self._odometry_metadata_for_state(state)
+        if not odometry:
+            return {}
+        local_control_context = runtime_payload.get("local_control_context")
+        if not isinstance(local_control_context, dict):
+            local_control_context = {}
+        local_control_context["odometry"] = odometry
+        runtime_payload["local_control_context"] = local_control_context
+        return odometry
+
+    def _attach_pre_planner_local_control_context(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+    ) -> None:
+        odometry = self._update_local_odometry_context(state, runtime_payload)
+        self._update_route_progress_from_odometry(state, odometry)
+        self._attach_route_progress_context(state, runtime_payload)
+        if not odometry or runtime_payload.get("motion_feedback_enabled") is not True:
+            return
+        motion_feedback = build_motion_feedback(odometry)
+        if not motion_feedback:
+            return
+        runtime_payload["motion_feedback"] = motion_feedback
+        control_context = runtime_payload.get("control_context")
+        if not isinstance(control_context, dict):
+            control_context = {}
+        control_context["motion_feedback"] = motion_feedback
+        runtime_payload["control_context"] = control_context
+
+    def _attach_local_control_metadata(
+        self,
+        metadata: Dict[str, Any],
+        runtime_context: Dict[str, Any],
+    ) -> None:
+        motion_feedback = runtime_context.get("motion_feedback")
+        if isinstance(motion_feedback, dict) and motion_feedback:
+            metadata["motion_feedback"] = motion_feedback
+            actual_effect = motion_feedback.get("actual_effect")
+            if actual_effect:
+                metadata["motion_feedback_actual_effect"] = actual_effect
+        route_progress = runtime_context.get("route_progress")
+        if isinstance(route_progress, dict) and route_progress:
+            metadata["route_progress"] = dict(route_progress)
+            for key in (
+                "required_waypoints",
+                "positively_seen_waypoints",
+                "passed_waypoints",
+                "negated_waypoint_mentions",
+                "heading_change_from_start_deg",
+                "turn_round_required",
+                "turn_round_completed",
+            ):
+                if key in route_progress:
+                    metadata[f"route_progress_{key}"] = route_progress[key]
+        local_control_context = runtime_context.get("local_control_context")
+        if not isinstance(local_control_context, dict) or not local_control_context:
+            return
+        metadata["local_control_context"] = local_control_context
+        odometry = local_control_context.get("odometry")
+        if not isinstance(odometry, dict):
+            return
+        for key, value in odometry.items():
+            metadata[f"odometry_{key}"] = value
+
+    def _odometry_metadata_for_state(self, state: VLNState) -> Dict[str, Any]:
+        pose = self._pose_from_state(state)
+        if pose is None:
+            return {}
+        episode_state = self._odometry_state_for_episode(state)
+        previous_pose = episode_state.get("last_pose")
+        initial_rotation = episode_state.get("initial_rotation")
+        if initial_rotation is None:
+            initial_rotation = pose.get("rotation")
+            episode_state["initial_rotation"] = initial_rotation
+        previous_action = self._normalize_action_text(state.last_action) or ""
+        position_delta = None
+        rotation_delta = None
+        if isinstance(previous_pose, dict):
+            position_delta = self._position_delta_m(
+                previous_pose.get("position"),
+                pose.get("position"),
+            )
+            rotation_delta = self._rotation_delta_deg(
+                previous_pose.get("rotation"),
+                pose.get("rotation"),
+            )
+
+        had_progress = self._last_action_had_progress(
+            previous_action,
+            position_delta,
+            rotation_delta,
+        )
+        if previous_action == "MOVE_FORWARD" and had_progress is False:
+            consecutive_no_progress_forward = (
+                self._nonnegative_int(
+                    episode_state.get("consecutive_no_progress_forward")
+                )
+                + 1
+            )
+        elif previous_action == "MOVE_FORWARD" and had_progress is True:
+            consecutive_no_progress_forward = 0
+        else:
+            consecutive_no_progress_forward = self._nonnegative_int(
+                episode_state.get("consecutive_no_progress_forward")
+            )
+
+        collision = self._collision_from_state(state)
+        if collision is True:
+            consecutive_collision = (
+                self._nonnegative_int(episode_state.get("consecutive_collision")) + 1
+            )
+        elif collision is False:
+            consecutive_collision = 0
+        else:
+            consecutive_collision = self._nonnegative_int(
+                episode_state.get("consecutive_collision")
+            )
+
+        episode_state["last_pose"] = pose
+        episode_state["consecutive_no_progress_forward"] = (
+            consecutive_no_progress_forward
+        )
+        episode_state["consecutive_collision"] = consecutive_collision
+        heading_change_from_start = self._rotation_delta_deg(
+            initial_rotation,
+            pose.get("rotation"),
+        )
+
+        return {
+            "available": True,
+            "previous_action": previous_action,
+            "position_delta_m": self._round_float(position_delta),
+            "rotation_delta_deg": self._round_float(rotation_delta),
+            "last_forward_delta_m": self._round_float(
+                position_delta if previous_action == "MOVE_FORWARD" else None
+            ),
+            "last_turn_delta_deg": self._round_float(
+                rotation_delta
+                if previous_action in {"TURN_LEFT", "TURN_RIGHT"}
+                else None
+            ),
+            "last_action_had_progress": had_progress,
+            "consecutive_no_progress_forward": consecutive_no_progress_forward,
+            "collision": collision,
+            "consecutive_collision": consecutive_collision,
+            "progress_threshold_m": ODOMETRY_PROGRESS_THRESHOLD_M,
+            "turn_progress_threshold_deg": ODOMETRY_TURN_PROGRESS_THRESHOLD_DEG,
+            "heading_change_from_start_deg": self._round_float(
+                heading_change_from_start
+            ),
+        }
+
+    def _odometry_state_for_episode(self, state: VLNState) -> Dict[str, Any]:
+        key = f"{state.scene_id}::{state.episode_id}"
+        return self.odometry_episode_state.setdefault(key, {})
+
+    def _pose_from_state(self, state: VLNState) -> Optional[Dict[str, Any]]:
+        candidates = [state.diagnostic_pose, state.pose]
+        diagnostics = state.diagnostics if isinstance(state.diagnostics, dict) else {}
+        if diagnostics:
+            candidates.append(
+                {
+                    "position": diagnostics.get("sim_position"),
+                    "rotation": diagnostics.get("sim_rotation"),
+                }
+            )
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            position = self._numeric_list(candidate.get("position"))
+            rotation = self._numeric_list(candidate.get("rotation"))
+            if position is None and rotation is None:
+                continue
+            return {"position": position, "rotation": rotation}
+        return None
+
+    @staticmethod
+    def _numeric_list(value: Any) -> Optional[List[float]]:
+        if value is None:
+            return None
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if all(hasattr(value, attr) for attr in ("w", "x", "y", "z")):
+            value = [value.w, value.x, value.y, value.z]
+        if not isinstance(value, (list, tuple)):
+            return None
+        try:
+            return [float(item) for item in value]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _position_delta_m(
+        previous_position: Any,
+        current_position: Any,
+    ) -> Optional[float]:
+        previous = OpenClawVLNRuntime._numeric_list(previous_position)
+        current = OpenClawVLNRuntime._numeric_list(current_position)
+        if previous is None or current is None:
+            return None
+        dims = min(len(previous), len(current))
+        if dims == 0:
+            return None
+        return math.sqrt(
+            sum((current[index] - previous[index]) ** 2 for index in range(dims))
+        )
+
+    @staticmethod
+    def _rotation_delta_deg(
+        previous_rotation: Any,
+        current_rotation: Any,
+    ) -> Optional[float]:
+        previous = OpenClawVLNRuntime._quaternion_wxyz(previous_rotation)
+        current = OpenClawVLNRuntime._quaternion_wxyz(current_rotation)
+        if previous is None or current is None:
+            return None
+        dot = sum(previous[index] * current[index] for index in range(4))
+        dot = max(-1.0, min(1.0, abs(dot)))
+        return math.degrees(2.0 * math.acos(dot))
+
+    @staticmethod
+    def _quaternion_wxyz(value: Any) -> Optional[List[float]]:
+        values = OpenClawVLNRuntime._numeric_list(value)
+        if values is None or len(values) != 4:
+            return None
+        if abs(values[0]) >= abs(values[3]):
+            ordered = [values[0], values[1], values[2], values[3]]
+        else:
+            ordered = [values[3], values[0], values[1], values[2]]
+        norm = math.sqrt(sum(item * item for item in ordered))
+        if norm <= 0:
+            return None
+        return [item / norm for item in ordered]
+
+    @staticmethod
+    def _last_action_had_progress(
+        previous_action: str,
+        position_delta_m: Optional[float],
+        rotation_delta_deg: Optional[float],
+    ) -> Optional[bool]:
+        if previous_action == "MOVE_FORWARD":
+            if position_delta_m is None:
+                return None
+            return position_delta_m >= ODOMETRY_PROGRESS_THRESHOLD_M
+        if previous_action in {"TURN_LEFT", "TURN_RIGHT"}:
+            if rotation_delta_deg is None:
+                return None
+            return rotation_delta_deg >= ODOMETRY_TURN_PROGRESS_THRESHOLD_DEG
+        return None
+
+    @staticmethod
+    def _collision_from_state(state: VLNState) -> Optional[bool]:
+        metrics = state.online_metrics if isinstance(state.online_metrics, dict) else {}
+        if "collision" in metrics:
+            return bool(metrics.get("collision"))
+        collisions = metrics.get("collisions")
+        if isinstance(collisions, dict) and "is_collision" in collisions:
+            return bool(collisions.get("is_collision"))
+        return None
+
+    @staticmethod
+    def _round_float(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        return round(float(value), 6)
 
     def _qwen_direct_gate_context(
         self,
@@ -1016,100 +1404,210 @@ class OpenClawVLNRuntime:
                 gate_context["observed_visual_summaries"] = list(
                     observed_visual_summaries
                 )
+        self._attach_route_progress_context(state, gate_context)
 
-        start_index = episode_state.get("structural_stop_confirmation_action_index")
-        stored_forward_count = episode_state.get(
-            "structural_stop_confirmation_forward_count"
-        )
-        if start_index is None and stored_forward_count is None:
-            return
-        try:
-            start_index = max(0, int(start_index))
-        except (TypeError, ValueError):
-            start_index = 0
-        if stored_forward_count is None:
-            recent_actions = self._normalized_recent_actions(
-                gate_context.get("recent_actions")
-            )
-            forward_count = sum(
-                1
-                for action in recent_actions[start_index:]
-                if action == "MOVE_FORWARD"
-            )
-        else:
-            forward_count = self._nonnegative_int(stored_forward_count)
-        gate_context.setdefault("structural_stop_confirmation_active", True)
-        gate_context.setdefault(
-            "structural_stop_confirmation_action_index",
-            start_index,
-        )
-        gate_context.setdefault(
-            "structural_stop_confirmation_forward_count",
-            forward_count,
-        )
-
-    def _update_qwen_direct_episode_state(
+    def _record_qwen_direct_observation(
         self,
         state: VLNState,
-        runtime_payload: Dict[str, Any],
         arguments: Dict[str, Any],
-        gate_result,
     ) -> None:
         episode_state = self._qwen_direct_state_for_episode(state)
         visual_summary = self._bounded_metadata_text(arguments.get("visual_summary"))
         if visual_summary:
             summaries = list(episode_state.get("observed_visual_summaries") or [])
-            summaries.append(visual_summary)
+            if not summaries or summaries[-1] != visual_summary:
+                summaries.append(visual_summary)
             episode_state["observed_visual_summaries"] = summaries[-24:]
-
-        metadata = getattr(gate_result, "metadata", {}) or {}
-        if metadata.get("stop_gate_decision") == "passed":
-            episode_state.pop("structural_stop_confirmation_action_index", None)
-            episode_state.pop("structural_stop_confirmation_forward_count", None)
+        required_waypoints = self.qwen_direct_gates.required_intermediate_route_waypoints(
+            state.instruction
+        )
+        if not visual_summary or not required_waypoints:
             return
-        final_action = self._normalize_action_text(
-            getattr(gate_result, "final_action", "")
-        )
-        active = (
-            "structural_stop_confirmation_action_index" in episode_state
-            or "structural_stop_confirmation_forward_count" in episode_state
-        )
-        structural_blocked = metadata.get("stop_gate_block_reason") == (
-            "structural_stop_confirmation_required"
-        )
-        if structural_blocked and not active:
-            episode_state["structural_stop_confirmation_action_index"] = len(
-                self._normalized_recent_actions(runtime_payload.get("recent_actions"))
+        waypoint_states = episode_state.setdefault("route_waypoint_states", {})
+        for waypoint in required_waypoints:
+            status = self.qwen_direct_gates.classify_waypoint_observation(
+                visual_summary,
+                waypoint,
             )
-            episode_state["structural_stop_confirmation_forward_count"] = 0
-            active = True
-        if active and final_action == "MOVE_FORWARD":
-            episode_state["structural_stop_confirmation_forward_count"] = (
-                self._nonnegative_int(
-                    episode_state.get("structural_stop_confirmation_forward_count")
+            waypoint_state = waypoint_states.setdefault(
+                waypoint,
+                {
+                    "positively_seen": False,
+                    "effective_forward_after_seen": 0,
+                    "passed": False,
+                    "negated_mentions": 0,
+                },
+            )
+            if status == "positive":
+                waypoint_state["positively_seen"] = True
+            elif status == "negated":
+                waypoint_state["negated_mentions"] = self._nonnegative_int(
+                    waypoint_state.get("negated_mentions")
+                ) + 1
+
+    def _update_route_progress_from_odometry(
+        self,
+        state: VLNState,
+        odometry: Dict[str, Any],
+    ) -> None:
+        if not odometry:
+            return
+        if self._normalize_action_text(odometry.get("previous_action")) != "MOVE_FORWARD":
+            return
+        if odometry.get("last_action_had_progress") is not True:
+            return
+        episode_state = self._qwen_direct_state_for_episode(state)
+        waypoint_states = episode_state.get("route_waypoint_states")
+        if not isinstance(waypoint_states, dict):
+            return
+        for waypoint_state in waypoint_states.values():
+            if not isinstance(waypoint_state, dict):
+                continue
+            if waypoint_state.get("positively_seen") is not True:
+                continue
+            if waypoint_state.get("passed") is True:
+                continue
+            forward_count = self._nonnegative_int(
+                waypoint_state.get("effective_forward_after_seen")
+            ) + 1
+            waypoint_state["effective_forward_after_seen"] = forward_count
+            if forward_count >= ROUTE_WAYPOINT_PASS_FORWARD_ACTIONS:
+                waypoint_state["passed"] = True
+
+    def _attach_route_progress_context(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+    ) -> None:
+        required_waypoints = self.qwen_direct_gates.required_intermediate_route_waypoints(
+            state.instruction
+        )
+        turn_round_required = self.qwen_direct_gates.route_requires_turn_round(
+            state.instruction
+        )
+        if not required_waypoints and not turn_round_required:
+            return
+        existing_route_progress = runtime_payload.get("route_progress")
+        if not isinstance(existing_route_progress, dict):
+            existing_route_progress = {}
+        local_control_context = runtime_payload.get("local_control_context")
+        odometry = (
+            local_control_context.get("odometry")
+            if isinstance(local_control_context, dict)
+            else {}
+        )
+        if not isinstance(odometry, dict):
+            odometry = {}
+        heading_change = self._float_or_none(
+            odometry.get("heading_change_from_start_deg")
+        )
+        if heading_change is None:
+            heading_change = self._float_or_none(
+                existing_route_progress.get("heading_change_from_start_deg")
+            )
+        episode_state = self._qwen_direct_state_for_episode(state)
+        waypoint_states = episode_state.get("route_waypoint_states")
+        if not isinstance(waypoint_states, dict):
+            waypoint_states = {}
+        serialized_states: Dict[str, Dict[str, Any]] = {}
+        positively_seen: List[str] = []
+        passed: List[str] = []
+        negated: List[str] = []
+        for waypoint in required_waypoints:
+            state_value = waypoint_states.get(waypoint)
+            if not isinstance(state_value, dict):
+                existing_states = existing_route_progress.get("waypoint_states")
+                state_value = (
+                    existing_states.get(waypoint)
+                    if isinstance(existing_states, dict)
+                    and isinstance(existing_states.get(waypoint), dict)
+                    else {}
                 )
-                + 1
+            existing_seen = existing_route_progress.get(
+                "positively_seen_waypoints"
             )
+            existing_passed = existing_route_progress.get("passed_waypoints")
+            existing_negated = existing_route_progress.get(
+                "negated_waypoint_mentions"
+            )
+            serialized = {
+                "positively_seen": (
+                    state_value.get("positively_seen") is True
+                    or (
+                        isinstance(existing_seen, list)
+                        and waypoint in existing_seen
+                    )
+                ),
+                "effective_forward_after_seen": self._nonnegative_int(
+                    state_value.get("effective_forward_after_seen")
+                ),
+                "passed": (
+                    state_value.get("passed") is True
+                    or (
+                        isinstance(existing_passed, list)
+                        and waypoint in existing_passed
+                    )
+                ),
+                "negated_mentions": self._nonnegative_int(
+                    state_value.get("negated_mentions")
+                ) or int(
+                    isinstance(existing_negated, list)
+                    and waypoint in existing_negated
+                ),
+            }
+            serialized_states[waypoint] = serialized
+            if serialized["positively_seen"]:
+                positively_seen.append(waypoint)
+            if serialized["passed"]:
+                passed.append(waypoint)
+            if serialized["negated_mentions"] > 0:
+                negated.append(waypoint)
+        turn_round_completed = (
+            not turn_round_required
+            or episode_state.get("turn_round_completed") is True
+            or (
+                heading_change is not None
+                and heading_change >= TURN_ROUND_COMPLETION_THRESHOLD_DEG
+            )
+            or (
+                heading_change is None
+                and existing_route_progress.get("turn_round_completed") is True
+            )
+        )
+        if turn_round_required and turn_round_completed:
+            episode_state["turn_round_completed"] = True
+        route_progress = {
+            "required_waypoints": required_waypoints,
+            "positively_seen_waypoints": positively_seen,
+            "passed_waypoints": passed,
+            "negated_waypoint_mentions": negated,
+            "waypoint_states": serialized_states,
+            "waypoint_pass_forward_actions": ROUTE_WAYPOINT_PASS_FORWARD_ACTIONS,
+            "heading_change_from_start_deg": self._round_float(heading_change),
+            "turn_round_required": turn_round_required,
+            "turn_round_completion_threshold_deg": (
+                TURN_ROUND_COMPLETION_THRESHOLD_DEG
+            ),
+            "turn_round_completed": turn_round_completed,
+        }
+        runtime_payload["route_progress"] = route_progress
+        control_context = runtime_payload.get("control_context")
+        if not isinstance(control_context, dict):
+            control_context = {}
+        else:
+            control_context = dict(control_context)
+        control_context["route_progress"] = route_progress
+        runtime_payload["control_context"] = control_context
+
+    def _qwen_direct_state_for_episode(self, state: VLNState) -> Dict[str, Any]:
+        key = f"{state.scene_id}::{state.episode_id}"
+        return self.qwen_direct_episode_state.setdefault(key, {})
 
     def _nonnegative_int(self, value: Any) -> int:
         try:
             return max(0, int(value))
         except (TypeError, ValueError):
             return 0
-
-    def _qwen_direct_state_for_episode(self, state: VLNState) -> Dict[str, Any]:
-        key = f"{state.scene_id}::{state.episode_id}"
-        return self.qwen_direct_episode_state.setdefault(key, {})
-
-    def _normalized_recent_actions(self, value: Any) -> List[str]:
-        if not isinstance(value, list):
-            return []
-        actions: List[str] = []
-        for item in value:
-            action = self._normalize_action_text(item)
-            if action:
-                actions.append(action)
-        return actions
 
     def _qwen_direct_schema_metadata(
         self,

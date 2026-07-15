@@ -41,12 +41,16 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
     assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-300}" in contents
     assert "OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}" in contents
+    assert "OPENCLAW_MAP_ASSIST_MODE=${OPENCLAW_MAP_ASSIST_MODE:-off}" in contents
+    assert "OPENCLAW_MAP_FRAME_INTERVAL_STEPS=${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}" in contents
     assert "MAX_STEPS must be a positive integer" in contents
     assert "REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}" in contents
     assert "--require_service openclaw_cli_plan_gateway" in contents
     assert "--enforce_timeout_budget" in contents
     assert "--harness_debug_max_episodes" in contents
     assert "--max_steps" in contents
+    assert "--map_assist_mode" in contents
+    assert "--map_frame_interval_steps" in contents
     assert "POLICY_BACKEND=${POLICY_BACKEND:-janus_policy}" in contents
     assert "--policy_backend" in contents
 
@@ -164,8 +168,12 @@ def test_run_qwen_starts_gateway_in_qwen_direct_mode():
 
     gateway_start_block = contents.split("./scripts/start_openclaw_cli_plan_gateway.sh &", 1)[0]
 
+    assert "env -u OPENCLAW_GATEWAY_PORT \\" in gateway_start_block
     assert "POLICY_BACKEND=qwen_direct \\" in gateway_start_block
     assert 'OPENCLAW_MODEL_MAX_IMAGES="${OPENCLAW_MODEL_MAX_IMAGES:-8}" \\' in gateway_start_block
+    assert 'OPENCLAW_MODEL_FAST_MODE="${OPENCLAW_MODEL_FAST_MODE}" \\' in gateway_start_block
+    assert 'OPENCLAW_MAP_ASSIST_MODE="${OPENCLAW_MAP_ASSIST_MODE:-off}"' in contents
+    assert 'OPENCLAW_MAP_FRAME_INTERVAL_STEPS="${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}"' in contents
 
 
 def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():

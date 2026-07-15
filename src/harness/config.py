@@ -35,3 +35,8 @@ class HarnessConfig:
     keyframe_episode_cap: int = 64
     keyframe_coverage_gap_steps: int = 20
     keyframe_debug_save_all_eligible: bool = False
+    map_assist_mode: str = "off"
+    map_frame_interval_steps: int = 5
+    motion_feedback_enabled: bool = False
+    forward_stall_odometry_enabled: bool = False
+    map_collision_overlay_enabled: bool = False

@@ -31,6 +31,25 @@ class SaveableFrame:
         path.write_text(self.text, encoding="utf-8")
 
 
+class FakeAgentState:
+    def __init__(self, position, rotation):
+        self.position = position
+        self.rotation = rotation
+
+
+class FakeSim:
+    def __init__(self, position, rotation):
+        self._state = FakeAgentState(position, rotation)
+
+    def get_agent_state(self):
+        return self._state
+
+
+class FakeEnv:
+    def __init__(self, position, rotation):
+        self.sim = FakeSim(position, rotation)
+
+
 class FakeDirectRuntimeResult:
     ok = True
     action_text = "MOVE_FORWARD"
@@ -73,6 +92,11 @@ def make_args(tmp_path, **overrides):
         "keyframe_episode_cap": 64,
         "keyframe_coverage_gap_steps": 20,
         "keyframe_debug_save_all_eligible": False,
+        "map_assist_mode": "off",
+        "map_frame_interval_steps": 5,
+        "motion_feedback_enabled": False,
+        "forward_stall_odometry_enabled": False,
+        "map_collision_overlay_enabled": False,
         "harness_runtime": "openclaw_bridge",
         "openclaw_workspace_path": "",
         "openclaw_service_registry_path": "",
@@ -179,6 +203,61 @@ def test_qwen_direct_proxy_uses_runtime_without_base_model(tmp_path):
     assert record["direct_policy"] is True
     assert record["janus_loaded"] is False
     assert record["planned_tool"] == "QwenDirectPolicy"
+
+
+def test_qwen_direct_proxy_injects_habitat_pose_into_state_without_prompt_leak(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+    runtime = FakeDirectRuntime()
+    components["openclaw_runtime"] = runtime
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    episode = SimpleNamespace(
+        scene_id="/tmp/scene-a/scene.glb",
+        episode_id="episode-1",
+        instruction=SimpleNamespace(instruction_text="go to kitchen"),
+    )
+
+    proxy.observe_environment_state(
+        env=FakeEnv(
+            position=[1.0, 2.0, 3.0],
+            rotation=SimpleNamespace(w=1.0, x=0.0, y=0.0, z=0.0),
+        ),
+        episode=episode,
+        observations={"rgb": "raw-frame"},
+        metrics={"collisions": {"is_collision": True}, "distance_to_goal": 0.1},
+        step_id=0,
+    )
+    action = proxy.call_model([SaveableFrame("frame0")], "go to kitchen", step_id=0)
+
+    assert action == ["MOVE_FORWARD"]
+    state, payload = runtime.calls[0]
+    assert state.diagnostic_pose == {
+        "position": [1.0, 2.0, 3.0],
+        "rotation": [1.0, 0.0, 0.0, 0.0],
+    }
+    assert state.diagnostics["sim_position"] == [1.0, 2.0, 3.0]
+    assert "raw_metrics" not in state.diagnostics
+    assert state.pose is None
+    assert payload["control_context"]["non_oracle_metrics"] == {"collision": True}
+    prompt_payload_text = json.dumps(
+        {
+            "policy_input": payload["policy_input"],
+            "control_context": payload["control_context"],
+            "evidence_context": payload["evidence_context"],
+        },
+        sort_keys=True,
+    )
+    assert "sim_position" not in prompt_payload_text
+    assert "sim_rotation" not in prompt_payload_text
+    assert "distance_to_goal" not in prompt_payload_text
 
 
 def test_build_components_registers_visual_memory_curator_when_enabled(tmp_path):
@@ -360,6 +439,78 @@ def test_proxy_payload_exposes_current_image_path_and_recent_keyframe_paths(tmp_
     assert Path(second_payload["current_image_path"]).exists()
     assert first_payload["current_image_path"].endswith("step_000000.png")
     assert second_payload["current_image_path"].endswith("step_000001.png")
+    assert "map_context" not in first_payload
+    assert "map_assist_mode" not in first_payload
+
+
+def test_proxy_payload_uses_absolute_image_paths_for_gateway(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    base_model = FakeBaseModel()
+    components = build_harness_components(
+        make_args("relative-run-output"),
+        model=base_model,
+    )
+    proxy = HarnessModelProxy(base_model, components)
+    proxy.start_episode("scene-a", "episode-1")
+
+    payload = proxy._runtime_payload([SaveableFrame("first")], step_id=0)
+
+    assert Path(payload["current_image_path"]).is_absolute()
+    assert Path(payload["keyframe_candidate"]["image_path"]).is_absolute()
+    assert Path(payload["current_image_path"]).exists()
+
+
+def test_qwen_direct_proxy_payload_exposes_map_context_when_enabled(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+            map_assist_mode="floorplan_map_assisted",
+            map_frame_interval_steps=5,
+        ),
+        model=None,
+    )
+    runtime = FakeDirectRuntime()
+    components["openclaw_runtime"] = runtime
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    proxy._map_context_provider._renderer = lambda **_: b"fake-png"
+    episode = SimpleNamespace(
+        scene_id="/tmp/scene-a/scene.glb",
+        episode_id="episode-1",
+        instruction=SimpleNamespace(instruction_text="go to kitchen"),
+    )
+
+    proxy.observe_environment_state(
+        FakeEnv([0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+        episode,
+        {"rgb": SaveableFrame("current")},
+        {},
+        step_id=0,
+    )
+    first_payload = proxy._runtime_payload([SaveableFrame("current")], step_id=0)
+    proxy.observe_environment_state(
+        FakeEnv([0.1, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+        episode,
+        {"rgb": SaveableFrame("current")},
+        {},
+        step_id=1,
+    )
+    second_payload = proxy._runtime_payload([SaveableFrame("current")], step_id=1)
+
+    assert first_payload["map_assist_mode"] == "floorplan_map_assisted"
+    assert first_payload["input_regime"] == "rgb_plus_privileged_floorplan_pose"
+    assert first_payload["map_context"]["map_frame_due"] is True
+    assert first_payload["map_context"]["map_available"] is True
+    assert first_payload["map_context"]["internal_only"]["map_image_path"].endswith(
+        "openclaw_map_frames/scene-a/episode-1/step_000000.png"
+    )
+    assert Path(first_payload["map_context"]["internal_only"]["map_image_path"]).exists()
+    assert second_payload["map_context"]["map_frame_due"] is False
+    assert second_payload["map_context"]["map_available"] is False
+    assert "internal_only" not in second_payload["map_context"]
 
 
 def test_qwen_direct_proxy_payload_includes_structured_control_context(tmp_path):

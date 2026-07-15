@@ -90,6 +90,52 @@ class HarnessLogger:
         if extra:
             record.update(extra)
 
+        record = self._json_safe(record)
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
         return record
+
+    def _json_safe(self, value: Any, seen: Optional[set] = None) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if seen is None:
+            seen = set()
+        object_id = id(value)
+        if object_id in seen:
+            return str(value)
+        seen.add(object_id)
+        try:
+            return self._json_safe_container(value, seen)
+        finally:
+            seen.discard(object_id)
+
+    def _json_safe_container(self, value: Any, seen: set) -> Any:
+        if all(hasattr(value, attr) for attr in ("w", "x", "y", "z")):
+            return [
+                self._json_safe(getattr(value, "w"), seen),
+                self._json_safe(getattr(value, "x"), seen),
+                self._json_safe(getattr(value, "y"), seen),
+                self._json_safe(getattr(value, "z"), seen),
+            ]
+        if isinstance(value, dict):
+            return {
+                str(key): self._json_safe(nested, seen)
+                for key, nested in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe(item, seen) for item in value]
+        if hasattr(value, "item"):
+            try:
+                converted = value.item()
+                if converted is not value:
+                    return self._json_safe(converted, seen)
+            except Exception:
+                pass
+        if hasattr(value, "tolist"):
+            try:
+                converted = value.tolist()
+                if converted is not value:
+                    return self._json_safe(converted, seen)
+            except Exception:
+                pass
+        return str(value)

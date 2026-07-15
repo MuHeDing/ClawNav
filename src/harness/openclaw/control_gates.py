@@ -150,6 +150,25 @@ ROUTE_STOP_HOLDOFF_MARKERS = (
 )
 ROUTE_STOP_MIN_STEP_ID = 4
 ROUTE_STOP_MIN_FORWARD_ACTIONS = 4
+ROUTE_WAYPOINT_PASS_FORWARD_ACTIONS = 2
+TURN_ROUND_COMPLETION_THRESHOLD_DEG = 150.0
+ROUTE_WAYPOINT_NEGATIVE_MARKERS = (
+    "not visible",
+    "not seen",
+    "not in view",
+    "cannot see",
+    "can't see",
+    "could not see",
+    "unable to see",
+    "need to locate",
+    "needs to locate",
+    "looking for",
+    "searching for",
+    "without seeing",
+    "before reaching",
+    "not reached",
+    "missing",
+)
 STRUCTURAL_STOP_CONFIRMATION_FORWARD_ACTIONS = 1
 INTERMEDIATE_ROUTE_WAYPOINT_PATTERNS = (
     ("billiard table", "billiard table"),
@@ -181,18 +200,6 @@ STRUCTURAL_TARGET_ARRIVAL_MARKERS = (
     "in the entrance",
     "at the entrance",
     "at entrance",
-)
-STRUCTURAL_CONFIRM_FORWARD_NEGATIVE_MARKERS = (
-    "blocked",
-    "obstruct",
-    "wall",
-    "off center",
-    "off-center",
-    "not aligned",
-    "not centered",
-    "not visible",
-    "left edge",
-    "right edge",
 )
 STRUCTURAL_FORWARD_OVERRUN_MARKERS = (
     "further movement would",
@@ -246,11 +253,29 @@ class QwenDirectControlGates:
             }
             return self._hard_failure(failure_args, metadata)
 
+        if (
+            candidate_action == "MOVE_FORWARD"
+            and runtime_context.get("structural_stop_verification_active") is True
+        ):
+            replacement = self._turn_fallback(runtime_context)
+            metadata.update(
+                {
+                    "stop_verification_gate_decision": "blocked",
+                    "blocked_action": "MOVE_FORWARD",
+                    "replacement_action": replacement,
+                    "final_action": replacement,
+                    "final_action_source": "stop_verification_gate",
+                    "fallback_policy": "stop_verification_turn",
+                }
+            )
+            return QwenDirectGateResult(replacement, metadata)
+
         if candidate_action == "STOP":
             stop_block_metadata = self._stop_block_metadata(arguments, runtime_context)
             if not stop_block_metadata:
                 passed_metadata = {
                     "stop_gate_decision": "passed",
+                    "stop_permission": True,
                     "final_action": "STOP",
                     "final_action_source": "qwen",
                 }
@@ -267,6 +292,7 @@ class QwenDirectControlGates:
             metadata.update(
                 {
                     "stop_gate_decision": "blocked",
+                    "stop_permission": False,
                     "blocked_action": "STOP",
                     "replacement_action": replacement,
                     "final_action": replacement,
@@ -291,7 +317,20 @@ class QwenDirectControlGates:
             )
             return QwenDirectGateResult(loop_replacement, metadata)
 
-        forward_replacement = self._forward_stall_replacement(
+        turn_oscillation_detected = self._turn_oscillation_detected(
+            candidate_action,
+            runtime_context,
+        )
+        if turn_oscillation_detected:
+            metadata.update(
+                {
+                    "turn_oscillation_gate_decision": "audit_only",
+                    "turn_oscillation_detected": True,
+                    "loop_pattern": "turn_oscillation",
+                }
+            )
+
+        forward_replacement, forward_metadata = self._forward_stall_replacement(
             candidate_action,
             arguments,
             runtime_context,
@@ -307,6 +346,7 @@ class QwenDirectControlGates:
                     "fallback_policy": "forward_stall_turn",
                 }
             )
+            metadata.update(forward_metadata)
             return QwenDirectGateResult(forward_replacement, metadata)
 
         confidence = self._confidence(arguments.get("confidence"))
@@ -501,6 +541,8 @@ class QwenDirectControlGates:
         if has_arrival_anchor:
             if self._structural_forward_would_overrun(arrival_text):
                 return {}
+            if runtime_context.get("structural_stop_verification_active") is True:
+                return {}
             confirmation_count = self._structural_confirmation_forward_count(
                 runtime_context
             )
@@ -534,14 +576,51 @@ class QwenDirectControlGates:
         if forward_count < ROUTE_STOP_MIN_FORWARD_ACTIONS:
             missing_reasons.append("min_forward_actions")
 
-        progress_text = self._observed_route_progress_text(arguments, runtime_context)
+        required_waypoints = self._required_intermediate_route_waypoints(instruction)
+        route_progress = runtime_context.get("route_progress")
+        if not isinstance(route_progress, dict):
+            route_progress = {}
+        observations = self._route_visual_observations(arguments, runtime_context)
+        positively_seen = self._normalized_waypoint_list(
+            route_progress.get("positively_seen_waypoints")
+        )
+        passed_waypoints = self._normalized_waypoint_list(
+            route_progress.get("passed_waypoints")
+        )
+        negated_mentions = self._normalized_waypoint_list(
+            route_progress.get("negated_waypoint_mentions")
+        )
+        for waypoint in required_waypoints:
+            observation = self._waypoint_observation_status(observations, waypoint)
+            if observation == "positive" and waypoint not in positively_seen:
+                positively_seen.append(waypoint)
+            elif observation == "negated" and waypoint not in negated_mentions:
+                negated_mentions.append(waypoint)
+
+        turn_round_required = self._instruction_requires_turn_round(instruction)
+        turn_round_completed = (
+            route_progress.get("turn_round_completed") is True
+            if turn_round_required
+            else True
+        )
+        heading_change = self._float_or_none(
+            route_progress.get("heading_change_from_start_deg")
+        )
+        if turn_round_required and not turn_round_completed:
+            missing_reasons.append("turn_round_progress")
+
         missing_waypoints = [
+            waypoint for waypoint in required_waypoints if waypoint not in positively_seen
+        ]
+        unpassed_waypoints = [
             waypoint
-            for waypoint in self._required_intermediate_route_waypoints(instruction)
-            if not self._contains_waypoint(progress_text, waypoint)
+            for waypoint in required_waypoints
+            if waypoint in positively_seen and waypoint not in passed_waypoints
         ]
         if missing_waypoints:
-            missing_reasons.append("intermediate_waypoint_progress")
+            missing_reasons.append("intermediate_waypoint_seen")
+        elif unpassed_waypoints:
+            missing_reasons.append("intermediate_waypoint_passed")
 
         if not missing_reasons:
             return {}
@@ -552,9 +631,18 @@ class QwenDirectControlGates:
             "stop_gate_current_step_id": current_step_id,
             "stop_gate_min_forward_actions": ROUTE_STOP_MIN_FORWARD_ACTIONS,
             "stop_gate_forward_action_count": forward_count,
+            "stop_gate_required_route_waypoints": required_waypoints,
+            "stop_gate_positively_seen_waypoints": positively_seen,
+            "stop_gate_passed_waypoints": passed_waypoints,
+            "stop_gate_negated_waypoint_mentions": negated_mentions,
+            "stop_gate_turn_round_required": turn_round_required,
+            "stop_gate_turn_round_completed": turn_round_completed,
+            "stop_gate_heading_change_from_start_deg": heading_change,
         }
         if missing_waypoints:
             metadata["stop_gate_missing_route_waypoints"] = missing_waypoints
+        if unpassed_waypoints:
+            metadata["stop_gate_unpassed_route_waypoints"] = unpassed_waypoints
         return metadata
 
     def _instruction_needs_route_stop_holdoff(self, instruction: str) -> bool:
@@ -587,11 +675,11 @@ class QwenDirectControlGates:
         required_waypoints = self._required_route_waypoints(runtime_context)
         if len(required_waypoints) < 2:
             return []
-        progress_text = self._observed_route_progress_text(arguments, runtime_context)
+        observations = self._route_visual_observations(arguments, runtime_context)
         return [
             waypoint
             for waypoint in required_waypoints
-            if not self._contains_waypoint(progress_text, waypoint)
+            if self._waypoint_observation_status(observations, waypoint) != "positive"
         ]
 
     def _looks_like_terminal_visual_stop(self, arguments: Dict[str, Any]) -> bool:
@@ -633,23 +721,69 @@ class QwenDirectControlGates:
             seen.add(waypoint)
         return waypoints
 
-    def _observed_route_progress_text(
+    def _route_visual_observations(
         self,
         arguments: Dict[str, Any],
         runtime_context: Dict[str, Any],
-    ) -> str:
-        values = [
+    ) -> List[str]:
+        values: List[Any] = [
             arguments.get("visual_summary"),
             runtime_context.get("current_visual_summary"),
             runtime_context.get("recent_visual_summary"),
         ]
-        for key in ("observed_visual_summaries", "observed_route_waypoints"):
-            value = runtime_context.get(key)
-            if isinstance(value, list):
-                values.extend(value)
-            elif isinstance(value, str):
-                values.append(value)
-        return " ".join(str(value or "").strip().lower() for value in values)
+        observed = runtime_context.get("observed_visual_summaries")
+        if isinstance(observed, list):
+            values.extend(observed)
+        elif isinstance(observed, str):
+            values.append(observed)
+        return [str(value).strip().lower() for value in values if str(value or "").strip()]
+
+    def _waypoint_observation_status(
+        self,
+        observations: List[str],
+        waypoint: str,
+    ) -> str:
+        saw_negated = False
+        pattern = re.compile(r"\b" + re.escape(waypoint) + r"\b")
+        for observation in observations:
+            clauses = re.split(r"[.!?;\n]|\bbut\b|\bhowever\b", observation.lower())
+            for clause in clauses:
+                if pattern.search(clause) is None:
+                    continue
+                if any(marker in clause for marker in ROUTE_WAYPOINT_NEGATIVE_MARKERS):
+                    saw_negated = True
+                    continue
+                return "positive"
+        return "negated" if saw_negated else ""
+
+    def classify_waypoint_observation(self, summary: Any, waypoint: str) -> str:
+        text = str(summary or "").strip().lower()
+        if not text:
+            return ""
+        return self._waypoint_observation_status([text], waypoint)
+
+    def required_intermediate_route_waypoints(self, instruction: str) -> List[str]:
+        return self._required_intermediate_route_waypoints(
+            str(instruction or "").strip().lower()
+        )
+
+    def route_requires_turn_round(self, instruction: str) -> bool:
+        return self._instruction_requires_turn_round(
+            str(instruction or "").strip().lower()
+        )
+
+    def _instruction_requires_turn_round(self, instruction: str) -> bool:
+        return "turn round" in instruction or "turn around" in instruction
+
+    def _normalized_waypoint_list(self, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: List[str] = []
+        for item in value:
+            waypoint = str(item or "").strip().lower()
+            if waypoint and waypoint not in normalized:
+                normalized.append(waypoint)
+        return normalized
 
     def _structural_confirmation_forward_count(
         self,
@@ -681,27 +815,7 @@ class QwenDirectControlGates:
         arguments: Dict[str, Any],
         runtime_context: Dict[str, Any],
     ) -> tuple[str, str]:
-        if stop_block_metadata.get("stop_gate_block_reason") == (
-            "structural_stop_confirmation_required"
-        ):
-            if self._can_confirm_structural_stop_by_forward(arguments):
-                return "MOVE_FORWARD", "structural_stop_confirm_forward"
         return self._turn_fallback(runtime_context), "blocked_stop_turn"
-
-    def _can_confirm_structural_stop_by_forward(
-        self,
-        arguments: Dict[str, Any],
-    ) -> bool:
-        text = " ".join(
-            [
-                str(arguments.get("visual_summary") or "").strip().lower(),
-                str(arguments.get("target_relation") or "").strip().lower(),
-                str(arguments.get("reason") or "").strip().lower(),
-            ]
-        )
-        return not any(
-            marker in text for marker in STRUCTURAL_CONFIRM_FORWARD_NEGATIVE_MARKERS
-        )
 
     def _structural_forward_would_overrun(self, text: str) -> bool:
         return any(marker in text for marker in STRUCTURAL_FORWARD_OVERRUN_MARKERS)
@@ -730,19 +844,108 @@ class QwenDirectControlGates:
         candidate_action: str,
         arguments: Dict[str, Any],
         runtime_context: Dict[str, Any],
-    ) -> str:
+    ) -> tuple[str, Dict[str, Any]]:
         if candidate_action != "MOVE_FORWARD":
-            return ""
+            return "", {}
+        odometry_metadata = self._odometry_forward_stall_metadata(runtime_context)
+        if odometry_metadata:
+            return self._turn_fallback(runtime_context), odometry_metadata
+        if runtime_context.get("forward_stall_odometry_enabled") is True:
+            return "", {}
         recent = self._recent_actions(runtime_context)
         if len(recent) < 4 or recent[-4:] != ["MOVE_FORWARD"] * 4:
-            return ""
+            return "", {}
         if self._has_no_progress_evidence(arguments):
-            return self._turn_fallback(runtime_context)
+            return self._turn_fallback(runtime_context), {
+                "forward_stall_evidence_source": "qwen_text",
+                "forward_stall_gate_reason": "no_progress_evidence",
+            }
         if self._has_fresh_visual_evidence(runtime_context):
-            return ""
+            return "", {}
         if self._has_progress_evidence(arguments):
-            return ""
-        return self._turn_fallback(runtime_context)
+            return "", {}
+        return self._turn_fallback(runtime_context), {
+            "forward_stall_evidence_source": "recent_actions",
+            "forward_stall_gate_reason": "repeated_forward_without_fresh_progress",
+        }
+
+    def _odometry_forward_stall_metadata(
+        self,
+        runtime_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if runtime_context.get("forward_stall_odometry_enabled") is not True:
+            return {}
+        odometry = self._odometry_context(runtime_context)
+        if not odometry:
+            return {}
+        if self._normalize_action(odometry.get("previous_action")) != "MOVE_FORWARD":
+            return {}
+        consecutive_no_progress = self._int_or_none(
+            odometry.get("consecutive_no_progress_forward")
+        )
+        consecutive_no_progress = consecutive_no_progress or 0
+        last_forward_delta = self._float_or_none(odometry.get("last_forward_delta_m"))
+        progress_threshold = self._float_or_none(odometry.get("progress_threshold_m"))
+        if progress_threshold is None:
+            progress_threshold = 0.05
+        collision = bool(odometry.get("collision"))
+        tiny_forward = (
+            last_forward_delta is not None
+            and last_forward_delta < progress_threshold
+        )
+        if consecutive_no_progress < 2 and not (collision and tiny_forward):
+            return {}
+        reason = (
+            "odometry_consecutive_no_progress"
+            if consecutive_no_progress >= 2
+            else "odometry_collision_tiny_forward_delta"
+        )
+        return {
+            "forward_stall_evidence_source": "odometry",
+            "forward_stall_gate_reason": reason,
+            "blocked_forward_by_odometry_gate": True,
+            "forward_stall_odometry_consecutive_no_progress_forward": (
+                consecutive_no_progress
+            ),
+            "forward_stall_odometry_last_forward_delta_m": last_forward_delta,
+            "forward_stall_odometry_collision": collision,
+        }
+
+    def _turn_oscillation_detected(
+        self,
+        candidate_action: str,
+        runtime_context: Dict[str, Any],
+    ) -> bool:
+        if candidate_action not in {"TURN_LEFT", "TURN_RIGHT"}:
+            return False
+        if runtime_context.get("forward_stall_odometry_enabled") is not True:
+            return False
+        recent = self._recent_actions(runtime_context)
+        tail = recent[-8:]
+        if len(tail) < 6:
+            return False
+        turn_count = sum(1 for action in tail if action in {"TURN_LEFT", "TURN_RIGHT"})
+        forward_count = sum(1 for action in tail if action == "MOVE_FORWARD")
+        if turn_count < 6 or forward_count > 1:
+            return False
+        odometry = self._odometry_context(runtime_context)
+        if not odometry:
+            return False
+        if bool(odometry.get("collision")):
+            return False
+        consecutive_no_progress = self._int_or_none(
+            odometry.get("consecutive_no_progress_forward")
+        )
+        if consecutive_no_progress and consecutive_no_progress > 0:
+            return False
+        return True
+
+    def _odometry_context(self, runtime_context: Dict[str, Any]) -> Dict[str, Any]:
+        local_control_context = runtime_context.get("local_control_context")
+        if not isinstance(local_control_context, dict):
+            return {}
+        odometry = local_control_context.get("odometry")
+        return odometry if isinstance(odometry, dict) else {}
 
     def _has_fresh_visual_evidence(self, runtime_context: Dict[str, Any]) -> bool:
         planner_step_mode = str(runtime_context.get("planner_step_mode") or "")
@@ -804,6 +1007,14 @@ class QwenDirectControlGates:
         return normalized if normalized in ACTION_TEXTS else ""
 
     def _confidence(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _float_or_none(self, value: Any) -> Optional[float]:
         if value is None:
             return None
         try:
