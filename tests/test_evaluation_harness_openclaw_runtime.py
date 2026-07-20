@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from evaluation_harness import (
     HarnessModelProxy,
     QwenDirectPolicyProxy,
+    build_harness_config,
     build_harness_components,
 )
 
@@ -97,6 +98,7 @@ def make_args(tmp_path, **overrides):
         "motion_feedback_enabled": False,
         "forward_stall_odometry_enabled": False,
         "map_collision_overlay_enabled": False,
+        "dynamic_visual_context_enabled": False,
         "harness_runtime": "openclaw_bridge",
         "openclaw_workspace_path": "",
         "openclaw_service_registry_path": "",
@@ -117,6 +119,20 @@ def make_args(tmp_path, **overrides):
     }
     data.update(overrides)
     return SimpleNamespace(**data)
+
+
+def test_harness_config_defaults_dynamic_visual_context_off(tmp_path):
+    config = build_harness_config(make_args(tmp_path))
+
+    assert config.dynamic_visual_context_enabled is False
+
+
+def test_harness_config_can_enable_dynamic_visual_context(tmp_path):
+    config = build_harness_config(
+        make_args(tmp_path, dynamic_visual_context_enabled=True)
+    )
+
+    assert config.dynamic_visual_context_enabled is True
 
 
 def test_build_components_creates_openclaw_runtime_when_requested(tmp_path):
@@ -203,6 +219,45 @@ def test_qwen_direct_proxy_uses_runtime_without_base_model(tmp_path):
     assert record["direct_policy"] is True
     assert record["janus_loaded"] is False
     assert record["planned_tool"] == "QwenDirectPolicy"
+
+
+def test_qwen_direct_proxy_tracks_and_resets_invalid_episode(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+        ),
+        model=None,
+    )
+
+    class InvalidEpisodeRuntime:
+        def step(self, state, payload):
+            return SimpleNamespace(
+                ok=True,
+                action_text="STOP",
+                executor_command={},
+                error="",
+                runtime_metadata={
+                    "planned_intent": "act",
+                    "planned_tool": "QwenDirectPolicy",
+                    "episode_invalid": True,
+                    "qwen_failure_reason": "route_v2 repair failed",
+                },
+            )
+
+    components["openclaw_runtime"] = InvalidEpisodeRuntime()
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+
+    assert proxy.call_model([SaveableFrame("frame0")], "go", step_id=0) == ["STOP"]
+    assert proxy.episode_invalid is True
+    assert proxy.episode_invalid_reason == "route_v2 repair failed"
+
+    proxy.start_episode("scene-a", "episode-2")
+    assert proxy.episode_invalid is False
+    assert proxy.episode_invalid_reason == ""
 
 
 def test_qwen_direct_proxy_injects_habitat_pose_into_state_without_prompt_leak(tmp_path):
@@ -510,7 +565,58 @@ def test_qwen_direct_proxy_payload_exposes_map_context_when_enabled(tmp_path):
     assert Path(first_payload["map_context"]["internal_only"]["map_image_path"]).exists()
     assert second_payload["map_context"]["map_frame_due"] is False
     assert second_payload["map_context"]["map_available"] is False
-    assert "internal_only" not in second_payload["map_context"]
+    assert second_payload["map_context"]["cached_map_available"] is True
+    assert second_payload["map_context"]["map_age_steps"] == 1
+    assert second_payload["map_context"]["internal_only"] == first_payload["map_context"][
+        "internal_only"
+    ]
+
+
+def test_qwen_direct_proxy_uses_runtime_turn_loop_state_for_next_local_map(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+            map_assist_mode="floorplan_map_assisted",
+            map_frame_interval_steps=5,
+        ),
+        model=None,
+    )
+    components["openclaw_runtime"] = FakeDirectRuntime()
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    proxy._map_context_provider._renderer = lambda **_: b"fake-png"
+    episode = SimpleNamespace(
+        scene_id="/tmp/scene-a/scene.glb",
+        episode_id="episode-1",
+        instruction=SimpleNamespace(instruction_text="go to kitchen"),
+    )
+    proxy.observe_environment_state(
+        FakeEnv([0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+        episode,
+        {"rgb": SaveableFrame("current")},
+        {},
+        step_id=0,
+    )
+    proxy._remember_map_recovery_from_runtime(
+        SimpleNamespace(runtime_metadata={"turn_loop_recovery_active": True})
+    )
+
+    proxy.observe_environment_state(
+        FakeEnv([0.0, 0.0, 0.0], [0.9238795, 0.0, 0.3826834, 0.0]),
+        episode,
+        {"rgb": SaveableFrame("current")},
+        {},
+        step_id=1,
+    )
+    payload = proxy._runtime_payload([SaveableFrame("current")], step_id=1)
+
+    assert payload["map_context"]["map_frame_due"] is True
+    assert payload["map_context"]["map_interval_due"] is False
+    assert payload["map_context"]["map_view_scope"] == "local_recovery"
+    assert payload["map_context"]["map_refresh_reason"] == "turn_loop_recovery"
 
 
 def test_qwen_direct_proxy_payload_includes_structured_control_context(tmp_path):

@@ -54,6 +54,7 @@ class FloorplanMapContextProvider:
         self._visited_positions: List[Tuple[float, float, float]] = []
         self._collision_positions: List[Tuple[float, float, float]] = []
         self._last_position: Optional[Tuple[float, float, float]] = None
+        self._last_map_artifact: Optional[Dict[str, Any]] = None
 
     @property
     def enabled(self) -> bool:
@@ -64,6 +65,7 @@ class FloorplanMapContextProvider:
         self._visited_positions = []
         self._collision_positions = []
         self._last_position = None
+        self._last_map_artifact = None
 
     def build_context(
         self,
@@ -73,6 +75,7 @@ class FloorplanMapContextProvider:
         step_id: int,
         scene_id: str,
         episode_id: str,
+        local_focus: bool = False,
     ) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
@@ -98,13 +101,32 @@ class FloorplanMapContextProvider:
                 self._append_position(self._collision_positions, position)
             self._last_position = position
 
-        due = int(step_id) % self.frame_interval_steps == 0
+        local_focus = bool(local_focus)
+        interval_due = int(step_id) % self.frame_interval_steps == 0
+        cached_scope = (
+            str(self._last_map_artifact.get("map_view_scope") or "")
+            if isinstance(self._last_map_artifact, dict)
+            else ""
+        )
+        recovery_exit_refresh = not local_focus and cached_scope == "local_recovery"
+        due = interval_due or local_focus or recovery_exit_refresh
         context: Dict[str, Any] = {
             "mode": MAP_ASSIST_FLOORPLAN,
             "input_regime": INPUT_REGIME,
             "map_frame_interval_steps": self.frame_interval_steps,
             "map_step_id": int(step_id),
             "map_frame_due": due,
+            "map_interval_due": interval_due,
+            "map_view_scope": "local_recovery" if local_focus else "global",
+            "map_refresh_reason": (
+                "turn_loop_recovery"
+                if local_focus
+                else (
+                    "recovery_exit_global"
+                    if recovery_exit_refresh
+                    else ("interval" if interval_due else "cached_interval")
+                )
+            ),
             "map_available": False,
             "map_source": MAP_IMAGE_SOURCE,
             "pose_source": POSE_SOURCE,
@@ -116,15 +138,22 @@ class FloorplanMapContextProvider:
             else 0,
         }
         if not due:
+            self._attach_cached_map_artifact(context, int(step_id))
             return context
 
         try:
-            rendered = self._render_policy_map(env=env, state=state)
+            rendered = self._render_policy_map(
+                env=env,
+                state=state,
+                local_focus=local_focus,
+            )
         except Exception as exc:
             context["map_generation_error"] = exc.__class__.__name__
+            self._attach_cached_map_artifact(context, int(step_id))
             return context
         if rendered is None:
             context["map_generation_error"] = "map_unavailable"
+            self._attach_cached_map_artifact(context, int(step_id))
             return context
 
         path = self._map_image_path(scene_id, episode_id, int(step_id))
@@ -132,6 +161,7 @@ class FloorplanMapContextProvider:
             self._save_rendered_map(rendered, path)
         except Exception as exc:
             context["map_generation_error"] = exc.__class__.__name__
+            self._attach_cached_map_artifact(context, int(step_id))
             return context
 
         context["map_available"] = True
@@ -140,9 +170,38 @@ class FloorplanMapContextProvider:
             "map_image_path": str(path),
             "map_image_hash": self._sha256_file(path),
         }
+        self._last_map_artifact = {
+            "map_step_id": int(step_id),
+            "map_view_scope": context["map_view_scope"],
+            "internal_only": dict(context["internal_only"]),
+        }
         return context
 
-    def _render_policy_map(self, *, env: Any, state: Any) -> Any:
+    def _attach_cached_map_artifact(
+        self,
+        context: Dict[str, Any],
+        step_id: int,
+    ) -> None:
+        cached = self._last_map_artifact
+        if not isinstance(cached, dict):
+            context["cached_map_available"] = False
+            return
+        cached_step = int(cached.get("map_step_id") or 0)
+        context["cached_map_available"] = True
+        context["cached_map_step_id"] = cached_step
+        context["map_age_steps"] = int(step_id) - cached_step
+        context["map_view_scope"] = str(cached.get("map_view_scope") or "global")
+        internal = cached.get("internal_only")
+        if isinstance(internal, dict):
+            context["internal_only"] = dict(internal)
+
+    def _render_policy_map(
+        self,
+        *,
+        env: Any,
+        state: Any,
+        local_focus: bool = False,
+    ) -> Any:
         if self._renderer is not None:
             return self._renderer(
                 env=env,
@@ -150,9 +209,19 @@ class FloorplanMapContextProvider:
                 visited_positions=list(self._visited_positions),
                 collision_positions=list(self._collision_positions),
             )
-        return self._default_render_policy_map(env=env, state=state)
+        return self._default_render_policy_map(
+            env=env,
+            state=state,
+            local_focus=local_focus,
+        )
 
-    def _default_render_policy_map(self, *, env: Any, state: Any) -> Any:
+    def _default_render_policy_map(
+        self,
+        *,
+        env: Any,
+        state: Any,
+        local_focus: bool = False,
+    ) -> Any:
         sim = getattr(env, "sim", None)
         if sim is None:
             return None
@@ -209,7 +278,19 @@ class FloorplanMapContextProvider:
                 if pixel is not None:
                     self._draw_cross(draw, pixel, size=4, fill=(220, 90, 0))
 
+        if local_focus and current_pixel is not None:
+            return self._local_focus_image(image, current_pixel)
         return image
+
+    def _local_focus_image(self, image: Any, center: Tuple[int, int]) -> Any:
+        width, height = image.size
+        side = min(width, height, max(128, (min(width, height) * 2) // 5))
+        left = max(0, min(int(center[0]) - side // 2, width - side))
+        top = max(0, min(int(center[1]) - side // 2, height - side))
+        crop = image.crop((left, top, left + side, top + side))
+        resampling = getattr(image, "Resampling", None)
+        nearest = resampling.NEAREST if resampling is not None else 0
+        return crop.resize((self.map_resolution, self.map_resolution), resample=nearest)
 
     def _map_image_path(self, scene_id: str, episode_id: str, step_id: int) -> Path:
         return (

@@ -43,6 +43,7 @@ import base64
 from datetime import datetime
 from io import BytesIO
 from evaluation_debug_utils import (
+    apply_episode_validity,
     append_record_to_json_array_file,
     build_episode_multi_goal_lookup,
     build_topdown_goal_display_settings,
@@ -806,6 +807,10 @@ class VLNEvaluator:
 
                 process_bar.update(1)
                 metrics = env.get_metrics()
+                metrics, episode_invalid, episode_invalid_reason = apply_episode_validity(
+                    metrics,
+                    self.model,
+                )
                 if should_save_video:
                     images_to_video(
                         vis_frames,
@@ -854,6 +859,8 @@ class VLNEvaluator:
                     "os": metrics['oracle_success'],
                     "ne": metrics["distance_to_goal"],
                     "steps": step_id,
+                    "episode_invalid": episode_invalid,
+                    "episode_invalid_reason": episode_invalid_reason,
                     "episode_instruction": episode_instruction,
                     "action_normalized": self.current_episode_normalized
                 }

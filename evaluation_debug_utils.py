@@ -148,6 +148,20 @@ def format_episode_progress_line(
     return " ".join(parts)
 
 
+def apply_episode_validity(
+    metrics: Dict[str, Any],
+    model: Any,
+) -> tuple[Dict[str, Any], bool, str]:
+    normalized = dict(metrics)
+    episode_invalid = bool(getattr(model, "episode_invalid", False))
+    reason = str(getattr(model, "episode_invalid_reason", "") or "")
+    if episode_invalid:
+        normalized["success"] = 0.0
+        normalized["spl"] = 0.0
+        normalized["oracle_success"] = 0.0
+    return normalized, episode_invalid, reason
+
+
 def extract_multi_goal_positions(episode: Dict[str, Any]) -> List[List[float]]:
     positions: List[List[float]] = []
     for goal_item in episode.get("multi_goals", []):

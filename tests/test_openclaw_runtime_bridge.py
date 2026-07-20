@@ -114,6 +114,31 @@ class RecordingPlanner:
         return self.decision
 
 
+def route_v2_decision(**overrides):
+    arguments = {
+        "action_text": "TURN_LEFT",
+        "confidence": 0.8,
+        "visual_summary": "The billiard table is clearly visible on the left.",
+        "progress_state": "following route",
+        "route_stage": "intermediate_landmark",
+        "confirmed_landmarks": ["billiard table"],
+        "current_target": "window",
+        "target_relation": "ahead",
+        "stop_evidence": "none",
+        "semantic_stop_state": "not_ready",
+        "reason": "continue",
+    }
+    arguments.update(overrides)
+    return OpenClawPlanDecision(
+        intent="act",
+        tool_name="QwenDirectPolicy",
+        arguments=arguments,
+        reason=str(arguments["reason"]),
+        planner_backend="gateway",
+        runtime_metadata={"context_audit": {"qwen_output_json_valid": True}},
+    )
+
+
 class SequencePlanner:
     def __init__(self, decisions):
         self.decisions = list(decisions)
@@ -504,6 +529,380 @@ def test_qwen_direct_runtime_marks_waypoint_passed_after_two_effective_forwards(
         "effective_forward_after_seen"
     ] == 2
     assert result.runtime_metadata["route_progress"] == route_progress
+
+
+def test_dynamic_visual_registry_records_previous_executed_action_and_resets():
+    planner = RecordingPlanner(route_v2_decision())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+
+    runtime.step(
+        make_pose_state(step_id=0, position=(0, 0, 0)),
+        payload={"current_image_path": "/tmp/frame0.png"},
+    )
+    runtime.step(
+        make_pose_state(
+            step_id=1,
+            position=(0, 0, 0),
+            rotation=(0.9238795, 0.0, 0.3826834, 0.0),
+            last_action="TURN_LEFT",
+        ),
+        payload={"current_image_path": "/tmp/frame1.png"},
+    )
+
+    records = planner.payloads[1]["visual_evidence_registry"]
+    assert records[-1]["step_id"] == 1
+    assert records[-1]["previous_executed_action"] == "TURN_LEFT"
+    assert records[-1]["heading_deg"] == pytest.approx(45.0)
+
+    runtime.reset_episode("scene", "episode-2")
+    planner.payloads.clear()
+    new_episode_state = make_pose_state(step_id=0, position=(0, 0, 0))
+    new_episode_state.episode_id = "episode-2"
+    runtime.step(
+        new_episode_state,
+        payload={"current_image_path": "/tmp/new-frame.png"},
+    )
+
+    assert [record["image_path"] for record in planner.payloads[0]["visual_evidence_registry"]] == [
+        "/tmp/new-frame.png"
+    ]
+
+
+def test_dynamic_visual_registry_assigns_stall_anchor_and_signed_scan_roles():
+    planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+
+    states = [
+        make_pose_state(step_id=0, position=(0, 0, 0)),
+        make_pose_state(
+            step_id=1,
+            position=(0, 0, 0),
+            last_action="MOVE_FORWARD",
+        ),
+        make_pose_state(
+            step_id=2,
+            position=(0, 0, 0),
+            rotation=(0.9238795, 0.0, 0.3826834, 0.0),
+            last_action="TURN_LEFT",
+        ),
+        make_pose_state(
+            step_id=3,
+            position=(0, 0, 0),
+            rotation=(0.9238795, 0.0, -0.3826834, 0.0),
+            last_action="TURN_RIGHT",
+        ),
+    ]
+    for index, state in enumerate(states):
+        runtime.step(
+            state,
+            payload={
+                "current_image_path": f"/tmp/frame{index}.png",
+                "motion_feedback_enabled": True,
+            },
+        )
+
+    records = planner.payloads[-1]["visual_evidence_registry"]
+    roles_by_path = {record["image_path"]: record["roles"] for record in records}
+    assert "stuck_before_keyframe" in roles_by_path["/tmp/frame0.png"]
+    assert "center_scan" in roles_by_path["/tmp/frame1.png"]
+    assert "left_scan" in roles_by_path["/tmp/frame2.png"]
+    assert "right_scan" in roles_by_path["/tmp/frame3.png"]
+
+
+def test_dynamic_visual_turn_loop_recovery_collects_scans_and_clears_after_forward_progress():
+    planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    actions = [
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+    ]
+    rotations = [
+        (1.0, 0.0, 0.0, 0.0),
+        (0.9238795, 0.0, 0.3826834, 0.0),
+        (0.9238795, 0.0, -0.3826834, 0.0),
+        (0.9238795, 0.0, 0.3826834, 0.0),
+        (0.9238795, 0.0, -0.3826834, 0.0),
+        (0.9238795, 0.0, 0.3826834, 0.0),
+        (1.0, 0.0, 0.0, 0.0),
+        (0.9238795, 0.0, 0.3826834, 0.0),
+        (0.9238795, 0.0, -0.3826834, 0.0),
+    ]
+
+    for step_id, rotation in enumerate(rotations):
+        runtime.step(
+            make_pose_state(
+                step_id=step_id,
+                position=(0.0, 0.0, 0.0),
+                rotation=rotation,
+                last_action=actions[step_id - 1] if step_id else None,
+            ),
+            payload={
+                "current_image_path": f"/tmp/turn-loop-{step_id}.png",
+                "recent_actions": actions[:step_id],
+                "forward_stall_odometry_enabled": True,
+            },
+        )
+
+    recovery_payload = planner.payloads[-1]
+    assert recovery_payload["turn_loop_recovery_active"] is True
+    assert recovery_payload["visual_recovery_reason"] == "turn_loop"
+    assert recovery_payload["visual_recovery_phase"] == "choose_escape"
+    assert recovery_payload["turn_loop_feedback"]["translation_span_m"] == 0.0
+    assert recovery_payload["turn_loop_feedback"]["turn_count"] >= 6
+    roles_by_path = {
+        record["image_path"]: record["roles"]
+        for record in recovery_payload["visual_evidence_registry"]
+    }
+    assert any("stuck_before_keyframe" in roles for roles in roles_by_path.values())
+    assert any("left_scan" in roles for roles in roles_by_path.values())
+    assert any("right_scan" in roles for roles in roles_by_path.values())
+
+    runtime.step(
+        make_pose_state(
+            step_id=9,
+            position=(0.0, 0.0, 0.25),
+            rotation=rotations[-1],
+            last_action="MOVE_FORWARD",
+        ),
+        payload={
+            "current_image_path": "/tmp/turn-loop-9.png",
+            "recent_actions": actions + ["MOVE_FORWARD"],
+            "forward_stall_odometry_enabled": True,
+        },
+    )
+
+    cleared_payload = planner.payloads[-1]
+    assert cleared_payload["turn_loop_recovery_active"] is False
+    assert cleared_payload["visual_recovery_active"] is False
+    assert "turn_loop_feedback" not in cleared_payload
+
+
+def test_turn_loop_recovery_does_not_force_missing_directional_scans():
+    planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    state = make_pose_state(step_id=8, position=(0.0, 0.0, 0.0))
+    episode_state = runtime._qwen_direct_state_for_episode(state)
+    episode_state["visual_evidence_registry"] = [
+        {
+            "step_id": 8,
+            "image_path": "/tmp/center.png",
+            "heading_deg": 0.0,
+            "roles": [],
+        }
+    ]
+    episode_state["visual_recovery"] = {
+        "reason": "turn_loop",
+        "stuck_before_path": "/tmp/before.png",
+        "center_path": "/tmp/center.png",
+        "anchor_heading_deg": 0.0,
+        "anchor_step_id": 8,
+        "turn_count": 7,
+        "left_turn_count": 5,
+        "right_turn_count": 2,
+        "forward_count": 0,
+        "translation_span_m": 0.0,
+    }
+    payload = {"current_image_path": "/tmp/center.png"}
+
+    runtime._attach_visual_evidence_registry(state, payload)
+
+    assert payload["turn_loop_recovery_active"] is True
+    assert payload["visual_recovery_phase"] == "choose_escape"
+    assert payload["turn_loop_feedback"]["missing_scan_roles"] == []
+    assert "committed_turn" not in payload["turn_loop_feedback"]
+
+
+def test_dynamic_visual_turn_loop_recovery_ignores_required_same_direction_turn_round():
+    planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    actions = ["TURN_LEFT"] * 8
+    instruction = "Turn around and walk past the table."
+
+    for step_id in range(9):
+        runtime.step(
+            make_pose_state(
+                step_id=step_id,
+                position=(0.0, 0.0, 0.0),
+                last_action=actions[step_id - 1] if step_id else None,
+                instruction=instruction,
+            ),
+            payload={
+                "current_image_path": f"/tmp/turn-round-{step_id}.png",
+                "recent_actions": actions[:step_id],
+                "forward_stall_odometry_enabled": True,
+            },
+        )
+
+    assert planner.payloads[-1]["route_progress"]["turn_round_required"] is True
+    assert planner.payloads[-1]["turn_loop_recovery_active"] is False
+    assert planner.payloads[-1]["visual_recovery_active"] is False
+
+
+def test_dynamic_visual_turn_loop_recovery_ignores_turns_with_translation():
+    planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    actions = [
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+    ]
+
+    for step_id in range(7):
+        runtime.step(
+            make_pose_state(
+                step_id=step_id,
+                position=(0.0, 0.0, step_id * 0.1),
+                last_action=actions[step_id - 1] if step_id else None,
+            ),
+            payload={
+                "current_image_path": f"/tmp/moving-turn-{step_id}.png",
+                "recent_actions": actions[:step_id],
+                "forward_stall_odometry_enabled": True,
+            },
+        )
+
+    assert planner.payloads[-1]["turn_loop_recovery_active"] is False
+    assert planner.payloads[-1]["visual_recovery_active"] is False
+
+
+def test_dynamic_visual_registry_promotes_only_schema_valid_positive_semantics():
+    valid = route_v2_decision()
+    invalid = route_v2_decision(
+        visual_summary="The billiard table is not visible.",
+        confirmed_landmarks=["billiard table"],
+    )
+    invalid.runtime_metadata = {"context_audit": {"qwen_output_json_valid": False}}
+    planner = SequencePlanner([valid, invalid, valid])
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    instruction = "walk past the billiard table and stop by the window"
+
+    for step_id in range(3):
+        runtime.step(
+            make_pose_state(step_id=step_id, position=(0, 0, step_id * 0.25), instruction=instruction),
+            payload={"current_image_path": f"/tmp/semantic{step_id}.png"},
+        )
+
+    second_call_records = planner.payloads[1]["visual_evidence_registry"]
+    first = next(record for record in second_call_records if record["step_id"] == 0)
+    assert "confirmed_landmark" in first["roles"]
+    assert first["confirmed_landmarks"] == ["billiard table"]
+    assert first["capture_route_stage"] == "intermediate_landmark"
+    assert first["capture_current_target"] == "window"
+    third_call_records = planner.payloads[2]["visual_evidence_registry"]
+    second = next(record for record in third_call_records if record["step_id"] == 1)
+    assert "confirmed_landmark" not in second["roles"]
+
+
+def test_dynamic_visual_registry_is_bounded_to_32_records():
+    planner = RecordingPlanner(route_v2_decision(confirmed_landmarks=[]))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+
+    for step_id in range(35):
+        runtime.step(
+            make_pose_state(step_id=step_id, position=(0, 0, step_id * 0.25)),
+            payload={"current_image_path": f"/tmp/cap{step_id}.png"},
+        )
+
+    records = planner.payloads[-1]["visual_evidence_registry"]
+    assert len(records) == 32
+    assert records[-1]["image_path"] == "/tmp/cap34.png"
+
+
+def test_dynamic_visual_registry_tracks_promoted_keyframe_path_with_semantic_provenance():
+    planner = RecordingPlanner(route_v2_decision())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    state = make_pose_state(step_id=0, position=(0, 0, 0))
+    payload = {"current_image_path": "/tmp/current.png"}
+
+    runtime._record_visual_evidence_frame(state, payload)
+    runtime._promote_visual_semantic_evidence(state, payload, route_v2_decision())
+    runtime._record_promoted_keyframe_evidence(
+        state,
+        payload,
+        {
+            "promotion_status": "promoted",
+            "promoted_image_path": "/tmp/promoted.png",
+        },
+    )
+    runtime._attach_visual_evidence_registry(state, payload)
+
+    promoted = next(
+        record
+        for record in payload["visual_evidence_registry"]
+        if record["image_path"] == "/tmp/promoted.png"
+    )
+    assert "keyframe" in promoted["roles"]
+    assert promoted["capture_route_stage"] == "intermediate_landmark"
+    assert promoted["capture_current_target"] == "window"
+    assert promoted["confirmed_landmarks"] == ["billiard table"]
+
+
+def test_signed_heading_delta_handles_wraparound():
+    assert OpenClawVLNRuntime._signed_heading_delta(170.0, -170.0) == pytest.approx(20.0)
+    assert OpenClawVLNRuntime._signed_heading_delta(-170.0, 170.0) == pytest.approx(-20.0)
 
 
 def test_qwen_direct_runtime_keeps_turn_round_completion_after_further_rotation():

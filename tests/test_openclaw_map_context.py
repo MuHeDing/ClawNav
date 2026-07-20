@@ -63,11 +63,61 @@ def test_floorplan_map_context_writes_only_on_interval_steps(tmp_path):
     )
     assert middle["map_frame_due"] is False
     assert middle["map_available"] is False
-    assert "internal_only" not in middle
+    assert middle["cached_map_available"] is True
+    assert middle["map_age_steps"] == 1
+    assert middle["internal_only"]["map_image_path"] == first["internal_only"]["map_image_path"]
     assert next_due["internal_only"]["map_image_path"].endswith("step_000005.png")
     assert len(calls) == 2
     assert (tmp_path / "openclaw_map_frames" / "scene_a" / "ep_1" / "step_000000.png").exists()
     assert (tmp_path / "openclaw_map_frames" / "scene_a" / "ep_1" / "step_000005.png").exists()
+
+
+def test_floorplan_map_context_forces_local_refresh_during_turn_loop_recovery(tmp_path):
+    calls = []
+
+    def renderer(**kwargs):
+        calls.append(kwargs)
+        return b"fake-local-map"
+
+    provider = FloorplanMapContextProvider(
+        output_root=tmp_path,
+        mode=MAP_ASSIST_FLOORPLAN,
+        frame_interval_steps=5,
+        renderer=renderer,
+    )
+
+    provider.build_context(
+        env=SimpleNamespace(),
+        state=fake_state((0.0, 0.0, 0.0)),
+        step_id=0,
+        scene_id="scene-a",
+        episode_id="episode-1",
+    )
+    recovery = provider.build_context(
+        env=SimpleNamespace(),
+        state=fake_state((0.0, 0.0, 0.0)),
+        step_id=1,
+        scene_id="scene-a",
+        episode_id="episode-1",
+        local_focus=True,
+    )
+
+    assert recovery["map_frame_due"] is True
+    assert recovery["map_interval_due"] is False
+    assert recovery["map_view_scope"] == "local_recovery"
+    assert recovery["map_refresh_reason"] == "turn_loop_recovery"
+    assert recovery["internal_only"]["map_image_path"].endswith("step_000001.png")
+    resumed = provider.build_context(
+        env=SimpleNamespace(),
+        state=fake_state((0.25, 0.0, 0.0)),
+        step_id=2,
+        scene_id="scene-a",
+        episode_id="episode-1",
+    )
+    assert resumed["map_frame_due"] is True
+    assert resumed["map_view_scope"] == "global"
+    assert resumed["map_refresh_reason"] == "recovery_exit_global"
+    assert len(calls) == 3
 
 
 def test_floorplan_map_context_records_non_oracle_safety_contract(tmp_path):

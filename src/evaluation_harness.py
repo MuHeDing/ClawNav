@@ -174,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=env_bool("OPENCLAW_MAP_COLLISION_OVERLAY_ENABLED", False),
     )
+    parser.add_argument(
+        "--dynamic_visual_context_enabled",
+        action="store_true",
+        default=env_bool("OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED", False),
+    )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
     parser.add_argument("--openclaw_service_registry_path", type=str, default="")
@@ -261,6 +266,11 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         motion_feedback_enabled=args.motion_feedback_enabled,
         forward_stall_odometry_enabled=args.forward_stall_odometry_enabled,
         map_collision_overlay_enabled=args.map_collision_overlay_enabled,
+        dynamic_visual_context_enabled=getattr(
+            args,
+            "dynamic_visual_context_enabled",
+            False,
+        ),
         harness_runtime=args.harness_runtime,
         openclaw_workspace_path=args.openclaw_workspace_path,
         openclaw_service_registry_path=args.openclaw_service_registry_path,
@@ -403,6 +413,7 @@ def build_harness_components(
             keyframe_episode_cap=config.keyframe_episode_cap,
             keyframe_coverage_gap_steps=config.keyframe_coverage_gap_steps,
             keyframe_debug_save_all_eligible=config.keyframe_debug_save_all_eligible,
+            dynamic_visual_context_enabled=config.dynamic_visual_context_enabled,
         )
     logger = HarnessLogger(
         output_path / "harness_traces",
@@ -439,11 +450,14 @@ class HarnessModelProxy:
         )
         self.save_video_ratio = float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
         self.last_action_text = None
+        self.episode_invalid = False
+        self.episode_invalid_reason = ""
         self.current_scene_id = ""
         self.current_episode_id = ""
         self.recent_keyframe_paths = []
         self._pending_env_state = None
         self._pending_map_context = None
+        self._map_local_recovery_active = False
         self._init_map_context_provider()
         self._episode_video_writer = None
         self._episode_save_video = False
@@ -461,9 +475,15 @@ class HarnessModelProxy:
         self.current_scene_id = str(scene_id or "")
         self.current_episode_id = str(episode_id or "")
         self.last_action_text = None
+        self.episode_invalid = False
+        self.episode_invalid_reason = ""
         self.recent_keyframe_paths = []
         self._pending_env_state = None
         self._pending_map_context = None
+        self._map_local_recovery_active = False
+        runtime = self.components.get("openclaw_runtime")
+        if runtime is not None and hasattr(runtime, "reset_episode"):
+            runtime.reset_episode(self.current_scene_id, self.current_episode_id)
         self._reset_map_context_provider()
         self._episode_save_video = self.save_video and (
             random.random() < self.save_video_ratio
@@ -520,6 +540,7 @@ class HarnessModelProxy:
                 self._runtime_payload(images, step_id),
             )
             action_text = runtime_result.action_text if runtime_result.ok else "STOP"
+            self._remember_map_recovery_from_runtime(runtime_result)
             self._remember_promoted_keyframe_from_runtime(runtime_result)
             self.last_action_text = action_text
             self._append_working_memory(images, action_text)
@@ -547,6 +568,9 @@ class HarnessModelProxy:
             "policy_action": self.last_action_text,
             "run_id": str(self.components.get("output_path") or ""),
             "keyframe_policy_mode": self.components["config"].keyframe_policy_mode,
+            "dynamic_visual_context_enabled": self.components[
+                "config"
+            ].dynamic_visual_context_enabled,
         }
         keyframe_target_path = self._keyframe_target_path(current_image, step_id)
         payload["keyframe_target_path"] = keyframe_target_path
@@ -613,6 +637,7 @@ class HarnessModelProxy:
                 step_id=step_id,
                 scene_id=self.current_scene_id or getattr(state, "scene_id", ""),
                 episode_id=self.current_episode_id or getattr(state, "episode_id", ""),
+                local_focus=bool(self._map_local_recovery_active),
             )
         except Exception as exc:
             self._pending_map_context = {
@@ -642,6 +667,13 @@ class HarnessModelProxy:
                 "rgb_plus_privileged_floorplan_pose",
             )
             payload["map_context"] = dict(map_context)
+
+    def _remember_map_recovery_from_runtime(self, runtime_result: Any) -> None:
+        metadata = getattr(runtime_result, "runtime_metadata", {}) or {}
+        self._map_local_recovery_active = bool(
+            isinstance(metadata, dict)
+            and metadata.get("turn_loop_recovery_active") is True
+        )
 
     def _attach_structured_runtime_context(
         self,
@@ -943,10 +975,13 @@ class QwenDirectPolicyProxy:
         self.model = _InertQwenDirectBackbone()
         self.components = components
         self.last_action_text = None
+        self.episode_invalid = False
+        self.episode_invalid_reason = ""
         self.current_scene_id = ""
         self.current_episode_id = ""
         self._pending_env_state = None
         self._pending_map_context = None
+        self._map_local_recovery_active = False
         self._episode_video_writer = None
         self._episode_save_video = False
         self._episode_video_disabled = False
@@ -982,6 +1017,9 @@ class QwenDirectPolicyProxy:
     _reset_map_context_provider = HarnessModelProxy._reset_map_context_provider
     _update_pending_map_context = HarnessModelProxy._update_pending_map_context
     _attach_map_context_to_payload = HarnessModelProxy._attach_map_context_to_payload
+    _remember_map_recovery_from_runtime = (
+        HarnessModelProxy._remember_map_recovery_from_runtime
+    )
     _build_proxy_state = HarnessModelProxy._build_proxy_state
     _proxy_safe_diagnostics = HarnessModelProxy._proxy_safe_diagnostics
     _append_working_memory = HarnessModelProxy._append_working_memory
@@ -995,7 +1033,14 @@ class QwenDirectPolicyProxy:
             state,
             self._runtime_payload(images, step_id),
         )
+        runtime_metadata = dict(runtime_result.runtime_metadata or {})
+        if runtime_metadata.get("episode_invalid"):
+            self.episode_invalid = True
+            self.episode_invalid_reason = str(
+                runtime_metadata.get("qwen_failure_reason") or "qwen_direct_policy_abort"
+        )
         action_text = runtime_result.action_text if runtime_result.ok else "STOP"
+        self._remember_map_recovery_from_runtime(runtime_result)
         self._remember_promoted_keyframe_from_runtime(runtime_result)
         self.last_action_text = action_text
         self._append_working_memory(images, action_text)

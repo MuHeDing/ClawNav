@@ -53,6 +53,11 @@ OPENCLAW_CLI_MODEL_FALLBACK_REASON_PREFIX = "openclaw_cli_model_fallback:"
 QWEN_DIRECT_POLICY_BACKEND = "qwen_direct"
 ODOMETRY_PROGRESS_THRESHOLD_M = 0.05
 ODOMETRY_TURN_PROGRESS_THRESHOLD_DEG = 5.0
+TURN_LOOP_WINDOW_STEPS = 8
+TURN_LOOP_MIN_TURNS = 6
+TURN_LOOP_SAME_DIRECTION_TURNS = 8
+TURN_LOOP_MAX_FORWARD_ACTIONS = 1
+TURN_LOOP_MAX_TRANSLATION_SPAN_M = 0.35
 
 
 @dataclass
@@ -87,6 +92,7 @@ class OpenClawVLNRuntime:
         keyframe_episode_cap: int = 64,
         keyframe_coverage_gap_steps: int = 20,
         keyframe_debug_save_all_eligible: bool = False,
+        dynamic_visual_context_enabled: bool = False,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
@@ -107,6 +113,11 @@ class OpenClawVLNRuntime:
         self.context_engines: Dict[str, MemoryAwareContextEngine] = {}
         self.qwen_direct_episode_state: Dict[str, Dict[str, Any]] = {}
         self.odometry_episode_state: Dict[str, Dict[str, Any]] = {}
+        self.dynamic_visual_context_enabled = bool(dynamic_visual_context_enabled)
+
+    def reset_episode(self, scene_id: str = "", episode_id: str = "") -> None:
+        self.qwen_direct_episode_state.clear()
+        self.odometry_episode_state.clear()
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -139,6 +150,9 @@ class OpenClawVLNRuntime:
             )
 
         self._attach_pre_planner_local_control_context(state, runtime_payload)
+        if self._dynamic_visual_context_active(runtime_payload):
+            self._record_visual_evidence_frame(state, runtime_payload)
+            self._attach_visual_evidence_registry(state, runtime_payload)
         image_paths_used = self._image_paths_used(runtime_payload)
         try:
             decision = self.planner.plan(state, runtime_context=runtime_payload)
@@ -285,6 +299,12 @@ class OpenClawVLNRuntime:
 
         planned_action_text = self._planned_action_text(decision.arguments)
         if self.policy_backend == QWEN_DIRECT_POLICY_BACKEND:
+            self._promote_visual_semantic_evidence(
+                state,
+                runtime_payload,
+                decision,
+            )
+            self._attach_visual_evidence_registry(state, runtime_payload)
             self._record_qwen_direct_observation(state, decision.arguments)
             self._attach_route_progress_context(state, runtime_payload)
             gate_context = self._qwen_direct_gate_context(
@@ -309,6 +329,12 @@ class OpenClawVLNRuntime:
                     )
                     decision = requery_decision
                     self._merge_planner_visual_observations(runtime_payload, decision)
+                    self._promote_visual_semantic_evidence(
+                        state,
+                        requery_payload,
+                        decision,
+                    )
+                    self._attach_visual_evidence_registry(state, requery_payload)
                     self._record_qwen_direct_observation(state, decision.arguments)
                     self._attach_route_progress_context(state, requery_payload)
                     gate_context = self._qwen_direct_gate_context(
@@ -346,6 +372,11 @@ class OpenClawVLNRuntime:
             )
             if keyframe_gate:
                 metadata["keyframe_gate"] = keyframe_gate
+                self._record_promoted_keyframe_evidence(
+                    state,
+                    runtime_payload,
+                    keyframe_gate,
+                )
             if planner_error:
                 metadata["planner_error"] = planner_error
             metadata["planner_fallback"] = planner_fallback
@@ -532,6 +563,60 @@ class OpenClawVLNRuntime:
             "image_path": image_path,
             "keyframe_gate": dict(gate),
         }
+
+    def _record_promoted_keyframe_evidence(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        gate: Dict[str, Any],
+    ) -> None:
+        if not self._dynamic_visual_context_active(runtime_payload):
+            return
+        if gate.get("promotion_status") != "promoted":
+            return
+        promoted_path = str(
+            gate.get("promoted_image_path")
+            or gate.get("keyframe_target_path")
+            or ""
+        )
+        current_path = str(runtime_payload.get("current_image_path") or "")
+        if not promoted_path or not current_path:
+            return
+        episode_state = self._qwen_direct_state_for_episode(state)
+        records = episode_state.get("visual_evidence_registry")
+        if not isinstance(records, list):
+            return
+        source = next(
+            (
+                record
+                for record in reversed(records)
+                if isinstance(record, dict) and record.get("image_path") == current_path
+            ),
+            None,
+        )
+        if not isinstance(source, dict):
+            return
+        promoted = dict(source)
+        promoted["image_path"] = promoted_path
+        promoted["keyframe"] = True
+        promoted["roles"] = sorted(
+            {
+                str(role)
+                for role in source.get("roles") or []
+                if isinstance(role, str) and role
+            }
+            | {"keyframe"}
+        )
+        records[:] = [
+            record
+            for record in records
+            if not (
+                isinstance(record, dict)
+                and record.get("image_path") == promoted_path
+            )
+        ]
+        records.append(promoted)
+        self._evict_visual_evidence_records(episode_state)
 
     def _qwen_direct_should_requery_gate(
         self,
@@ -1141,6 +1226,15 @@ class OpenClawVLNRuntime:
             ):
                 if key in route_progress:
                     metadata[f"route_progress_{key}"] = route_progress[key]
+        for key in (
+            "visual_recovery_active",
+            "visual_recovery_reason",
+            "visual_recovery_phase",
+            "turn_loop_recovery_active",
+            "turn_loop_feedback",
+        ):
+            if key in runtime_context:
+                metadata[key] = runtime_context[key]
         local_control_context = runtime_context.get("local_control_context")
         if not isinstance(local_control_context, dict) or not local_control_context:
             return
@@ -1599,6 +1693,499 @@ class OpenClawVLNRuntime:
         control_context["route_progress"] = route_progress
         runtime_payload["control_context"] = control_context
 
+    def _dynamic_visual_context_active(self, runtime_payload: Dict[str, Any]) -> bool:
+        return self.dynamic_visual_context_enabled or (
+            runtime_payload.get("dynamic_visual_context_enabled") is True
+        )
+
+    def _record_visual_evidence_frame(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+    ) -> None:
+        image_path = str(runtime_payload.get("current_image_path") or "")
+        if not image_path:
+            return
+        episode_state = self._qwen_direct_state_for_episode(state)
+        records = episode_state.setdefault("visual_evidence_registry", [])
+        if not isinstance(records, list):
+            records = []
+            episode_state["visual_evidence_registry"] = records
+        heading_deg = self._heading_deg_for_state(state)
+        previous_action = self._normalize_action_text(state.last_action) or ""
+        keyframe_candidate = runtime_payload.get("keyframe_candidate")
+        keyframe_path = (
+            str(keyframe_candidate.get("image_path") or "")
+            if isinstance(keyframe_candidate, dict)
+            else ""
+        )
+        recent_keyframes = {
+            str(path)
+            for path in runtime_payload.get("recent_keyframe_paths") or []
+            if isinstance(path, str) and path
+        }
+        record = {
+            "step_id": int(state.step_id),
+            "image_path": image_path,
+            "previous_executed_action": previous_action,
+            "heading_deg": self._round_float(heading_deg),
+            "keyframe": image_path == keyframe_path or image_path in recent_keyframes,
+            "roles": [],
+            "confirmed_landmarks": [],
+            "capture_route_stage": "unknown",
+            "capture_current_target": "",
+            "confirmation_basis": "",
+        }
+        records[:] = [
+            existing
+            for existing in records
+            if not (
+                isinstance(existing, dict)
+                and (
+                    existing.get("image_path") == image_path
+                    or existing.get("step_id") == state.step_id
+                )
+            )
+        ]
+        records.append(record)
+        self._record_turn_loop_pose_sample(episode_state, state)
+        self._update_visual_recovery_state(episode_state, records, runtime_payload)
+        self._evict_visual_evidence_records(episode_state)
+
+    def _record_turn_loop_pose_sample(
+        self,
+        episode_state: Dict[str, Any],
+        state: VLNState,
+    ) -> None:
+        pose = self._pose_from_state(state)
+        position = self._numeric_list(pose.get("position")) if isinstance(pose, dict) else None
+        if position is None or len(position) < 3:
+            return
+        samples = episode_state.setdefault("turn_loop_pose_history", [])
+        if not isinstance(samples, list):
+            samples = []
+            episode_state["turn_loop_pose_history"] = samples
+        samples.append(
+            {
+                "step_id": int(state.step_id),
+                "position": position[:3],
+            }
+        )
+        del samples[: max(0, len(samples) - (TURN_LOOP_WINDOW_STEPS + 1))]
+
+    def _update_visual_recovery_state(
+        self,
+        episode_state: Dict[str, Any],
+        records: List[Dict[str, Any]],
+        runtime_payload: Dict[str, Any],
+    ) -> None:
+        current = records[-1] if records else None
+        if not isinstance(current, dict):
+            return
+        local_control = runtime_payload.get("local_control_context")
+        odometry = (
+            local_control.get("odometry")
+            if isinstance(local_control, dict)
+            and isinstance(local_control.get("odometry"), dict)
+            else {}
+        )
+        previous_action = self._normalize_action_text(odometry.get("previous_action"))
+        had_progress = odometry.get("last_action_had_progress")
+        if previous_action == "MOVE_FORWARD" and had_progress is True:
+            episode_state.pop("visual_recovery", None)
+            return
+        if isinstance(episode_state.get("visual_recovery"), dict):
+            return
+        if previous_action == "MOVE_FORWARD" and had_progress is False:
+            if not isinstance(episode_state.get("visual_recovery"), dict):
+                prior = records[-2] if len(records) >= 2 else None
+                episode_state["visual_recovery"] = {
+                    "stuck_before_path": (
+                        str(prior.get("image_path") or "")
+                        if isinstance(prior, dict)
+                        else ""
+                    ),
+                    "center_path": str(current.get("image_path") or ""),
+                    "anchor_heading_deg": current.get("heading_deg"),
+                    "anchor_step_id": current.get("step_id"),
+                    "reason": "forward_stall",
+                }
+            return
+        detection = self._turn_loop_detection(episode_state, runtime_payload)
+        if not detection:
+            return
+        window_start_step = self._nonnegative_int(detection.get("window_start_step_id"))
+        prior = next(
+            (
+                record
+                for record in reversed(records[:-1])
+                if isinstance(record, dict)
+                and self._nonnegative_int(record.get("step_id")) <= window_start_step
+            ),
+            records[-2] if len(records) >= 2 else None,
+        )
+        episode_state["visual_recovery"] = {
+            "stuck_before_path": (
+                str(prior.get("image_path") or "") if isinstance(prior, dict) else ""
+            ),
+            "center_path": str(current.get("image_path") or ""),
+            "anchor_heading_deg": current.get("heading_deg"),
+            "anchor_step_id": current.get("step_id"),
+            "reason": "turn_loop",
+            **detection,
+        }
+
+    def _turn_loop_detection(
+        self,
+        episode_state: Dict[str, Any],
+        runtime_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if runtime_payload.get("forward_stall_odometry_enabled") is not True:
+            return {}
+        recent_actions = runtime_payload.get("recent_actions")
+        if not isinstance(recent_actions, list):
+            return {}
+        tail = [
+            action
+            for action in (
+                self._normalize_action_text(value)
+                for value in recent_actions[-TURN_LOOP_WINDOW_STEPS:]
+            )
+            if action
+        ]
+        if len(tail) < TURN_LOOP_MIN_TURNS:
+            return {}
+        turns = [action for action in tail if action in {"TURN_LEFT", "TURN_RIGHT"}]
+        forward_count = sum(action == "MOVE_FORWARD" for action in tail)
+        if len(turns) < TURN_LOOP_MIN_TURNS or forward_count > TURN_LOOP_MAX_FORWARD_ACTIONS:
+            return {}
+        left_turns = turns.count("TURN_LEFT")
+        right_turns = turns.count("TURN_RIGHT")
+        oscillating = left_turns >= 2 and right_turns >= 2
+        same_direction_spin = (
+            len(turns) >= TURN_LOOP_SAME_DIRECTION_TURNS
+            and (left_turns == 0 or right_turns == 0)
+        )
+        route_progress = runtime_payload.get("route_progress")
+        legitimate_turn_round = (
+            isinstance(route_progress, dict)
+            and route_progress.get("turn_round_required") is True
+            and route_progress.get("turn_round_completed") is not True
+            and not oscillating
+        )
+        if legitimate_turn_round or not (oscillating or same_direction_spin):
+            return {}
+        samples = episode_state.get("turn_loop_pose_history")
+        if not isinstance(samples, list) or len(samples) < TURN_LOOP_MIN_TURNS:
+            return {}
+        window = [sample for sample in samples[-(len(tail) + 1):] if isinstance(sample, dict)]
+        positions = [
+            self._numeric_list(sample.get("position"))
+            for sample in window
+        ]
+        positions = [position for position in positions if position is not None and len(position) >= 3]
+        if len(positions) < TURN_LOOP_MIN_TURNS:
+            return {}
+        x_values = [position[0] for position in positions]
+        z_values = [position[2] for position in positions]
+        translation_span = math.hypot(
+            max(x_values) - min(x_values),
+            max(z_values) - min(z_values),
+        )
+        if translation_span > TURN_LOOP_MAX_TRANSLATION_SPAN_M:
+            return {}
+        return {
+            "window_start_step_id": self._nonnegative_int(window[0].get("step_id")),
+            "turn_count": len(turns),
+            "left_turn_count": left_turns,
+            "right_turn_count": right_turns,
+            "forward_count": forward_count,
+            "translation_span_m": self._round_float(translation_span),
+        }
+
+    def _attach_visual_evidence_registry(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+    ) -> None:
+        if not self._dynamic_visual_context_active(runtime_payload):
+            return
+        episode_state = self._qwen_direct_state_for_episode(state)
+        records = episode_state.get("visual_evidence_registry")
+        if not isinstance(records, list):
+            runtime_payload["visual_evidence_registry"] = []
+            return
+        role_paths = self._visual_role_paths(episode_state, records)
+        current_path = str(runtime_payload.get("current_image_path") or "")
+        serialized: List[Dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            path = str(record.get("image_path") or "")
+            roles = {
+                str(role)
+                for role in record.get("roles") or []
+                if isinstance(role, str) and role
+            }
+            if record.get("keyframe"):
+                roles.add("keyframe")
+            if path == current_path:
+                roles.add("current")
+            for role, role_path in role_paths.items():
+                if path and path == role_path:
+                    roles.add(role)
+            item = dict(record)
+            item["roles"] = sorted(roles)
+            serialized.append(item)
+        runtime_payload["visual_evidence_registry"] = serialized
+        recovery = episode_state.get("visual_recovery")
+        recovery_active = isinstance(recovery, dict)
+        runtime_payload["visual_recovery_active"] = recovery_active
+        runtime_payload["turn_loop_recovery_active"] = bool(
+            recovery_active and recovery.get("reason") == "turn_loop"
+        )
+        if not recovery_active:
+            return
+        reason = str(recovery.get("reason") or "")
+        runtime_payload["visual_recovery_reason"] = reason
+        requested_scan_roles = [] if reason == "turn_loop" else ["left_scan", "right_scan"]
+        missing_scan_roles = [
+            role for role in requested_scan_roles if not role_paths.get(role)
+        ]
+        phase = "collect_scans" if missing_scan_roles else "choose_escape"
+        runtime_payload["visual_recovery_phase"] = phase
+        if reason != "turn_loop":
+            return
+        feedback = {
+            "reason": "repeated turning with insufficient translation",
+            "phase": phase,
+            "missing_scan_roles": missing_scan_roles,
+            "turn_count": self._nonnegative_int(recovery.get("turn_count")),
+            "left_turn_count": self._nonnegative_int(recovery.get("left_turn_count")),
+            "right_turn_count": self._nonnegative_int(recovery.get("right_turn_count")),
+            "forward_count": self._nonnegative_int(recovery.get("forward_count")),
+            "translation_span_m": self._round_float(
+                self._float_or_none(recovery.get("translation_span_m"))
+            ),
+            "recovery_goal": (
+                "Use the current RGB, local map, and any already available scans to "
+                "choose one visibly open escape direction. Do not alternate turns just "
+                "to collect missing scans; move forward once the open path is aligned."
+            ),
+        }
+        runtime_payload["turn_loop_feedback"] = feedback
+        control_context = runtime_payload.get("control_context")
+        if not isinstance(control_context, dict):
+            control_context = {}
+        else:
+            control_context = dict(control_context)
+        control_context["turn_loop_feedback"] = feedback
+        control_context["force_visual_refresh"] = True
+        runtime_payload["control_context"] = control_context
+
+    def _visual_role_paths(
+        self,
+        episode_state: Dict[str, Any],
+        records: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        recovery = episode_state.get("visual_recovery")
+        if not isinstance(recovery, dict):
+            return {}
+        role_paths = {
+            "stuck_before_keyframe": str(recovery.get("stuck_before_path") or ""),
+            "center_scan": str(recovery.get("center_path") or ""),
+        }
+        anchor_heading = self._float_or_none(recovery.get("anchor_heading_deg"))
+        if anchor_heading is None:
+            return role_paths
+        directional: Dict[str, List[tuple[float, int, str]]] = {
+            "left_scan": [],
+            "right_scan": [],
+        }
+        anchor_step = self._nonnegative_int(recovery.get("anchor_step_id"))
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            step_id = self._nonnegative_int(record.get("step_id"))
+            if step_id <= anchor_step:
+                continue
+            heading = self._float_or_none(record.get("heading_deg"))
+            if heading is None:
+                continue
+            delta = self._signed_heading_delta(anchor_heading, heading)
+            if not 15.0 <= abs(delta) <= 90.0:
+                continue
+            role = "left_scan" if delta > 0 else "right_scan"
+            directional[role].append(
+                (abs(abs(delta) - 45.0), -step_id, str(record.get("image_path") or ""))
+            )
+        for role, candidates in directional.items():
+            if candidates:
+                role_paths[role] = min(candidates)[2]
+        return role_paths
+
+    def _promote_visual_semantic_evidence(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        decision: Any,
+    ) -> None:
+        if not self._dynamic_visual_context_active(runtime_payload):
+            return
+        runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        context_audit = (
+            runtime_metadata.get("context_audit")
+            if isinstance(runtime_metadata, dict)
+            else {}
+        )
+        if not isinstance(context_audit, dict) or context_audit.get(
+            "qwen_output_json_valid"
+        ) is not True:
+            return
+        arguments = getattr(decision, "arguments", {}) or {}
+        if not isinstance(arguments, dict):
+            return
+        image_path = str(runtime_payload.get("current_image_path") or "")
+        episode_state = self._qwen_direct_state_for_episode(state)
+        records = episode_state.get("visual_evidence_registry")
+        if not isinstance(records, list):
+            return
+        current_record = next(
+            (
+                record
+                for record in reversed(records)
+                if isinstance(record, dict) and record.get("image_path") == image_path
+            ),
+            None,
+        )
+        if not isinstance(current_record, dict):
+            return
+        visual_summary = self._bounded_metadata_text(
+            arguments.get("visual_summary"),
+            limit=240,
+        )
+        confirmed = arguments.get("confirmed_landmarks")
+        if not isinstance(confirmed, list):
+            confirmed = []
+        positive_landmarks = []
+        for landmark in confirmed[:8]:
+            normalized = self._normalize_semantic_text(landmark, 80)
+            if not normalized:
+                continue
+            if self.qwen_direct_gates.classify_waypoint_observation(
+                visual_summary,
+                normalized,
+            ) == "positive":
+                positive_landmarks.append(normalized)
+        route_stage = self._normalize_semantic_text(arguments.get("route_stage"), 40)
+        if route_stage not in {
+            "start",
+            "en_route",
+            "intermediate_landmark",
+            "post_landmark_transition",
+            "approaching_target",
+            "verifying_target",
+            "complete",
+            "unknown",
+        }:
+            route_stage = "unknown"
+        current_target = self._normalize_semantic_text(arguments.get("current_target"), 120)
+        current_record["capture_route_stage"] = route_stage
+        current_record["capture_current_target"] = current_target
+        roles = {
+            str(role)
+            for role in current_record.get("roles") or []
+            if isinstance(role, str)
+        }
+        if positive_landmarks:
+            self._replace_latest_semantic_role(records, "confirmed_landmark")
+            roles.add("confirmed_landmark")
+            current_record["confirmed_landmarks"] = positive_landmarks
+            current_record["confirmation_basis"] = "schema_valid_positive_visual_summary"
+        if current_target and self.qwen_direct_gates.classify_waypoint_observation(
+            visual_summary,
+            current_target,
+        ) == "positive":
+            self._replace_latest_semantic_role(records, "target_candidate")
+            roles.add("target_candidate")
+            if not current_record.get("confirmation_basis"):
+                current_record["confirmation_basis"] = "schema_valid_target_candidate"
+        current_record["roles"] = sorted(roles)
+        self._evict_visual_evidence_records(episode_state)
+
+    @staticmethod
+    def _replace_latest_semantic_role(
+        records: List[Dict[str, Any]],
+        role: str,
+    ) -> None:
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            roles = record.get("roles")
+            if isinstance(roles, list) and role in roles:
+                record["roles"] = [value for value in roles if value != role]
+
+    def _evict_visual_evidence_records(self, episode_state: Dict[str, Any]) -> None:
+        records = episode_state.get("visual_evidence_registry")
+        if not isinstance(records, list):
+            return
+        while len(records) > 32:
+            pinned_paths = self._pinned_visual_evidence_paths(episode_state, records)
+            remove_index = next(
+                (
+                    index
+                    for index, record in enumerate(records[:-1])
+                    if isinstance(record, dict)
+                    and str(record.get("image_path") or "") not in pinned_paths
+                ),
+                0,
+            )
+            records.pop(remove_index)
+
+    def _pinned_visual_evidence_paths(
+        self,
+        episode_state: Dict[str, Any],
+        records: List[Dict[str, Any]],
+    ) -> set[str]:
+        pinned = {
+            str(records[-1].get("image_path") or "")
+        } if records and isinstance(records[-1], dict) else set()
+        recovery = episode_state.get("visual_recovery")
+        if isinstance(recovery, dict):
+            pinned.update(
+                str(recovery.get(key) or "")
+                for key in ("stuck_before_path", "center_path")
+            )
+        for role in ("confirmed_landmark", "target_candidate"):
+            for record in reversed(records):
+                if isinstance(record, dict) and role in (record.get("roles") or []):
+                    pinned.add(str(record.get("image_path") or ""))
+                    break
+        return {path for path in pinned if path}
+
+    @staticmethod
+    def _normalize_semantic_text(value: Any, limit: int) -> str:
+        return " ".join(str(value or "").strip().lower().split())[:limit]
+
+    def _heading_deg_for_state(self, state: VLNState) -> Optional[float]:
+        pose = self._pose_from_state(state)
+        if not isinstance(pose, dict):
+            return None
+        quaternion = self._quaternion_wxyz(pose.get("rotation"))
+        if quaternion is None:
+            return None
+        w, x, y, z = quaternion
+        return math.degrees(
+            math.atan2(
+                2.0 * (w * y + x * z),
+                1.0 - 2.0 * (y * y + z * z),
+            )
+        )
+
+    @staticmethod
+    def _signed_heading_delta(anchor_deg: float, current_deg: float) -> float:
+        return (float(current_deg) - float(anchor_deg) + 180.0) % 360.0 - 180.0
+
     def _qwen_direct_state_for_episode(self, state: VLNState) -> Dict[str, Any]:
         key = f"{state.scene_id}::{state.episode_id}"
         return self.qwen_direct_episode_state.setdefault(key, {})
@@ -1621,6 +2208,18 @@ class OpenClawVLNRuntime:
         progress_state = self._bounded_metadata_text(arguments.get("progress_state"))
         if progress_state:
             metadata["qwen_progress_state"] = progress_state
+        route_stage = self._bounded_metadata_text(arguments.get("route_stage"), limit=40)
+        if route_stage:
+            metadata["qwen_route_stage"] = route_stage
+        confirmed_landmarks = arguments.get("confirmed_landmarks")
+        if isinstance(confirmed_landmarks, list):
+            bounded_landmarks = [
+                self._bounded_metadata_text(value, limit=80)
+                for value in confirmed_landmarks[:8]
+            ]
+            metadata["qwen_confirmed_landmarks"] = [
+                value for value in bounded_landmarks if value
+            ]
         stop_evidence = self._bounded_metadata_text(arguments.get("stop_evidence"))
         if stop_evidence:
             metadata["qwen_stop_evidence"] = stop_evidence

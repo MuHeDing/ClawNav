@@ -49,6 +49,8 @@ STOP_VISUAL_POSITIVE_MARKERS = (
     "at entrance",
     "at target",
     "at goal",
+    "inside",
+    "within",
     "beside",
     "next to",
     "framed by",
@@ -303,19 +305,13 @@ class QwenDirectControlGates:
             metadata.update(stop_block_metadata)
             return QwenDirectGateResult(replacement, metadata)
 
-        loop_replacement = self._loop_replacement(candidate_action, runtime_context)
-        if loop_replacement:
+        if self._repeated_same_direction_turn(candidate_action, runtime_context):
             metadata.update(
                 {
-                    "loop_gate_decision": "blocked",
+                    "loop_gate_decision": "audit_only",
                     "loop_pattern": "repeated_turn",
-                    "replacement_action": loop_replacement,
-                    "final_action": loop_replacement,
-                    "final_action_source": "loop_gate",
-                    "fallback_policy": "loop_break_turn",
                 }
             )
-            return QwenDirectGateResult(loop_replacement, metadata)
 
         turn_oscillation_detected = self._turn_oscillation_detected(
             candidate_action,
@@ -377,12 +373,18 @@ class QwenDirectControlGates:
         metadata: Dict[str, Any],
     ) -> QwenDirectGateResult:
         reason = str(arguments.get("qwen_failure_reason") or "qwen_direct_failure")
+        episode_invalid = bool(arguments.get("episode_invalid"))
         metadata.update(
             {
                 "qwen_failure": True,
                 "qwen_failure_reason": reason,
+                "episode_invalid": episode_invalid,
                 "final_action": "STOP",
-                "final_action_source": "qwen_failure_stop",
+                "final_action_source": (
+                    "qwen_invalid_episode_abort"
+                    if episode_invalid
+                    else "qwen_failure_stop"
+                ),
                 "fallback_policy": str(
                     arguments.get("fallback_policy") or "hard_failure_stop"
                 ),
@@ -825,19 +827,19 @@ class QwenDirectControlGates:
             return False
         return re.search(r"\b" + re.escape(waypoint) + r"\b", text) is not None
 
-    def _loop_replacement(
+    def _repeated_same_direction_turn(
         self,
         candidate_action: str,
         runtime_context: Dict[str, Any],
-    ) -> str:
+    ) -> bool:
         if candidate_action not in {"TURN_LEFT", "TURN_RIGHT"}:
-            return ""
+            return False
+        if runtime_context.get("turn_loop_recovery_active") is True:
+            return False
         recent = self._recent_actions(runtime_context)
         if len(recent) < 3:
-            return ""
-        if recent[-3:] == [candidate_action, candidate_action, candidate_action]:
-            return "TURN_RIGHT" if candidate_action == "TURN_LEFT" else "TURN_LEFT"
-        return ""
+            return False
+        return recent[-3:] == [candidate_action, candidate_action, candidate_action]
 
     def _forward_stall_replacement(
         self,

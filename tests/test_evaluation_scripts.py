@@ -68,6 +68,14 @@ def test_openclaw_gateway_script_can_disable_default_episode_keys_for_custom_dat
     assert 'if [[ -n "${HARNESS_EPISODE_KEYS:-}" ]]; then' in contents
 
 
+def test_run_qwen_preserves_caller_max_steps_override():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_qwen.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert 'MAX_STEPS="${MAX_STEPS:-200}"' in contents
+
+
 def test_400_val_unseen_launcher_runs_directly_without_screen_management():
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "scripts" / "run_memory_guided_fast_400_val_unseen_screen.sh"
@@ -159,6 +167,14 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "--openclaw_model_fast_use_memory_context" in contents
     assert "--policy_backend" in contents
     assert "--agent_max_input_tokens" in contents
+    assert "OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED=${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}" in contents
+    assert "OPENCLAW_QWEN_THINKING_MODE=${OPENCLAW_QWEN_THINKING_MODE:-auto}" in contents
+    assert "OPENCLAW_QWEN_OUTPUT_SCHEMA=${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" in contents
+    assert "OPENCLAW_QWEN_TRANSPORT_MODE=${OPENCLAW_QWEN_TRANSPORT_MODE:-sync}" in contents
+    assert "--dynamic_visual_context_enabled" in contents
+    assert "--qwen_thinking_mode" in contents
+    assert "--qwen_output_schema" in contents
+    assert "--qwen_transport_mode" in contents
 
 
 def test_run_qwen_starts_gateway_in_qwen_direct_mode():
@@ -172,8 +188,39 @@ def test_run_qwen_starts_gateway_in_qwen_direct_mode():
     assert "POLICY_BACKEND=qwen_direct \\" in gateway_start_block
     assert 'OPENCLAW_MODEL_MAX_IMAGES="${OPENCLAW_MODEL_MAX_IMAGES:-8}" \\' in gateway_start_block
     assert 'OPENCLAW_MODEL_FAST_MODE="${OPENCLAW_MODEL_FAST_MODE}" \\' in gateway_start_block
+    assert 'OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED="${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}" \\' in gateway_start_block
+    assert 'OPENCLAW_QWEN_THINKING_MODE="${OPENCLAW_QWEN_THINKING_MODE:-auto}" \\' in gateway_start_block
+    assert 'OPENCLAW_QWEN_OUTPUT_SCHEMA="${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" \\' in gateway_start_block
+    assert 'OPENCLAW_QWEN_TRANSPORT_MODE="${OPENCLAW_QWEN_TRANSPORT_MODE:-sync}" \\' in gateway_start_block
     assert 'OPENCLAW_MAP_ASSIST_MODE="${OPENCLAW_MAP_ASSIST_MODE:-off}"' in contents
     assert 'OPENCLAW_MAP_FRAME_INTERVAL_STEPS="${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}"' in contents
+    assert 'OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED="${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}"' in contents
+    assert "QWEN_ABLATION_PROFILE=${QWEN_ABLATION_PROFILE:-}" in contents
+    for profile in ("fixed_off", "dynamic_off", "fixed_on", "dynamic_on"):
+        assert profile in contents
+    assert "OPENCLAW_MODEL=qwen/qwen3.5-flash-2026-02-23" in contents
+    assert "OPENCLAW_QWEN_OUTPUT_SCHEMA=route_v2" in contents
+    assert "OPENCLAW_QWEN_TRANSPORT_MODE=sync" in contents
+    assert "OPENCLAW_MODEL_MAX_IMAGES=8" not in contents
+
+
+def test_run_qwen_latest_launches_dynamic_thinking_six_episode_smoke():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_qwen_latest.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert 'QWEN_ABLATION_PROFILE=${QWEN_ABLATION_PROFILE:-dynamic_on}' in contents
+    assert (
+        'EPISODE_KEYS=${EPISODE_KEYS:-"2azQ1b91cZZ:10,2azQ1b91cZZ:11,'
+        '2azQ1b91cZZ:12,2azQ1b91cZZ:16,2azQ1b91cZZ:70,2azQ1b91cZZ:1393"}'
+    ) in contents
+    assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-6}" in contents
+    assert "OPENCLAW_GATEWAY_PORT=${OPENCLAW_GATEWAY_PORT:-18013}" in contents
+    assert "OPENCLAW_KILL_EXISTING_GATEWAY=${OPENCLAW_KILL_EXISTING_GATEWAY:-1}" in contents
+    assert "unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_WS_URL" in contents
+    assert "qwen_latest_${QWEN_ABLATION_PROFILE}_6ep_${RUN_TIMESTAMP}" in contents
+    assert "OPENCLAW_MODEL_MAX_IMAGES" not in contents
+    assert "exec bash scripts/run_qwen.sh" in contents
 
 
 def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():

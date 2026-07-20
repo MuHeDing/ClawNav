@@ -51,6 +51,9 @@ def check_qwen_api(args: argparse.Namespace) -> Dict[str, Any]:
     client = QwenApiModelClient(
         max_retries=args.retries,
         retry_backoff_s=args.retry_backoff_s,
+        thinking_mode=args.thinking_mode,
+        thinking_budget=args.thinking_budget,
+        transport_mode=args.transport_mode,
     )
     client._ensure_config(args.timeout)
     if not client.api_key:
@@ -127,6 +130,9 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=0)
     parser.add_argument("--retry-backoff-s", type=float, default=1.0)
     parser.add_argument("--model", default="qwen-plus")
+    parser.add_argument("--thinking-mode", choices=("auto", "off", "on"), default="auto")
+    parser.add_argument("--thinking-budget", type=int, default=None)
+    parser.add_argument("--transport-mode", choices=("sync",), default="sync")
     parser.add_argument("--prompt", default="Return exactly: OK")
     parser.add_argument("--instruction", default="go forward to the target")
     args = parser.parse_args()

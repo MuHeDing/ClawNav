@@ -40,3 +40,4 @@ class HarnessConfig:
     motion_feedback_enabled: bool = False
     forward_stall_odometry_enabled: bool = False
     map_collision_overlay_enabled: bool = False
+    dynamic_visual_context_enabled: bool = False

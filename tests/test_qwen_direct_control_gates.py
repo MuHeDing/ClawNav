@@ -278,6 +278,37 @@ def test_qwen_direct_stop_with_at_archway_visual_summary_passes():
     assert result.runtime_metadata["final_action_source"] == "qwen"
 
 
+def test_qwen_direct_stop_with_agent_inside_archway_visual_summary_passes():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "STOP",
+                "confidence": 0.95,
+                "visual_summary": (
+                    "Agent is centered inside the wooden archway entrance, "
+                    "facing the tiled hallway beyond."
+                ),
+                "progress_state": "Waiting inside the requested entrance.",
+                "stop_evidence": "instruction_complete",
+                "current_target": "entrance under the balcony",
+                "target_relation": "inside the entrance",
+                "semantic_stop_state": "at_or_inside_target",
+                "reason": "Current view confirms the agent is inside the target entrance.",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(),
+        payload={"structural_stop_confirmation_forward_count": 1},
+    )
+
+    assert result.ok is True
+    assert result.action_text == "STOP"
+    assert result.runtime_metadata["stop_gate_decision"] == "passed"
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
 def test_qwen_direct_structural_stop_passes_when_forward_would_overshoot():
     runtime = make_runtime(
         direct_decision(
@@ -1031,7 +1062,30 @@ def test_qwen_direct_hard_failure_stops_without_other_gates():
     assert "stop_gate_decision" not in result.runtime_metadata
 
 
-def test_qwen_direct_repeated_turn_loop_chooses_opposite_turn():
+def test_qwen_direct_invalid_episode_abort_is_not_navigation_stop():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "STOP",
+                "qwen_failure": True,
+                "qwen_failure_reason": "route_v2 repair failed",
+                "episode_invalid": True,
+                "fallback_policy": "invalid_episode_abort",
+            }
+        )
+    )
+
+    result = runtime.step(make_state(), payload={})
+
+    assert result.ok is True
+    assert result.action_text == "STOP"
+    assert result.runtime_metadata["episode_invalid"] is True
+    assert result.runtime_metadata["final_action_source"] == "qwen_invalid_episode_abort"
+    assert result.runtime_metadata["fallback_policy"] == "invalid_episode_abort"
+    assert "stop_gate_decision" not in result.runtime_metadata
+
+
+def test_qwen_direct_repeated_same_direction_turn_does_not_force_reversal():
     runtime = make_runtime(
         direct_decision(
             {
@@ -1048,11 +1102,37 @@ def test_qwen_direct_repeated_turn_loop_chooses_opposite_turn():
     )
 
     assert result.ok is True
-    assert result.action_text == "TURN_RIGHT"
-    assert result.runtime_metadata["loop_gate_decision"] == "blocked"
+    assert result.action_text == "TURN_LEFT"
+    assert result.runtime_metadata["loop_gate_decision"] == "audit_only"
     assert result.runtime_metadata["loop_pattern"] == "repeated_turn"
-    assert result.runtime_metadata["replacement_action"] == "TURN_RIGHT"
-    assert result.runtime_metadata["fallback_policy"] == "loop_break_turn"
+    assert "replacement_action" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_turn_loop_recovery_keeps_model_selected_scan_turn():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "TURN_LEFT",
+                "confidence": 0.8,
+                "stop_evidence": "none",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(),
+        payload={
+            "recent_actions": ["TURN_LEFT", "TURN_LEFT", "TURN_LEFT"],
+            "turn_loop_recovery_active": True,
+            "visual_recovery_phase": "collect_scans",
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "TURN_LEFT"
+    assert "loop_gate_decision" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
 
 
 def test_qwen_direct_turn_oscillation_is_audit_only():
@@ -1096,6 +1176,49 @@ def test_qwen_direct_turn_oscillation_is_audit_only():
     assert result.runtime_metadata["turn_oscillation_gate_decision"] == "audit_only"
     assert result.runtime_metadata["turn_oscillation_detected"] is True
     assert result.runtime_metadata["loop_pattern"] == "turn_oscillation"
+    assert "replacement_action" not in result.runtime_metadata
+    assert result.runtime_metadata["final_action_source"] == "qwen"
+
+
+def test_qwen_direct_turn_oscillation_never_overrides_model_direction():
+    runtime = make_runtime(
+        direct_decision(
+            {
+                "action_text": "TURN_RIGHT",
+                "confidence": 0.8,
+                "stop_evidence": "none",
+            }
+        )
+    )
+
+    result = runtime.step(
+        make_state(),
+        payload={
+            "forward_stall_odometry_enabled": True,
+            "recent_actions": [
+                "TURN_LEFT",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+                "TURN_LEFT",
+            ],
+            "local_control_context": {
+                "odometry": {
+                    "available": True,
+                    "previous_action": "TURN_LEFT",
+                    "collision": False,
+                    "consecutive_no_progress_forward": 0,
+                }
+            },
+        },
+    )
+
+    assert result.ok is True
+    assert result.action_text == "TURN_RIGHT"
+    assert result.runtime_metadata["turn_oscillation_gate_decision"] == "audit_only"
     assert "replacement_action" not in result.runtime_metadata
     assert result.runtime_metadata["final_action_source"] == "qwen"
 

@@ -1,6 +1,8 @@
 import argparse
 import base64
+import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -8,7 +10,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -69,6 +71,12 @@ PROMPT_RUNTIME_CONTEXT_KEYS = (
     "task_state",
     "recent_step_summary",
     "retrieved_memory_ids",
+    "visual_evidence_registry",
+    "visual_recovery_active",
+    "visual_recovery_reason",
+    "visual_recovery_phase",
+    "turn_loop_recovery_active",
+    "turn_loop_feedback",
 )
 PROMPT_KEYFRAME_KEYS = ("step_id", "reason", "image_path")
 PROMPT_MAP_CONTEXT_KEYS = (
@@ -86,6 +94,12 @@ PROMPT_MAP_CONTEXT_KEYS = (
     "collision_point_count",
     "map_image_label",
     "map_generation_error",
+    "cached_map_available",
+    "cached_map_step_id",
+    "map_age_steps",
+    "map_interval_due",
+    "map_view_scope",
+    "map_refresh_reason",
 )
 PROMPT_TASK_STATE_KEYS = (
     "scene_id",
@@ -111,6 +125,81 @@ OPENCLAW_SESSION_MODE = "fresh_per_step"
 LOCAL_POLICY_FAST_MODES = {"memory_guided_policy_fast", "local_policy"}
 JANUS_POLICY_BACKEND = "janus_policy"
 QWEN_DIRECT_POLICY_BACKEND = "qwen_direct"
+ROUTE_V2_REQUIRED_FIELDS = {
+    "action_text",
+    "confidence",
+    "visual_summary",
+    "progress_state",
+    "route_stage",
+    "confirmed_landmarks",
+    "current_target",
+    "target_relation",
+    "stop_evidence",
+    "semantic_stop_state",
+    "reason",
+}
+ROUTE_V2_MAX_RESPONSE_CHARS = 2048
+ROUTE_V2_STRING_LIMITS = {
+    "visual_summary": 240,
+    "progress_state": 120,
+    "current_target": 120,
+    "target_relation": 120,
+    "reason": 160,
+}
+ROUTE_V2_MAX_LANDMARKS = 8
+ROUTE_V2_MAX_LANDMARK_CHARS = 80
+ROUTE_V2_FIELD_LIMITS_TEXT = (
+    "Field limits: visual_summary<=240 chars; progress_state<=120 chars; "
+    "current_target<=120 chars; target_relation<=120 chars; reason<=160 chars; "
+    "confirmed_landmarks<=8 items and each item<=80 chars."
+)
+ROUTE_STAGES = {
+    "start",
+    "en_route",
+    "intermediate_landmark",
+    "post_landmark_transition",
+    "approaching_target",
+    "verifying_target",
+    "complete",
+    "unknown",
+}
+STOP_EVIDENCE_VALUES = {"none", "visible_goal", "instruction_complete"}
+SEMANTIC_STOP_STATES = {
+    "not_ready",
+    "visible_not_reached",
+    "approaching_target",
+    "at_or_inside_target",
+    "beside_target",
+    "instruction_complete_at_target",
+}
+VISUAL_IMAGE_ROLES = {
+    "map_view",
+    "current",
+    "left_scan",
+    "center_scan",
+    "right_scan",
+    "keyframe",
+    "confirmed_landmark",
+    "target_candidate",
+    "stuck_before_keyframe",
+}
+DYNAMIC_VISUAL_ROLE_ORDERS = {
+    "normal": ("map_view", "confirmed_landmark", "keyframe", "current"),
+    "stuck": (
+        "map_view",
+        "stuck_before_keyframe",
+        "left_scan",
+        "center_scan",
+        "right_scan",
+        "current",
+    ),
+    "stop_blocked": (
+        "map_view",
+        "confirmed_landmark",
+        "target_candidate",
+        "current",
+    ),
+}
 DIRECT_PROMPT_OMIT_KEYS = {
     "run_id",
     "current_image_path",
@@ -129,7 +218,14 @@ DIRECT_PROMPT_OMIT_KEYS = {
     "diagnostic_pose",
     "full_pose_history",
     "local_artifact_path",
+    "visual_evidence_registry",
 }
+
+
+class QwenApiRequestError(RuntimeError):
+    def __init__(self, message: str, audit_metadata: Dict[str, Any]) -> None:
+        super().__init__(message)
+        self.audit_metadata = dict(audit_metadata)
 
 
 class QwenApiModelClient:
@@ -141,6 +237,9 @@ class QwenApiModelClient:
         openclaw_profile: str = "",
         max_retries: Optional[int] = None,
         retry_backoff_s: Optional[float] = None,
+        thinking_mode: str = "auto",
+        thinking_budget: Optional[int] = None,
+        transport_mode: str = "sync",
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
@@ -158,6 +257,15 @@ class QwenApiModelClient:
             "OPENCLAW_QWEN_API_RETRY_BACKOFF_S",
             1.0,
         )
+        if thinking_mode not in {"auto", "off", "on"}:
+            raise ValueError("thinking_mode must be one of auto, off, on")
+        if thinking_budget is not None and thinking_budget <= 0:
+            raise ValueError("thinking_budget must be a positive integer")
+        if transport_mode != "sync":
+            raise ValueError("only synchronous Qwen transport is currently supported")
+        self.thinking_mode = thinking_mode
+        self.thinking_budget = thinking_budget
+        self.transport_mode = transport_mode
 
     def run(
         self,
@@ -165,6 +273,7 @@ class QwenApiModelClient:
         image_paths: List[str],
         model: str,
         timeout_s: float,
+        image_labels: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         self._ensure_config(timeout_s)
         if not self.api_key:
@@ -173,19 +282,48 @@ class QwenApiModelClient:
                 "DASHSCOPE_API_KEY, QWEN_API_KEY, or configure OpenClaw provider qwen"
             )
         endpoint = self.base_url.rstrip("/") + "/chat/completions"
-        request_json = {
+        base_request_json = {
             "model": self._api_model_name(model),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": self._message_content(prompt, image_paths),
-                }
-            ],
             "temperature": 0,
         }
-        attempts = self.max_retries + 1
-        last_error = ""
-        for attempt_index in range(attempts):
+        request_image_paths = list(image_paths)
+        request_image_labels = (
+            list(image_labels or [])
+            if len(image_labels or []) == len(request_image_paths)
+            else []
+        )
+        original_image_count = len(request_image_paths)
+        thinking_enabled: Optional[bool] = None
+        if self.thinking_mode == "on":
+            thinking_enabled = True
+        elif self.thinking_mode == "off":
+            thinking_enabled = False
+        request_attempts = 0
+        retry_count = 0
+        capability_fallback = False
+        degradation_attempted = False
+        degradation_mode: Optional[str] = None
+        degradation_trigger_detail: Optional[str] = None
+        last_error_detail: Optional[str] = None
+        last_error_fingerprint: Optional[str] = None
+        request_started_at = time.monotonic()
+        while True:
+            request_json = dict(base_request_json)
+            request_json["messages"] = [
+                {
+                    "role": "user",
+                    "content": self._message_content(
+                        prompt,
+                        request_image_paths,
+                        request_image_labels,
+                    ),
+                }
+            ]
+            if thinking_enabled is not None:
+                request_json["enable_thinking"] = thinking_enabled
+                if thinking_enabled and self.thinking_budget is not None:
+                    request_json["thinking_budget"] = self.thinking_budget
+            request_attempts += 1
             try:
                 response = self.session.post(
                     endpoint,
@@ -197,26 +335,361 @@ class QwenApiModelClient:
                     timeout=timeout_s,
                 )
             except requests.exceptions.RequestException as exc:
-                last_error = str(exc)
-                if attempt_index >= self.max_retries:
-                    raise RuntimeError(
-                        "Qwen API request failed after "
-                        f"{attempt_index + 1} attempt(s): {last_error}"
+                if retry_count >= self.max_retries:
+                    metadata = self._failure_metadata(
+                        status_code=None,
+                        error_code="network_error",
+                        category="network_error",
+                        retryable=True,
+                        request_attempts=request_attempts,
+                        retry_count=retry_count,
+                        capability_fallback=capability_fallback,
+                        error_detail="network_error",
+                        degradation_attempted=degradation_attempted,
+                        degradation_mode=degradation_mode,
+                        degradation_trigger_detail=degradation_trigger_detail,
+                        original_image_count=original_image_count,
+                        final_image_count=len(request_image_paths),
+                    )
+                    raise QwenApiRequestError(
+                        "Qwen API request failed: category=network_error",
+                        metadata,
                     ) from exc
-                self._sleep_before_retry(attempt_index)
+                self._sleep_before_retry(retry_count)
+                retry_count += 1
                 continue
             if response.status_code >= 400:
-                message = f"HTTP {response.status_code} {response.text}"
-                last_error = message
-                if self._retryable_status(response.status_code) and attempt_index < self.max_retries:
-                    self._sleep_before_retry(attempt_index)
+                error_code, error_message = self._provider_error(response)
+                category = self._provider_error_category(
+                    response.status_code,
+                    error_code,
+                    error_message,
+                    thinking_enabled,
+                )
+                error_detail = self._provider_error_detail(error_code, error_message)
+                error_fingerprint = self._provider_error_fingerprint(
+                    error_code,
+                    error_message,
+                )
+                last_error_detail = error_detail
+                last_error_fingerprint = error_fingerprint
+                if category == "thinking_transport_incompatible":
+                    metadata = self._failure_metadata(
+                        response.status_code,
+                        error_code,
+                        category,
+                        False,
+                        request_attempts,
+                        retry_count,
+                        capability_fallback,
+                        error_detail=error_detail,
+                        error_fingerprint=error_fingerprint,
+                        degradation_attempted=degradation_attempted,
+                        degradation_mode=degradation_mode,
+                        degradation_trigger_detail=degradation_trigger_detail,
+                        original_image_count=original_image_count,
+                        final_image_count=len(request_image_paths),
+                    )
+                    raise QwenApiRequestError(
+                        self._sanitized_error_message(
+                            response.status_code,
+                            error_code,
+                            category,
+                            error_detail,
+                        ),
+                        metadata,
+                    )
+                if not degradation_attempted:
+                    candidate_mode = self._provider_degradation_mode(
+                        category,
+                        error_detail,
+                        thinking_enabled,
+                        request_image_paths,
+                    )
+                    if candidate_mode == "thinking_disabled":
+                        degradation_attempted = True
+                        degradation_mode = candidate_mode
+                        degradation_trigger_detail = error_detail
+                        capability_fallback = category == "thinking_unsupported"
+                        thinking_enabled = False
+                        continue
+                    if candidate_mode == "map_current_only":
+                        reduced_paths, reduced_labels = self._reduced_visual_inputs(
+                            request_image_paths,
+                            request_image_labels,
+                        )
+                        if len(reduced_paths) < len(request_image_paths):
+                            degradation_attempted = True
+                            degradation_mode = candidate_mode
+                            degradation_trigger_detail = error_detail
+                            request_image_paths = reduced_paths
+                            request_image_labels = reduced_labels
+                            continue
+                retryable = self._retryable_status(response.status_code)
+                if retryable and retry_count < self.max_retries:
+                    self._sleep_before_retry(retry_count)
+                    retry_count += 1
                     continue
-                raise RuntimeError(f"Qwen API request failed: {message}")
-            normalized = self._normalize_response(response.json())
-            normalized["request_attempts"] = attempt_index + 1
-            normalized["retry_count"] = attempt_index
+                metadata = self._failure_metadata(
+                    response.status_code,
+                    error_code,
+                    category,
+                    retryable,
+                    request_attempts,
+                    retry_count,
+                    capability_fallback,
+                    error_detail=error_detail,
+                    error_fingerprint=error_fingerprint,
+                    degradation_attempted=degradation_attempted,
+                    degradation_mode=degradation_mode,
+                    degradation_trigger_detail=degradation_trigger_detail,
+                    original_image_count=original_image_count,
+                    final_image_count=len(request_image_paths),
+                )
+                raise QwenApiRequestError(
+                    self._sanitized_error_message(
+                        response.status_code,
+                        error_code,
+                        category,
+                        error_detail,
+                    ),
+                    metadata,
+                )
+            try:
+                response_data = response.json()
+            except (ValueError, TypeError) as exc:
+                metadata = self._failure_metadata(
+                    response.status_code,
+                    "invalid_json",
+                    "invalid_response",
+                    False,
+                    request_attempts,
+                    retry_count,
+                    capability_fallback,
+                    error_detail="invalid_response_json",
+                    degradation_attempted=degradation_attempted,
+                    degradation_mode=degradation_mode,
+                    degradation_trigger_detail=degradation_trigger_detail,
+                    original_image_count=original_image_count,
+                    final_image_count=len(request_image_paths),
+                )
+                raise QwenApiRequestError(
+                    self._sanitized_error_message(
+                        response.status_code,
+                        "invalid_json",
+                        "invalid_response",
+                    ),
+                    metadata,
+                ) from exc
+            normalized = self._normalize_response(
+                response_data,
+                thinking_enabled=thinking_enabled,
+                capability_fallback=capability_fallback,
+                degradation_attempted=degradation_attempted,
+                degradation_mode=degradation_mode,
+                degradation_trigger_detail=degradation_trigger_detail,
+                error_detail=last_error_detail,
+                error_fingerprint=last_error_fingerprint,
+                original_image_count=original_image_count,
+                final_image_count=len(request_image_paths),
+            )
+            normalized["request_attempts"] = request_attempts
+            normalized["retry_count"] = retry_count
+            provider_metadata = normalized.get("provider_metadata")
+            if isinstance(provider_metadata, dict):
+                provider_metadata["provider_latency_ms"] = round(
+                    (time.monotonic() - request_started_at) * 1000.0,
+                    3,
+                )
             return normalized
-        raise RuntimeError(f"Qwen API request failed after {attempts} attempt(s): {last_error}")
+
+    @staticmethod
+    def _provider_error(response: Any) -> tuple[str, str]:
+        try:
+            data = response.json()
+        except (ValueError, TypeError):
+            return "unknown", ""
+        if not isinstance(data, dict):
+            return "unknown", ""
+        error = data.get("error")
+        if not isinstance(error, dict):
+            error = data
+        raw_code = str(error.get("code") or "unknown")
+        code = raw_code if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", raw_code) else "unknown"
+        return code, str(error.get("message") or "")
+
+    @staticmethod
+    def _provider_error_category(
+        status_code: int,
+        error_code: str,
+        error_message: str,
+        thinking_enabled: Optional[bool],
+    ) -> str:
+        transient = f"{error_code} {error_message}".lower()
+        if thinking_enabled is True and (
+            "only support stream" in transient
+            or "stream call" in transient
+            or "streaming required" in transient
+        ):
+            return "thinking_transport_incompatible"
+        if thinking_enabled is True and "thinking" in transient and (
+            "not supported" in transient
+            or "unsupported" in transient
+            or "unknown parameter" in transient
+            or "unrecognized" in transient
+        ):
+            return "thinking_unsupported"
+        if status_code == 429:
+            return "rate_limited"
+        if status_code >= 500:
+            return "server_error"
+        return "client_error"
+
+    @staticmethod
+    def _provider_error_detail(error_code: str, error_message: str) -> str:
+        error_text = f"{error_code} {error_message}".lower()
+        if "thinking_budget" in error_text or "thinking budget" in error_text:
+            return "thinking_budget_invalid"
+        if "thinking" in error_text and (
+            "not supported" in error_text
+            or "unsupported" in error_text
+            or "unknown parameter" in error_text
+            or "unrecognized" in error_text
+            or "invalid" in error_text
+        ):
+            return "thinking_parameter_invalid"
+        if (
+            "context length" in error_text
+            or "input length" in error_text
+            or "input tokens" in error_text
+            or "maximum token" in error_text
+            or "token limit" in error_text
+            or "too many tokens" in error_text
+        ):
+            return "input_length_invalid"
+        if "image" in error_text and (
+            "invalid" in error_text
+            or "format" in error_text
+            or "size" in error_text
+            or "resolution" in error_text
+            or "too many" in error_text
+            or "unsupported" in error_text
+            or "image_url" in error_text
+            or "image url" in error_text
+        ):
+            return "image_input_invalid"
+        if "model" in error_text and (
+            "not found" in error_text
+            or "unsupported" in error_text
+            or "invalid" in error_text
+        ):
+            return "model_parameter_invalid"
+        if "invalidparameter" in error_text or "invalid_parameter" in error_text:
+            return "request_parameter_invalid"
+        return "unclassified"
+
+    @staticmethod
+    def _provider_error_fingerprint(error_code: str, error_message: str) -> str:
+        normalized = " ".join(f"{error_code} {error_message}".lower().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _provider_degradation_mode(
+        category: str,
+        error_detail: str,
+        thinking_enabled: Optional[bool],
+        image_paths: List[str],
+    ) -> Optional[str]:
+        if thinking_enabled is True and (
+            category == "thinking_unsupported"
+            or error_detail in {"thinking_budget_invalid", "thinking_parameter_invalid"}
+        ):
+            return "thinking_disabled"
+        if error_detail in {"image_input_invalid", "input_length_invalid"} and len(
+            image_paths
+        ) > 2:
+            return "map_current_only"
+        return None
+
+    @staticmethod
+    def _reduced_visual_inputs(
+        image_paths: List[str],
+        image_labels: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        if len(image_paths) <= 2:
+            return list(image_paths), list(image_labels)
+        if len(image_labels) == len(image_paths):
+            map_index = next(
+                (index for index, label in enumerate(image_labels) if label == "map_view"),
+                0,
+            )
+            current_index = next(
+                (
+                    index
+                    for index in range(len(image_labels) - 1, -1, -1)
+                    if image_labels[index] == "current"
+                ),
+                len(image_paths) - 1,
+            )
+            selected_indices = [map_index]
+            if current_index != map_index:
+                selected_indices.append(current_index)
+            return (
+                [image_paths[index] for index in selected_indices],
+                [image_labels[index] for index in selected_indices],
+            )
+        return [image_paths[0], image_paths[-1]], []
+
+    @staticmethod
+    def _sanitized_error_message(
+        status_code: int,
+        error_code: str,
+        category: str,
+        error_detail: Optional[str] = None,
+    ) -> str:
+        detail = f" detail={error_detail}" if error_detail else ""
+        return (
+            f"Qwen API request failed: HTTP {status_code} code={error_code} "
+            f"category={category}{detail}"
+        )
+
+    def _failure_metadata(
+        self,
+        status_code: Optional[int],
+        error_code: str,
+        category: str,
+        retryable: bool,
+        request_attempts: int,
+        retry_count: int,
+        capability_fallback: bool,
+        error_detail: Optional[str] = None,
+        error_fingerprint: Optional[str] = None,
+        degradation_attempted: bool = False,
+        degradation_mode: Optional[str] = None,
+        degradation_trigger_detail: Optional[str] = None,
+        original_image_count: int = 0,
+        final_image_count: int = 0,
+    ) -> Dict[str, Any]:
+        return {
+            "provider_error_status": status_code,
+            "provider_error_code": error_code,
+            "provider_error_category": category,
+            "provider_error_retryable": retryable,
+            "provider_error_detail": error_detail,
+            "provider_error_fingerprint": error_fingerprint,
+            "provider_degradation_attempted": degradation_attempted,
+            "provider_degradation_mode": degradation_mode,
+            "provider_degradation_trigger_detail": degradation_trigger_detail,
+            "provider_original_image_count": original_image_count,
+            "provider_final_image_count": final_image_count,
+            "qwen_api_request_attempts": request_attempts,
+            "qwen_api_retry_count": retry_count,
+            "qwen_thinking_enabled": self.thinking_mode == "on",
+            "qwen_thinking_exercised": None,
+            "thinking_model_supported": False if category == "thinking_unsupported" else None,
+            "thinking_capability_fallback": capability_fallback,
+            "thinking_transport_incompatible": category == "thinking_transport_incompatible",
+        }
 
     def _sleep_before_retry(self, attempt_index: int) -> None:
         if self.retry_backoff_s <= 0:
@@ -338,9 +811,20 @@ class QwenApiModelClient:
             return model.split("/", 1)[1]
         return model
 
-    def _message_content(self, prompt: str, image_paths: List[str]) -> List[Dict[str, Any]]:
+    def _message_content(
+        self,
+        prompt: str,
+        image_paths: List[str],
+        image_labels: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         content: List[Dict[str, Any]] = []
-        for image_path in image_paths:
+        labels = image_labels if len(image_labels or []) == len(image_paths) else []
+        for index, image_path in enumerate(image_paths):
+            if labels:
+                label = str(labels[index])
+                if label not in VISUAL_IMAGE_ROLES:
+                    raise ValueError(f"unsupported provider image label: {label}")
+                content.append({"type": "text", "text": f"Image label: {label}"})
             content.append(
                 {
                     "type": "image_url",
@@ -357,12 +841,26 @@ class QwenApiModelClient:
         return f"data:{mime_type};base64,{encoded}"
 
     @staticmethod
-    def _normalize_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_response(
+        data: Dict[str, Any],
+        thinking_enabled: Optional[bool] = None,
+        capability_fallback: bool = False,
+        degradation_attempted: bool = False,
+        degradation_mode: Optional[str] = None,
+        degradation_trigger_detail: Optional[str] = None,
+        error_detail: Optional[str] = None,
+        error_fingerprint: Optional[str] = None,
+        original_image_count: int = 0,
+        final_image_count: int = 0,
+    ) -> Dict[str, Any]:
         text = ""
+        reasoning_content_present = False
         choices = data.get("choices") if isinstance(data, dict) else None
         if isinstance(choices, list) and choices:
             message = choices[0].get("message") if isinstance(choices[0], dict) else None
             if isinstance(message, dict):
+                reasoning = message.get("reasoning_content")
+                reasoning_content_present = isinstance(reasoning, str) and bool(reasoning.strip())
                 content = message.get("content")
                 if isinstance(content, str):
                     text = content
@@ -374,6 +872,7 @@ class QwenApiModelClient:
                     )
         usage = data.get("usage") if isinstance(data, dict) else {}
         normalized_usage: Dict[str, Any] = {}
+        reasoning_tokens: Optional[int] = None
         if isinstance(usage, dict):
             normalized_usage = {
                 "input": usage.get("prompt_tokens") or usage.get("input") or usage.get("input_tokens"),
@@ -388,12 +887,41 @@ class QwenApiModelClient:
                     or usage.get("total_tokens")
                 ),
             }
+            details = usage.get("completion_tokens_details")
+            if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+                try:
+                    reasoning_tokens = max(0, int(details.get("reasoning_tokens")))
+                except (TypeError, ValueError):
+                    reasoning_tokens = None
             normalized_usage = {key: value for key, value in normalized_usage.items() if value is not None}
+        thinking_exercised: Optional[bool] = None
+        if reasoning_content_present or (reasoning_tokens is not None and reasoning_tokens > 0):
+            thinking_exercised = True
+        elif reasoning_tokens == 0:
+            thinking_exercised = False
+        returned_model_id = str(data.get("model") or "") if isinstance(data, dict) else ""
         return {
             "ok": True,
             "outputs": [{"text": text}],
             "usage": normalized_usage,
-            "raw": data,
+            "provider_metadata": {
+                "returned_model_id": returned_model_id or None,
+                "qwen_thinking_enabled": thinking_enabled,
+                "qwen_thinking_exercised": thinking_exercised,
+                "thinking_model_supported": (
+                    False if capability_fallback else True if thinking_enabled is True else None
+                ),
+                "thinking_capability_fallback": capability_fallback,
+                "thinking_transport_incompatible": False,
+                "reasoning_tokens": reasoning_tokens,
+                "provider_error_detail": error_detail,
+                "provider_error_fingerprint": error_fingerprint,
+                "provider_degradation_attempted": degradation_attempted,
+                "provider_degradation_mode": degradation_mode,
+                "provider_degradation_trigger_detail": degradation_trigger_detail,
+                "provider_original_image_count": original_image_count,
+                "provider_final_image_count": final_image_count,
+            },
         }
 
 
@@ -436,6 +964,11 @@ class OpenClawCliPlanPlanner:
         agent_max_input_tokens: int = 10000,
         openclaw_session_dir: str = "",
         policy_backend: str = JANUS_POLICY_BACKEND,
+        dynamic_visual_context_enabled: bool = False,
+        qwen_thinking_mode: str = "auto",
+        qwen_output_schema: str = "legacy",
+        qwen_thinking_budget: Optional[int] = None,
+        qwen_transport_mode: str = "sync",
     ) -> None:
         self.recall_interval_steps = max(1, recall_interval_steps)
         self.run_openclaw = run_openclaw
@@ -465,6 +998,23 @@ class OpenClawCliPlanPlanner:
         self.agent_max_input_tokens = max(0, int(agent_max_input_tokens or 0))
         self.openclaw_session_dir = openclaw_session_dir
         self.policy_backend = policy_backend or JANUS_POLICY_BACKEND
+        if qwen_thinking_mode not in {"auto", "off", "on"}:
+            raise ValueError("qwen_thinking_mode must be one of auto, off, on")
+        if qwen_output_schema not in {"legacy", "route_v2"}:
+            raise ValueError("qwen_output_schema must be one of legacy, route_v2")
+        if qwen_thinking_budget is not None and qwen_thinking_budget <= 0:
+            raise ValueError("qwen_thinking_budget must be a positive integer")
+        if qwen_transport_mode != "sync":
+            raise ValueError("only synchronous Qwen transport is currently supported")
+        if openclaw_model_provider == "openclaw_cli" and qwen_thinking_mode != "auto":
+            raise ValueError(
+                "explicit Qwen thinking control is only supported by qwen_api"
+            )
+        self.dynamic_visual_context_enabled = bool(dynamic_visual_context_enabled)
+        self.qwen_thinking_mode = qwen_thinking_mode
+        self.qwen_output_schema = qwen_output_schema
+        self.qwen_thinking_budget = qwen_thinking_budget
+        self.qwen_transport_mode = qwen_transport_mode
         self._agent_token_guard: Dict[str, Any] = {}
         self.openclaw_visual_mode = openclaw_visual_mode
         self.openclaw_visual_max_images = max(0, openclaw_visual_max_images)
@@ -640,6 +1190,9 @@ class OpenClawCliPlanPlanner:
             self._update_context_audit_for_model_step(context_audit, step_mode)
             context_audit["model_provider"] = self.openclaw_model_provider
             context_audit["qwen_model_called"] = True
+            provider_error_metadata = getattr(exc, "audit_metadata", None)
+            if isinstance(provider_error_metadata, dict):
+                context_audit.update(provider_error_metadata)
             context_audit["visual_memory_update_status"] = self._mark_visual_memory_error(
                 prompt_payload,
                 step_mode,
@@ -650,6 +1203,7 @@ class OpenClawCliPlanPlanner:
                     str(exc),
                     context_audit=context_audit,
                     reason="qwen_direct_provider_error",
+                    episode_invalid=True,
                 )
             return self._model_fallback_decision(
                 payload,
@@ -670,27 +1224,101 @@ class OpenClawCliPlanPlanner:
         context_audit["model_provider"] = self.openclaw_model_provider
         context_audit["qwen_model_called"] = True
         context_audit.update(self._model_request_metadata(model_stdout))
+        if self._is_qwen_direct_policy() and self.qwen_output_schema == "route_v2":
+            context_audit["qwen_output_repair_attempted"] = False
+            context_audit["qwen_output_repair_succeeded"] = False
         model_text = self._model_visible_text(model_stdout)
         try:
-            decision = self._extract_json_object(model_text)
-            normalized = self._normalize_decision(decision)
-        except RuntimeError as exc:
-            context_audit["visual_memory_update_status"] = self._mark_visual_memory_error(
-                prompt_payload,
-                step_mode,
-                str(exc),
+            decision = (
+                self._extract_route_v2_json_object(model_text)
+                if self._is_qwen_direct_policy() and self.qwen_output_schema == "route_v2"
+                else self._extract_json_object(model_text)
             )
+            normalized = self._normalize_decision(decision)
             if self._is_qwen_direct_policy():
-                return self._direct_policy_failure_decision(
+                context_audit["qwen_output_json_valid"] = True
+        except RuntimeError as exc:
+            if self._is_qwen_direct_policy():
+                context_audit["qwen_output_json_valid"] = False
+            if self._is_qwen_direct_policy() and self.qwen_output_schema == "route_v2":
+                context_audit["qwen_output_repair_attempted"] = True
+                context_audit["qwen_output_repair_error_category"] = (
+                    self._route_v2_error_category(exc)
+                )
+                repair_error: Optional[Exception] = None
+                try:
+                    repair_stdout = self._model_run_stdout(
+                        self._route_v2_repair_prompt(model_text, exc),
+                        {"paths": [], "provider_image_labels": []},
+                    )
+                    repair_metadata = self._model_request_metadata(repair_stdout)
+                    repair_usage = self._agent_usage_metadata(repair_stdout)
+                    for source_key, output_key in (
+                        ("input", "qwen_output_repair_input_tokens"),
+                        ("output", "qwen_output_repair_output_tokens"),
+                        ("totalTokens", "qwen_output_repair_total_tokens"),
+                    ):
+                        value = self._usage_int(repair_usage, source_key)
+                        if value is not None:
+                            context_audit[output_key] = value
+                    if "qwen_api_request_attempts" in repair_metadata:
+                        context_audit["qwen_output_repair_request_attempts"] = (
+                            repair_metadata["qwen_api_request_attempts"]
+                        )
+                    if "qwen_api_retry_count" in repair_metadata:
+                        context_audit["qwen_output_repair_retry_count"] = repair_metadata[
+                            "qwen_api_retry_count"
+                        ]
+                    repair_text = self._model_visible_text(repair_stdout)
+                    repair_candidate = self._extract_route_v2_json_object(repair_text)
+                    repair_candidate, sanitized_fields = (
+                        self._sanitize_route_v2_repair_candidate(repair_candidate)
+                    )
+                    if sanitized_fields:
+                        context_audit["qwen_output_repair_sanitized_fields"] = (
+                            sanitized_fields
+                        )
+                    normalized = self._normalize_decision(repair_candidate)
+                except Exception as repair_exc:
+                    repair_error = repair_exc
+                if repair_error is None:
+                    context_audit["qwen_output_json_valid"] = True
+                    context_audit["qwen_output_repair_succeeded"] = True
+                else:
+                    context_audit["qwen_output_repair_succeeded"] = False
+                    context_audit["qwen_output_repair_final_error_category"] = (
+                        self._route_v2_error_category(repair_error)
+                    )
+                    context_audit["visual_memory_update_status"] = (
+                        self._mark_visual_memory_error(
+                            prompt_payload,
+                            step_mode,
+                            str(repair_error),
+                        )
+                    )
+                    return self._direct_policy_failure_decision(
+                        str(repair_error),
+                        context_audit=context_audit,
+                        reason="qwen_direct_invalid_episode_abort",
+                        episode_invalid=True,
+                    )
+            else:
+                context_audit["visual_memory_update_status"] = self._mark_visual_memory_error(
+                    prompt_payload,
+                    step_mode,
+                    str(exc),
+                )
+                if self._is_qwen_direct_policy():
+                    return self._direct_policy_failure_decision(
+                        str(exc),
+                        context_audit=context_audit,
+                        reason="qwen_direct_parse_error",
+                    )
+                return self._model_fallback_decision(
+                    payload,
                     str(exc),
                     context_audit=context_audit,
-                    reason="qwen_direct_parse_error",
                 )
-            return self._model_fallback_decision(
-                payload,
-                str(exc),
-                context_audit=context_audit,
-            )
         self._enrich_write_memory_with_visual_observation(normalized, prompt_payload)
         context_audit["visual_memory_update_status"] = self._update_visual_memory_cache(
             prompt_payload,
@@ -711,6 +1339,7 @@ class OpenClawCliPlanPlanner:
         error: str,
         context_audit: Optional[Dict[str, Any]] = None,
         reason: str = "qwen_direct_failure",
+        episode_invalid: bool = False,
     ) -> Dict[str, Any]:
         audit = dict(context_audit or {})
         audit.setdefault("planner_authority", "qwen")
@@ -730,7 +1359,10 @@ class OpenClawCliPlanPlanner:
                 "qwen_failure": True,
                 "qwen_failure_reason": error,
                 "candidate_action": None,
-                "fallback_policy": "hard_failure_stop",
+                "fallback_policy": (
+                    "invalid_episode_abort" if episode_invalid else "hard_failure_stop"
+                ),
+                "episode_invalid": episode_invalid,
             },
             "reason": reason,
             "runtime_metadata": {"context_audit": audit},
@@ -828,12 +1460,16 @@ class OpenClawCliPlanPlanner:
                 self.model_client = QwenApiModelClient(
                     run_openclaw=self.run_openclaw,
                     openclaw_profile=self.openclaw_profile,
+                    thinking_mode=self.qwen_thinking_mode,
+                    thinking_budget=self.qwen_thinking_budget,
+                    transport_mode=self.qwen_transport_mode,
                 )
             response = self.model_client.run(
                 prompt=prompt,
                 image_paths=image_paths,
                 model=self.openclaw_model,
                 timeout_s=self.agent_timeout_s,
+                image_labels=list(model_images.get("provider_image_labels") or []),
             )
             return json.dumps(response, ensure_ascii=True)
 
@@ -1160,12 +1796,42 @@ class OpenClawCliPlanPlanner:
                 )
             )
         )
+        if (
+            self.dynamic_visual_context_enabled
+            and isinstance(attached_order, dict)
+            and attached_order.get("sources")
+        ):
+            image_instruction = (
+                "Attached images carry controlled purpose labels in this exact order: "
+                + ", ".join(str(value) for value in attached_order.get("sources") or [])
+                + ". Use each image only for its labeled purpose; current is the final image and controls immediate action feasibility."
+            )
+        schema_line = (
+            'Schema: {"action_text":"STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT","confidence":0.0,"visual_summary":"short","progress_state":"short","route_stage":"start|en_route|intermediate_landmark|post_landmark_transition|approaching_target|verifying_target|complete|unknown","confirmed_landmarks":["short"],"current_target":"short","target_relation":"short","stop_evidence":"none|visible_goal|instruction_complete","semantic_stop_state":"not_ready|visible_not_reached|approaching_target|at_or_inside_target|beside_target|instruction_complete_at_target","reason":"short"}'
+            if self.qwen_output_schema == "route_v2"
+            else 'Schema: {"action_text":"STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT","confidence":0.0,"visual_summary":"short","progress_state":"short","stop_evidence":"none|visible_goal|instruction_complete","current_target":"short","target_relation":"short","semantic_stop_state":"not_ready|visible_not_reached|approaching_target|at_or_inside_target|beside_target|instruction_complete_at_target","reason":"short"}'
+        )
+        field_limits_line = (
+            ROUTE_V2_FIELD_LIMITS_TEXT
+            if self.qwen_output_schema == "route_v2"
+            else ""
+        )
+        thinking_lines = []
+        if self.qwen_thinking_mode == "on":
+            thinking_lines = [
+                "Use Qwen thinking to reason internally before producing the final JSON.",
+                "In that internal reasoning, inspect map_view for coarse topology, agent heading, visited trail, target direction, and route-stage consistency before choosing an action.",
+                "Treat collision marks as evidence only when map_context says collision_overlay_enabled=true, and never invent map content that is not visible.",
+                "Do not include chain-of-thought, reasoning_content, markdown, or prose in the final answer; output only the short JSON object.",
+            ]
         return "\n".join(
             [
                 "Return one JSON object for QwenDirectPolicy.",
                 "QwenDirectPolicy is the only action-producing policy in this mode.",
-                'Schema: {"action_text":"STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT","confidence":0.0,"visual_summary":"short","progress_state":"short","stop_evidence":"none|visible_goal|instruction_complete","current_target":"short","target_relation":"short","semantic_stop_state":"not_ready|visible_not_reached|approaching_target|at_or_inside_target|beside_target|instruction_complete_at_target","reason":"short"}',
+                schema_line,
+                field_limits_line,
                 "Do not name external tools. Do not emit markdown.",
+                *thinking_lines,
                 "Action rules:",
                 "Use TURN_LEFT or TURN_RIGHT when the intended route or landmark is off-center, missing from the current view, or requires reorientation.",
                 "Embodiment/action scale: MOVE_FORWARD advances 0.25 meters; TURN_LEFT and TURN_RIGHT rotate 15 degrees each.",
@@ -1181,6 +1847,7 @@ class OpenClawCliPlanPlanner:
                 "When motion_feedback reports actual_effect=blocked or recommended_constraint=avoid_forward, avoid MOVE_FORWARD unless the final current RGB image clearly shows a newly aligned open path.",
                 "When blocked_stop_feedback is present, do not choose STOP. Use MOVE_FORWARD only when the current image clearly shows the route continues forward; otherwise use TURN_LEFT or TURN_RIGHT to recheck alignment or target evidence.",
                 "When forward_stall_feedback is present, do not choose MOVE_FORWARD; choose only TURN_LEFT or TURN_RIGHT and explain the corrective visual reason.",
+                "When turn_loop_feedback is present, stop repeating the previous turn pattern. Use map_view visited trail plus left_scan, center_scan, and right_scan to choose the least-visited traversable direction. Collect a missing scan with the corresponding turn; once scans are available, align the final current RGB with the chosen open direction and prefer MOVE_FORWARD to leave the loop.",
                 "When stop_verification_feedback is present, do not choose MOVE_FORWARD. Recheck the same current observation and choose STOP only if the agent is already at or inside the structural target boundary; otherwise choose TURN_LEFT or TURN_RIGHT to inspect.",
                 "When route_progress is present, treat negated waypoint mentions as unseen. Do not claim a walk-past waypoint is complete until it appears in passed_waypoints, and do not choose final STOP while turn_round_completed is false or required_waypoints are not passed.",
                 image_instruction,
@@ -1279,6 +1946,19 @@ class OpenClawCliPlanPlanner:
             "map_frame_due": map_context.get("map_frame_due"),
             "map_step_id": map_context.get("map_step_id"),
             "map_available": map_context.get("map_available"),
+            "map_view_scope": map_context.get("map_view_scope"),
+            "map_refresh_reason": map_context.get("map_refresh_reason"),
+            "turn_loop_recovery_active": runtime_context.get(
+                "turn_loop_recovery_active"
+            ),
+            "visual_recovery_phase": runtime_context.get("visual_recovery_phase"),
+            "motion_feedback_enabled": runtime_context.get("motion_feedback_enabled"),
+            "forward_stall_odometry_enabled": runtime_context.get(
+                "forward_stall_odometry_enabled"
+            ),
+            "map_collision_overlay_enabled": runtime_context.get(
+                "map_collision_overlay_enabled"
+            ),
         }
 
     def _force_visual_refresh_requested(self, runtime_context: Dict[str, Any]) -> bool:
@@ -1337,7 +2017,12 @@ class OpenClawCliPlanPlanner:
         planner_step_mode: str = "visual_update",
     ) -> Dict[str, Any]:
         runtime_context = prompt_payload.get("runtime_context") or {}
-        if not isinstance(runtime_context, dict) or self.openclaw_model_max_images <= 0:
+        if not isinstance(runtime_context, dict):
+            return {"paths": [], "missing_paths": []}
+        dynamic_qwen_selection = (
+            self._is_qwen_direct_policy() and self.dynamic_visual_context_enabled
+        )
+        if self.openclaw_model_max_images <= 0 and not dynamic_qwen_selection:
             return {"paths": [], "missing_paths": []}
         if planner_step_mode == "fast_text":
             return {"paths": [], "missing_paths": []}
@@ -1366,6 +2051,18 @@ class OpenClawCliPlanPlanner:
                 missing_candidates,
             )
         )
+        if self._is_qwen_direct_policy() and self.dynamic_visual_context_enabled:
+            model_images.update(
+                self._dynamic_visual_selection_metadata(
+                    runtime_context,
+                    selected_candidates,
+                    missing_candidates,
+                )
+            )
+            model_images["provider_image_labels"] = [
+                str(candidate.get("source") or "")
+                for candidate in selected_candidates
+            ]
         return model_images
 
     def _model_visual_update_image_paths(self, runtime_context: Dict[str, Any]) -> List[str]:
@@ -1431,6 +2128,8 @@ class OpenClawCliPlanPlanner:
         self,
         runtime_context: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
+        if self.dynamic_visual_context_enabled:
+            return self._dynamic_qwen_direct_model_image_candidates(runtime_context)
         current_image_path = runtime_context.get("current_image_path")
         current_path = current_image_path if isinstance(current_image_path, str) else ""
         current_budget = 1 if current_path else 0
@@ -1474,6 +2173,166 @@ class OpenClawCliPlanPlanner:
             candidates.append({"path": current_path, "source": "current"})
         return self._dedupe_model_image_candidates(candidates)
 
+    def _dynamic_qwen_direct_model_image_candidates(
+        self,
+        runtime_context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        mode = self._dynamic_visual_context_mode(runtime_context)
+        role_order = DYNAMIC_VISUAL_ROLE_ORDERS[mode]
+        registry = runtime_context.get("visual_evidence_registry")
+        records = [record for record in registry or [] if isinstance(record, dict)]
+        current_path = str(runtime_context.get("current_image_path") or "")
+        candidates: List[Dict[str, Any]] = []
+        for role in role_order:
+            if role == "map_view":
+                candidate = self._map_view_image_candidate(runtime_context)
+            elif role == "current":
+                candidate = (
+                    {"path": current_path, "source": "current"}
+                    if current_path
+                    else None
+                )
+            elif role == "keyframe":
+                candidate = self._ranked_keyframe_candidate(records)
+            else:
+                candidate = self._latest_registry_role_candidate(
+                    records,
+                    role,
+                )
+            if candidate:
+                candidates.append(candidate)
+        return self._dedupe_dynamic_candidates_current_last(candidates)
+
+    @staticmethod
+    def _dynamic_visual_context_mode(runtime_context: Dict[str, Any]) -> str:
+        if runtime_context.get("blocked_stop_feedback") or runtime_context.get(
+            "stop_verification_feedback"
+        ):
+            return "stop_blocked"
+        if runtime_context.get("forward_stall_feedback") or runtime_context.get(
+            "visual_recovery_active"
+        ) is True:
+            return "stuck"
+        return "normal"
+
+    def _latest_registry_role_candidate(
+        self,
+        records: List[Dict[str, Any]],
+        role: str,
+    ) -> Optional[Dict[str, Any]]:
+        eligible = [
+            record
+            for record in records
+            if role in (record.get("roles") or [])
+            and str(record.get("image_path") or "")
+        ]
+        if not eligible:
+            return None
+        record = max(eligible, key=lambda value: self._nonnegative_int(value.get("step_id")))
+        return {
+            "path": str(record.get("image_path") or ""),
+            "source": role,
+            "capture_route_stage": record.get("capture_route_stage"),
+            "capture_current_target": record.get("capture_current_target"),
+        }
+
+    def _ranked_keyframe_candidate(
+        self,
+        records: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        candidates = [
+            record
+            for record in records
+            if "keyframe" in (record.get("roles") or [])
+            and str(record.get("image_path") or "")
+        ]
+        if not candidates:
+            return None
+        references = [
+            record
+            for record in records
+            if record.get("capture_route_stage") not in (None, "", "unknown")
+            or record.get("capture_current_target")
+        ]
+        reference = max(
+            references,
+            key=lambda value: self._nonnegative_int(value.get("step_id")),
+        ) if references else {}
+        stage = str(reference.get("capture_route_stage") or "")
+        target = str(reference.get("capture_current_target") or "")
+        record = max(
+            candidates,
+            key=lambda value: (
+                int(bool(stage and stage != "unknown" and value.get("capture_route_stage") == stage)),
+                int(bool(target and value.get("capture_current_target") == target)),
+                self._nonnegative_int(value.get("step_id")),
+            ),
+        )
+        return {
+            "path": str(record.get("image_path") or ""),
+            "source": "keyframe",
+            "capture_route_stage": record.get("capture_route_stage"),
+            "capture_current_target": record.get("capture_current_target"),
+        }
+
+    @staticmethod
+    def _dedupe_dynamic_candidates_current_last(
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        by_path: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for raw_candidate in candidates:
+            candidate = dict(raw_candidate)
+            path = str(candidate.get("path") or "")
+            source = str(candidate.get("source") or "")
+            if not path:
+                continue
+            if path in by_path:
+                existing = by_path[path]
+                aliases = set(existing.get("aliases") or [])
+                if existing.get("source") != source:
+                    aliases.add(str(existing.get("source") or ""))
+                    aliases.add(source)
+                existing["aliases"] = sorted(alias for alias in aliases if alias)
+                if source == "current":
+                    existing["source"] = "current"
+                    existing["aliases"] = [
+                        alias for alias in existing["aliases"] if alias != "current"
+                    ]
+                    order.remove(path)
+                    order.append(path)
+                continue
+            candidate["aliases"] = list(candidate.get("aliases") or [])
+            by_path[path] = candidate
+            order.append(path)
+        return [by_path[path] for path in order]
+
+    def _dynamic_visual_selection_metadata(
+        self,
+        runtime_context: Dict[str, Any],
+        selected_candidates: List[Dict[str, Any]],
+        missing_candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        mode = self._dynamic_visual_context_mode(runtime_context)
+        requested = list(DYNAMIC_VISUAL_ROLE_ORDERS[mode])
+        selected_roles = set()
+        aliases: Dict[str, List[str]] = {}
+        for candidate in selected_candidates:
+            source = str(candidate.get("source") or "")
+            if source:
+                selected_roles.add(source)
+            candidate_aliases = [str(value) for value in candidate.get("aliases") or []]
+            selected_roles.update(candidate_aliases)
+            if candidate_aliases:
+                aliases[str(candidate.get("path") or "")] = candidate_aliases
+        return {
+            "visual_context_mode": mode,
+            "requested_image_roles": requested,
+            "selected_image_roles": [role for role in requested if role in selected_roles],
+            "missing_image_roles": [role for role in requested if role not in selected_roles],
+            "image_role_aliases": aliases,
+        }
+
     def _map_view_image_candidate(
         self,
         runtime_context: Dict[str, Any],
@@ -1481,7 +2340,15 @@ class OpenClawCliPlanPlanner:
         map_context = runtime_context.get("map_context")
         if not isinstance(map_context, dict):
             return None
-        if not map_context.get("map_frame_due") or not map_context.get("map_available"):
+        fresh = bool(map_context.get("map_frame_due") and map_context.get("map_available"))
+        interval = self._nonnegative_int(map_context.get("map_frame_interval_steps")) or 1
+        age_steps = self._int_or_none(map_context.get("map_age_steps"))
+        cached = bool(
+            map_context.get("cached_map_available")
+            and age_steps is not None
+            and 0 <= age_steps < interval
+        )
+        if not fresh and not cached:
             return None
         internal = runtime_context.get("_map_internal_context")
         if not isinstance(internal, dict):
@@ -1494,7 +2361,13 @@ class OpenClawCliPlanPlanner:
         return {
             "path": path,
             "source": "map_view",
-            "map_step_id": map_context.get("map_step_id"),
+            "map_step_id": (
+                map_context.get("map_step_id")
+                if fresh
+                else map_context.get("cached_map_step_id")
+            ),
+            "map_age_steps": 0 if fresh else age_steps,
+            "map_reuse": "fresh" if fresh else "cached",
             "map_image_hash": internal.get("map_image_hash")
             or map_context.get("map_image_hash"),
         }
@@ -1663,6 +2536,9 @@ class OpenClawCliPlanPlanner:
         ]
         if map_view and map_view[0].get("map_image_hash"):
             metadata["map_image_hash"] = str(map_view[0].get("map_image_hash") or "")
+        if map_view:
+            metadata["map_age_steps"] = map_view[0].get("map_age_steps")
+            metadata["map_reuse"] = map_view[0].get("map_reuse")
         metadata["retrieved_memory_image_count"] = len(retrieved)
         metadata["retrieved_memory_image_paths"] = [
             str(candidate.get("path") or "")
@@ -1712,6 +2588,8 @@ class OpenClawCliPlanPlanner:
                 else "retrieved_history_first_then_recent_current_oldest_to_newest_current_last"
             ),
             "current_image_last": bool(model_images.get("current_image_last")),
+            "visual_context_mode": model_images.get("visual_context_mode"),
+            "image_role_aliases": model_images.get("image_role_aliases") or {},
         }
 
     def _update_context_audit_for_model_step(
@@ -1741,6 +2619,13 @@ class OpenClawCliPlanPlanner:
             "map_frame_due",
             "map_step_id",
             "map_available",
+            "map_view_scope",
+            "map_refresh_reason",
+            "turn_loop_recovery_active",
+            "visual_recovery_phase",
+            "motion_feedback_enabled",
+            "forward_stall_odometry_enabled",
+            "map_collision_overlay_enabled",
         ):
             if step_mode.get(key) is not None:
                 context_audit[key] = step_mode.get(key)
@@ -1857,6 +2742,20 @@ class OpenClawCliPlanPlanner:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _nonnegative_int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _int_or_none(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _agent_session_id_for_payload(self, prompt_payload: Dict[str, Any]) -> str:
         state = prompt_payload.get("state") or {}
         if not isinstance(state, dict):
@@ -1939,6 +2838,39 @@ class OpenClawCliPlanPlanner:
             "history_tokens": 0,
             "openclaw_session_mode": session_mode,
             "openclaw_session_id": session_id,
+            "dynamic_visual_context_enabled": self.dynamic_visual_context_enabled,
+            "qwen_thinking_enabled": (
+                True
+                if self.qwen_thinking_mode == "on"
+                else False
+                if self.qwen_thinking_mode == "off"
+                else None
+            ),
+            "qwen_thinking_exercised": None,
+            "thinking_model_supported": None,
+            "qwen_output_json_valid": None,
+            "qwen_output_schema": self.qwen_output_schema,
+            "configured_model_id": self.openclaw_model or None,
+            "configured_model_id_canonical": self._canonical_model_id(
+                self.openclaw_model
+            ),
+            "returned_model_id": None,
+            "returned_model_id_canonical": None,
+            "qwen_transport_mode": self.qwen_transport_mode,
+            "qwen_temperature": 0,
+            "openclaw_model_max_images": self.openclaw_model_max_images,
+            "model_image_count_policy": (
+                "role_adaptive"
+                if self._is_qwen_direct_policy()
+                and self.dynamic_visual_context_enabled
+                else "legacy_cap"
+            ),
+            "openclaw_model_max_images_applied": not (
+                self._is_qwen_direct_policy()
+                and self.dynamic_visual_context_enabled
+            ),
+            "openclaw_model_image_interval_steps": self.openclaw_model_image_interval_steps,
+            "qwen_thinking_budget": self.qwen_thinking_budget,
         }
         if model_images is not None:
             image_paths = [
@@ -1970,10 +2902,24 @@ class OpenClawCliPlanPlanner:
                 "recent_current_image_paths",
                 "recent_current_missing_image_paths",
                 "retrieved_memory_ids",
+                "visual_context_mode",
+                "requested_image_roles",
+                "selected_image_roles",
+                "missing_image_roles",
+                "image_role_aliases",
+                "map_age_steps",
+                "map_reuse",
             ):
                 if key in model_images:
                     audit[key] = model_images[key]
         return audit
+
+    @staticmethod
+    def _canonical_model_id(model: Any) -> Optional[str]:
+        value = str(model or "").strip()
+        if not value:
+            return None
+        return value.split("/", 1)[1] if value.startswith("qwen/") else value
 
     def _estimate_tokens(self, text: str) -> int:
         if not text:
@@ -2340,6 +3286,32 @@ class OpenClawCliPlanPlanner:
                 metadata["qwen_api_retry_count"] = int(retry_count)
             except (TypeError, ValueError):
                 pass
+        provider_metadata = data.get("provider_metadata")
+        if isinstance(provider_metadata, dict):
+            for key in (
+                "qwen_thinking_enabled",
+                "qwen_thinking_exercised",
+                "thinking_model_supported",
+                "thinking_capability_fallback",
+                "thinking_transport_incompatible",
+                "reasoning_tokens",
+                "provider_latency_ms",
+                "provider_error_detail",
+                "provider_error_fingerprint",
+                "provider_degradation_attempted",
+                "provider_degradation_mode",
+                "provider_degradation_trigger_detail",
+                "provider_original_image_count",
+                "provider_final_image_count",
+            ):
+                if key in provider_metadata:
+                    metadata[key] = provider_metadata[key]
+            returned_model_id = provider_metadata.get("returned_model_id")
+            if isinstance(returned_model_id, str) and returned_model_id:
+                metadata["returned_model_id"] = returned_model_id
+                metadata["returned_model_id_canonical"] = self._canonical_model_id(
+                    returned_model_id
+                )
         return metadata
 
     def _extract_json_object(self, text: str) -> Dict[str, Any]:
@@ -2362,6 +3334,84 @@ class OpenClawCliPlanPlanner:
             if isinstance(value, dict):
                 return value
         raise RuntimeError("openclaw agent did not return a JSON object")
+
+    def _extract_route_v2_json_object(self, text: str) -> Dict[str, Any]:
+        if len(text) > ROUTE_V2_MAX_RESPONSE_CHARS:
+            raise RuntimeError(
+                f"qwen route_v2 response exceeds {ROUTE_V2_MAX_RESPONSE_CHARS} characters"
+            )
+        stripped = text.strip()
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("qwen route_v2 response must be exactly one JSON object") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError("qwen route_v2 response must be a JSON object")
+        return value
+
+    def _route_v2_repair_prompt(self, model_text: str, error: Exception) -> str:
+        candidate = model_text[:ROUTE_V2_MAX_RESPONSE_CHARS]
+        return "\n".join(
+            [
+                "Repair the candidate into exactly one valid QwenDirectPolicy JSON object.",
+                "Return JSON only. Do not include markdown, prose, chain-of-thought, or reasoning_content.",
+                "Preserve the candidate action and navigation evidence when valid; only fix schema, types, boundaries, and overlong fields.",
+                f"Validation error category: {self._route_v2_error_category(error)}.",
+                ROUTE_V2_FIELD_LIMITS_TEXT,
+                'Schema: {"action_text":"STOP|MOVE_FORWARD|TURN_LEFT|TURN_RIGHT","confidence":0.0,"visual_summary":"short","progress_state":"short","route_stage":"start|en_route|intermediate_landmark|post_landmark_transition|approaching_target|verifying_target|complete|unknown","confirmed_landmarks":["short"],"current_target":"short","target_relation":"short","stop_evidence":"none|visible_goal|instruction_complete","semantic_stop_state":"not_ready|visible_not_reached|approaching_target|at_or_inside_target|beside_target|instruction_complete_at_target","reason":"short"}',
+                "Candidate JSON text follows as a JSON-escaped string:",
+                json.dumps(candidate, ensure_ascii=True),
+            ]
+        )
+
+    @staticmethod
+    def _sanitize_route_v2_repair_candidate(
+        candidate: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        sanitized = dict(candidate)
+        sanitized_fields: List[str] = []
+        for key, limit in ROUTE_V2_STRING_LIMITS.items():
+            value = sanitized.get(key)
+            if isinstance(value, str) and len(value) > limit:
+                sanitized[key] = value[:limit]
+                sanitized_fields.append(key)
+        landmarks = sanitized.get("confirmed_landmarks")
+        if isinstance(landmarks, list):
+            clipped_landmarks = [
+                item[:ROUTE_V2_MAX_LANDMARK_CHARS]
+                if isinstance(item, str)
+                else item
+                for item in landmarks[:ROUTE_V2_MAX_LANDMARKS]
+            ]
+            if clipped_landmarks != landmarks:
+                sanitized["confirmed_landmarks"] = clipped_landmarks
+                sanitized_fields.append("confirmed_landmarks")
+        return sanitized, sorted(sanitized_fields)
+
+    @staticmethod
+    def _route_v2_error_category(error: Exception) -> str:
+        message = str(error)
+        categories = (
+            ("exceeds", "response_too_long"),
+            ("exactly one JSON object", "invalid_json_boundary"),
+            ("must be a JSON object", "invalid_json_type"),
+            ("fields mismatch", "schema_fields"),
+            ("action_text", "invalid_action_text"),
+            ("confidence", "invalid_confidence"),
+            ("visual_summary", "invalid_visual_summary"),
+            ("progress_state", "invalid_progress_state"),
+            ("current_target", "invalid_current_target"),
+            ("target_relation", "invalid_target_relation"),
+            ("reason", "invalid_reason"),
+            ("route_stage", "invalid_route_stage"),
+            ("confirmed_landmarks", "invalid_confirmed_landmarks"),
+            ("stop_evidence", "invalid_stop_evidence"),
+            ("semantic_stop_state", "invalid_semantic_stop_state"),
+        )
+        for marker, category in categories:
+            if marker in message:
+                return category
+        return "provider_or_unknown_error"
 
     def _normalize_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
         if self._is_qwen_direct_policy():
@@ -2388,6 +3438,8 @@ class OpenClawCliPlanPlanner:
         }
 
     def _normalize_direct_policy_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        if self.qwen_output_schema == "route_v2":
+            return self._normalize_route_v2_decision(decision)
         if "arguments" in decision and isinstance(decision.get("arguments"), dict):
             arguments = dict(decision.get("arguments") or {})
             reason = str(decision.get("reason") or arguments.get("reason") or "qwen_direct")
@@ -2412,6 +3464,54 @@ class OpenClawCliPlanPlanner:
             raise RuntimeError("qwen direct response missing supported action_text")
         arguments["action_text"] = action_text
         arguments["reason"] = reason
+        return {
+            "intent": "act",
+            "tool_name": "QwenDirectPolicy",
+            "arguments": arguments,
+            "reason": reason,
+        }
+
+    def _normalize_route_v2_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        fields = set(decision)
+        if fields != ROUTE_V2_REQUIRED_FIELDS:
+            missing = sorted(ROUTE_V2_REQUIRED_FIELDS - fields)
+            extra = sorted(fields - ROUTE_V2_REQUIRED_FIELDS)
+            raise RuntimeError(
+                f"qwen route_v2 fields mismatch missing={missing} extra={extra}"
+            )
+        action_text = decision.get("action_text")
+        if action_text not in ACTION_TEXTS:
+            raise RuntimeError("qwen route_v2 action_text is invalid")
+        confidence = decision.get("confidence")
+        if (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+        ):
+            raise RuntimeError("qwen route_v2 confidence is invalid")
+        for key, limit in ROUTE_V2_STRING_LIMITS.items():
+            value = decision.get(key)
+            if not isinstance(value, str) or len(value) > limit:
+                raise RuntimeError(f"qwen route_v2 {key} is invalid")
+        if decision.get("route_stage") not in ROUTE_STAGES:
+            raise RuntimeError("qwen route_v2 route_stage is invalid")
+        landmarks = decision.get("confirmed_landmarks")
+        if (
+            not isinstance(landmarks, list)
+            or len(landmarks) > ROUTE_V2_MAX_LANDMARKS
+            or any(
+                not isinstance(item, str) or len(item) > ROUTE_V2_MAX_LANDMARK_CHARS
+                for item in landmarks
+            )
+        ):
+            raise RuntimeError("qwen route_v2 confirmed_landmarks is invalid")
+        if decision.get("stop_evidence") not in STOP_EVIDENCE_VALUES:
+            raise RuntimeError("qwen route_v2 stop_evidence is invalid")
+        if decision.get("semantic_stop_state") not in SEMANTIC_STOP_STATES:
+            raise RuntimeError("qwen route_v2 semantic_stop_state is invalid")
+        arguments = dict(decision)
+        reason = arguments["reason"]
         return {
             "intent": "act",
             "tool_name": "QwenDirectPolicy",
@@ -2511,6 +3611,23 @@ def main() -> None:
     parser.add_argument("--openclaw_model_image_interval_steps", type=int, default=20)
     parser.add_argument("--openclaw_model_fast_mode", default="qwen_text_only")
     parser.add_argument("--openclaw_model_fast_use_memory_context", type=int, default=1)
+    parser.add_argument("--dynamic_visual_context_enabled", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--qwen_thinking_mode",
+        choices=("auto", "off", "on"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--qwen_output_schema",
+        choices=("legacy", "route_v2"),
+        default="legacy",
+    )
+    parser.add_argument("--qwen_thinking_budget", type=int, default=None)
+    parser.add_argument(
+        "--qwen_transport_mode",
+        choices=("sync",),
+        default="sync",
+    )
     parser.add_argument("--agent_session_id", default="")
     parser.add_argument("--openclaw_visual_mode", choices=("path", "describe"), default="path")
     parser.add_argument("--openclaw_visual_max_images", type=int, default=2)
@@ -2535,6 +3652,11 @@ def main() -> None:
         openclaw_model_image_interval_steps=args.openclaw_model_image_interval_steps,
         openclaw_model_fast_mode=args.openclaw_model_fast_mode,
         openclaw_model_fast_use_memory_context=bool(args.openclaw_model_fast_use_memory_context),
+        dynamic_visual_context_enabled=bool(args.dynamic_visual_context_enabled),
+        qwen_thinking_mode=args.qwen_thinking_mode,
+        qwen_output_schema=args.qwen_output_schema,
+        qwen_thinking_budget=args.qwen_thinking_budget,
+        qwen_transport_mode=args.qwen_transport_mode,
         agent_session_id=args.agent_session_id,
         openclaw_visual_mode=args.openclaw_visual_mode,
         openclaw_visual_max_images=args.openclaw_visual_max_images,
