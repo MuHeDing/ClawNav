@@ -293,6 +293,7 @@ def test_staged_memory_launchers_propagate_strict_controller_contract():
     assert "--required_stage_schema instruction_stages_v1" in evaluation
     assert "--required_action_schema route_v3_staged" in evaluation
     assert "QWEN_STAGE_PLAN_CAPTURE=1" in ablation
+    assert ablation.count('DATA_PATH="${DATA_PATH}"') == 3
     assert "staged_memory_off" in ablation
     assert "staged_memory_on" in ablation
     assert "STAGED_MEMORY_COMPARISON_MANIFEST" in ablation

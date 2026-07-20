@@ -32,6 +32,11 @@ class RecordingMemoryClient(BaseSpatialMemoryClient):
         return self.hits[:n_results]
 
 
+class FailingMemoryClient(RecordingMemoryClient):
+    def query_semantic(self, *args, **kwargs):
+        raise RuntimeError("external backend unavailable")
+
+
 def test_staged_recall_merges_episode_visual_hits_before_external_hits(tmp_path):
     image_path = tmp_path / "doorway.png"
     image_path.write_bytes(b"png")
@@ -56,7 +61,11 @@ def test_staged_recall_merges_episode_visual_hits_before_external_hits(tmp_path)
     )
     manager = MemoryManager(
         RecordingMemoryClient([fake_text_hit]),
-        HarnessConfig(staged_visual_memory_enabled=True),
+        HarnessConfig(
+            policy_backend="qwen_direct",
+            dynamic_visual_context_enabled=True,
+            staged_visual_memory_enabled=True,
+        ),
         episode_visual_store=store,
     )
 
@@ -76,6 +85,78 @@ def test_staged_recall_merges_episode_visual_hits_before_external_hits(tmp_path)
     assert result.policy_context["memory_images"] == [str(image_path.resolve())]
 
 
+def test_staged_recall_keeps_local_hits_when_optional_external_backend_fails(
+    tmp_path,
+):
+    image_path = tmp_path / "local.png"
+    image_path.write_bytes(b"png")
+    store = EpisodeVisualMemoryStore()
+    store.start_episode("s1", "e1")
+    store.add_observation(
+        image_path=str(image_path),
+        step_id=1,
+        stage_id="stage_00",
+        visual_summary="local doorway",
+        image_roles=["keyframe"],
+    )
+    manager = MemoryManager(
+        FailingMemoryClient([]),
+        HarnessConfig(
+            policy_backend="qwen_direct",
+            dynamic_visual_context_enabled=True,
+            staged_visual_memory_enabled=True,
+        ),
+        episode_visual_store=store,
+    )
+
+    result = manager.recall(
+        "doorway",
+        step_id=2,
+        active_stage_id="stage_00",
+        n_results=1,
+    )
+
+    assert [hit.memory_id for hit in result.hits] == ["mem_000001"]
+    assert result.control_context["external_query_status"] == "failed_optional"
+
+
+def test_staged_recall_bounds_combined_local_and_external_hits(tmp_path):
+    store = EpisodeVisualMemoryStore()
+    store.start_episode("s1", "e1")
+    for step_id in range(2):
+        image_path = tmp_path / f"local-{step_id}.png"
+        image_path.write_bytes(b"png")
+        store.add_observation(
+            image_path=str(image_path),
+            step_id=step_id,
+            visual_summary="doorway",
+            image_roles=["keyframe"],
+        )
+    external = [
+        MemoryHit(
+            memory_id=f"external-{index}",
+            memory_type="semantic",
+            name="doorway",
+            confidence=0.5,
+        )
+        for index in range(2)
+    ]
+    manager = MemoryManager(
+        RecordingMemoryClient(external),
+        HarnessConfig(
+            policy_backend="qwen_direct",
+            dynamic_visual_context_enabled=True,
+            staged_visual_memory_enabled=True,
+        ),
+        episode_visual_store=store,
+    )
+
+    result = manager.recall("doorway", step_id=2, n_results=2)
+
+    assert len(result.hits) == 2
+    assert all(hit.memory_id.startswith("mem_") for hit in result.hits)
+
+
 def test_fake_text_only_hit_does_not_count_as_visual_recall():
     fake_text_hit = MemoryHit(
         memory_id="fake-text",
@@ -86,7 +167,11 @@ def test_fake_text_only_hit_does_not_count_as_visual_recall():
     )
     manager = MemoryManager(
         RecordingMemoryClient([fake_text_hit]),
-        HarnessConfig(staged_visual_memory_enabled=True),
+        HarnessConfig(
+            policy_backend="qwen_direct",
+            dynamic_visual_context_enabled=True,
+            staged_visual_memory_enabled=True,
+        ),
         episode_visual_store=EpisodeVisualMemoryStore(),
     )
 

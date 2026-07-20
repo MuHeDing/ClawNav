@@ -58,6 +58,17 @@ class HarnessConfig:
     staged_shadow_max_events: int = 5
 
     def __post_init__(self) -> None:
+        if self.staged_visual_memory_enabled and self.policy_backend != "qwen_direct":
+            raise ValueError(
+                "staged_visual_memory_enabled requires policy_backend=qwen_direct"
+            )
+        if (
+            self.staged_visual_memory_enabled
+            and not self.dynamic_visual_context_enabled
+        ):
+            raise ValueError(
+                "staged_visual_memory_enabled requires dynamic visual context"
+            )
         if self.staged_memory_treatment not in {"on", "off_ablation"}:
             raise ValueError("staged_memory_treatment must be one of: on, off_ablation")
         if (

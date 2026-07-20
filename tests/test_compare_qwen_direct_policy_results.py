@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from scripts.compare_qwen_direct_policy_results import (
+    _validate_stage_plan_manifest,
     compare_ablation_2x2,
     compare_result_files,
     compare_staged_memory_arms,
@@ -203,7 +204,16 @@ def test_compare_staged_memory_arms_requires_exact_keys_and_fingerprints(tmp_pat
         shadow = tmp_path / f"{name}.shadow.json"
         _write_jsonl(
             result,
-            [{"scene_id": "s1", "episode_id": "1", "success": 1, "spl": 0.5}],
+            [
+                {
+                    "scene_id": "s1",
+                    "episode_id": "1",
+                    "success": 1,
+                    "spl": 0.5,
+                    "ne": 1.25,
+                    "steps": 8,
+                }
+            ],
         )
         _write_jsonl(
             trace,
@@ -216,6 +226,7 @@ def test_compare_staged_memory_arms_requires_exact_keys_and_fingerprints(tmp_pat
                         "stage_plan_sha256": "stage-hash",
                         "provider_config_sha256": "provider-hash",
                         "memory_treatment": treatment,
+                        "segmentation_source": "frozen_manifest",
                         "memory_event_id": "event-1",
                         "trigger_reasons": ["stage_entry"],
                         "registry_attempts": 1 if treatment == "on" else 0,
@@ -230,6 +241,16 @@ def test_compare_staged_memory_arms_requires_exact_keys_and_fingerprints(tmp_pat
                         "candidate_action_after": "TURN_LEFT",
                         "controller_intervention": "blocked_stop",
                         "executed_action": "TURN_LEFT",
+                    },
+                    "context_audit": {
+                        "qwen_model_called": True,
+                        "qwen_output_json_valid": True,
+                        "provider_latency_ms": 25.0,
+                        "selected_image_roles": (
+                            ["retrieved_memory", "current"]
+                            if treatment == "on"
+                            else ["current"]
+                        ),
                     },
                 }
             ],
@@ -264,6 +285,15 @@ def test_compare_staged_memory_arms_requires_exact_keys_and_fingerprints(tmp_pat
         report["arms"]["staged_memory_off"]["event_audit"]["retrieval_hit_count"] == 0
     )
     assert report["shadow_agreement"]["stable"] is True
+    assert (
+        report["arms"]["staged_memory_on"]["metrics"]["navigation_error_mean"] == 1.25
+    )
+    assert report["arms"]["staged_memory_on"]["metrics"]["steps_mean"] == 8.0
+    assert report["arms"]["staged_memory_on"]["trace_audit"]["provider_valid"] is True
+    assert (
+        report["arms"]["staged_memory_on"]["trace_audit"]["provider_latency_ms_mean"]
+        == 25.0
+    )
 
 
 def test_compare_staged_memory_arms_rejects_fingerprint_mismatch(tmp_path):
@@ -298,6 +328,87 @@ def test_compare_staged_memory_arms_rejects_fingerprint_mismatch(tmp_path):
 
     assert report["valid"] is False
     assert report["fingerprints_match"] is False
+
+
+def test_compare_staged_memory_arms_rejects_intra_episode_fingerprint_drift(
+    tmp_path,
+):
+    arms = {}
+    for name, treatment in (
+        ("staged_memory_on", "on"),
+        ("staged_memory_off", "off_ablation"),
+    ):
+        result = tmp_path / f"{name}.jsonl"
+        trace = tmp_path / f"{name}.trace.jsonl"
+        _write_jsonl(result, [{"scene_id": "s1", "episode_id": "1"}])
+        _write_jsonl(
+            trace,
+            [
+                {
+                    "scene_id": "s1",
+                    "episode_id": "1",
+                    "staged_visual_memory": {
+                        "instruction_sha256": "same",
+                        "stage_plan_sha256": stage_hash,
+                        "provider_config_sha256": "same-provider",
+                        "memory_treatment": treatment,
+                    },
+                }
+                for stage_hash in ("stage-a", "stage-b")
+            ],
+        )
+        arms[name] = {"result": result, "trace": trace}
+
+    report = compare_staged_memory_arms(arms)
+
+    assert report["valid"] is False
+    assert report["fingerprints_match"] is False
+    assert (
+        "invalid_episode_fingerprints"
+        in report["arms"]["staged_memory_on"]["invalid_reasons"]
+    )
+
+
+def test_stage_plan_manifest_validation_matches_episode_trace_fingerprints(tmp_path):
+    manifest = tmp_path / "stage-manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": "staged_stage_plan_manifest_v1",
+                "rows": [
+                    {
+                        "episode_key": "s1:1",
+                        "instruction_sha256": "instruction-hash",
+                        "stage_plan_sha256": "stage-hash",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = {
+        "exact_episode_keys": ["s1:1"],
+        "arms": {
+            name: {
+                "episode_fingerprints": {
+                    "s1:1": ["instruction-hash", "stage-hash", "provider-hash"]
+                }
+            }
+            for name in ("staged_memory_on", "staged_memory_off")
+        },
+    }
+
+    valid = _validate_stage_plan_manifest(report, manifest)
+    report["arms"]["staged_memory_on"]["episode_fingerprints"]["s1:1"][
+        1
+    ] = "wrong-stage-hash"
+    invalid = _validate_stage_plan_manifest(report, manifest)
+
+    assert valid["valid"] is True
+    assert invalid["valid"] is False
+    assert invalid["invalid_reasons"] == [
+        "stage_manifest_fingerprint_mismatch:staged_memory_on:s1:1"
+    ]
 
 
 def _ablation_trace_row(*, dynamic, thinking, exercised, success_action="MOVE_FORWARD"):

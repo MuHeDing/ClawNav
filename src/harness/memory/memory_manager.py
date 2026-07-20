@@ -82,20 +82,7 @@ class MemoryManager:
             planner_reason=planner_reason,
             critic_signal=critic_signal,
         )
-        external_hits = self.client.query_semantic(
-            query_text,
-            n_results=n_results,
-            allowed_scopes=allowed_scopes,
-            memory_namespace=memory_namespace,
-        )
-        external_hits = self._filter_hits(
-            external_hits,
-            allowed_scopes=allowed_scopes,
-            memory_namespace=memory_namespace,
-        )
-        external_hits = self._rerank_hits(
-            external_hits, query_text=query_text, step_id=step_id
-        )
+        bounded_results = max(0, int(n_results))
         include_episode_store = (
             self.config.staged_visual_memory_enabled
             if use_episode_visual_store is None
@@ -103,17 +90,45 @@ class MemoryManager:
         )
         episode_query_status = "not_attempted"
         episode_hits: List[MemoryHit] = []
-        if include_episode_store and self.episode_visual_store is not None:
+        episode_store_attempted = (
+            include_episode_store and self.episode_visual_store is not None
+        )
+        if episode_store_attempted:
             episode_result = self.episode_visual_store.query_semantic(
                 query_text,
                 active_stage_id=active_stage_id,
                 expected_landmarks=expected_landmarks or [],
                 trigger_reasons=trigger_reasons or ([reason] if reason else []),
-                limit=min(n_results, self.config.staged_semantic_query_max_records),
+                limit=min(
+                    bounded_results,
+                    self.config.staged_semantic_query_max_records,
+                ),
             )
             episode_query_status = episode_result.status.value
             episode_hits = episode_result.to_memory_hits()
-        hits = self._merge_hits(episode_hits, external_hits)
+        external_query_status = "not_attempted"
+        try:
+            external_hits = self.client.query_semantic(
+                query_text,
+                n_results=bounded_results,
+                allowed_scopes=allowed_scopes,
+                memory_namespace=memory_namespace,
+            )
+            external_hits = self._filter_hits(
+                external_hits,
+                allowed_scopes=allowed_scopes,
+                memory_namespace=memory_namespace,
+            )
+            external_hits = self._rerank_hits(
+                external_hits, query_text=query_text, step_id=step_id
+            )
+            external_query_status = "selected" if external_hits else "empty"
+        except Exception:
+            if not episode_store_attempted:
+                raise
+            external_hits = []
+            external_query_status = "failed_optional"
+        hits = self._merge_hits(episode_hits, external_hits)[:bounded_results]
         self.mark_recalled(step_id)
         visual_memory_hit_count = sum(1 for hit in hits if hit.image_path)
         return MemoryRecallResult(
@@ -125,6 +140,7 @@ class MemoryManager:
                 hits,
                 reason,
                 episode_store_query_status=episode_query_status,
+                external_query_status=external_query_status,
                 episode_hit_count=len(episode_hits),
                 external_hit_count=len(external_hits),
                 visual_memory_hit_count=visual_memory_hit_count,
@@ -182,6 +198,7 @@ class MemoryManager:
         reason: str,
         *,
         episode_store_query_status: str = "not_attempted",
+        external_query_status: str = "not_attempted",
         episode_hit_count: int = 0,
         external_hit_count: int = 0,
         visual_memory_hit_count: int = 0,
@@ -195,6 +212,7 @@ class MemoryManager:
             "best_landmark": self._best_landmark(best_hit),
             "recall_confidence": best_hit.confidence if best_hit else 0.0,
             "episode_store_query_status": episode_store_query_status,
+            "external_query_status": external_query_status,
             "episode_hit_count": episode_hit_count,
             "external_hit_count": external_hit_count,
             "visual_memory_hit_count": visual_memory_hit_count,

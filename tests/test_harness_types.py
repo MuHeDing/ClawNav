@@ -80,6 +80,8 @@ def test_harness_config_rejects_ablation_without_staged_mode():
 
 def test_harness_config_accepts_staged_ablation_with_bounded_settings():
     cfg = HarnessConfig(
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
         staged_visual_memory_enabled=True,
         staged_memory_treatment="off_ablation",
         staged_memory_event_cap=1,
@@ -88,3 +90,19 @@ def test_harness_config_accepts_staged_ablation_with_bounded_settings():
 
     assert cfg.staged_memory_treatment == "off_ablation"
     assert cfg.staged_memory_event_cap == 1
+
+
+def test_harness_config_rejects_staged_mode_outside_qwen_dynamic_contract():
+    for overrides in (
+        {"staged_visual_memory_enabled": True},
+        {
+            "policy_backend": "qwen_direct",
+            "staged_visual_memory_enabled": True,
+        },
+    ):
+        try:
+            HarnessConfig(**overrides)
+        except ValueError as exc:
+            assert "requires" in str(exc)
+        else:
+            raise AssertionError("expected staged controller contract failure")

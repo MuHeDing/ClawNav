@@ -102,6 +102,20 @@ def compare_staged_memory_arms(
             invalid_reasons.append("unexpected_memory_treatment")
         if set(arm_fingerprints) != result_keys:
             invalid_reasons.append("incomplete_fingerprint_keys")
+        if any(
+            not all(fingerprint) or "inconsistent" in fingerprint
+            for fingerprint in arm_fingerprints.values()
+        ):
+            invalid_reasons.append("invalid_episode_fingerprints")
+        trace_audit = _staged_trace_audit(trace_rows, event_rows)
+        if not trace_audit["provider_valid"]:
+            invalid_reasons.append("provider_invalid")
+        if not trace_audit["segmentation_source_counts"]:
+            invalid_reasons.append("missing_segmentation_source")
+        if trace_audit["segmentation_fallback_count"]:
+            invalid_reasons.append("unexpected_segmentation_fallback")
+        if trace_audit["undelivered_attachment_count"]:
+            invalid_reasons.append("memory_attachment_not_delivered")
         shadow_summary = None
         if spec.get("shadow_summary"):
             shadow_summary = json.loads(
@@ -110,6 +124,10 @@ def compare_staged_memory_arms(
         report_arms[name] = {
             "result_count": len(result_rows),
             "metrics": _metrics(list(result_rows.values())),
+            "trace_audit": trace_audit,
+            "episode_fingerprints": {
+                key: list(value) for key, value in sorted(arm_fingerprints.items())
+            },
             "duplicate_keys": sorted(duplicates),
             "treatments": sorted(treatments),
             "event_audit": _staged_event_audit(event_rows),
@@ -123,6 +141,8 @@ def compare_staged_memory_arms(
         fingerprints[STAGED_MEMORY_ARMS[0]].get(key)
         == fingerprints[STAGED_MEMORY_ARMS[1]].get(key)
         and all(fingerprints[name].get(key, ("", "", "")))
+        and "inconsistent" not in fingerprints[name].get(key, ())
+        for name in STAGED_MEMORY_ARMS
         for key in exact_keys
     )
     shadow_summaries = [
@@ -155,6 +175,7 @@ def compare_staged_memory_arms(
             "available": shadow_available,
             "stable": shadow_stable if shadow_available else None,
         },
+        "matched_deltas": _staged_metric_deltas(report_arms),
     }
 
 
@@ -181,7 +202,110 @@ def _staged_event_audit(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             str(row.get("controller_intervention") or "none") != "none" for row in rows
         ),
         "executed_action_count": sum(bool(row.get("executed_action")) for row in rows),
+        "executed_action_change_count": sum(
+            bool(row.get("candidate_action_after"))
+            and row.get("candidate_action_after") != row.get("executed_action")
+            for row in rows
+        ),
     }
+
+
+def _staged_trace_audit(
+    trace_rows: List[Dict[str, Any]],
+    event_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    model_rows = []
+    latency_values = []
+    provider_delivery_count = 0
+    attached_event_count = 0
+    segmentation_sources: Counter[str] = Counter()
+    trigger_counts: Counter[str] = Counter()
+    for row in trace_rows:
+        staged = row.get("staged_visual_memory")
+        if isinstance(staged, dict):
+            source = str(staged.get("segmentation_source") or "")
+            if source:
+                segmentation_sources[source] += 1
+            if staged.get("attached_image_roles"):
+                attached_event_count += 1
+        audit = row.get("context_audit")
+        if not isinstance(audit, dict) or audit.get("qwen_model_called") is not True:
+            continue
+        model_rows.append(audit)
+        selected_roles = {
+            str(role)
+            for role in (
+                audit.get("selected_image_roles")
+                or audit.get("model_image_sources")
+                or []
+            )
+        }
+        if (
+            isinstance(staged, dict)
+            and staged.get("attached_image_roles")
+            and "retrieved_memory" in selected_roles
+        ):
+            provider_delivery_count += 1
+        if audit.get("provider_latency_ms") is not None:
+            latency_values.append(_float(audit.get("provider_latency_ms")))
+    for event in event_rows:
+        for reason in event.get("trigger_reasons") or []:
+            trigger_counts[str(reason)] += 1
+    provider_failure_count = sum(
+        audit.get("qwen_output_json_valid") is not True
+        or bool(audit.get("provider_error_detail"))
+        for audit in model_rows
+    )
+    return {
+        "trace_row_count": len(trace_rows),
+        "provider_call_count": len(model_rows),
+        "provider_valid_count": len(model_rows) - provider_failure_count,
+        "provider_failure_count": provider_failure_count,
+        "provider_valid": bool(model_rows) and provider_failure_count == 0,
+        "provider_latency_ms_mean": (
+            round(sum(latency_values) / len(latency_values), 3)
+            if latency_values
+            else None
+        ),
+        "segmentation_source_counts": dict(sorted(segmentation_sources.items())),
+        "segmentation_fallback_count": sum(
+            count
+            for source, count in segmentation_sources.items()
+            if source not in {"qwen", "frozen_manifest"}
+        ),
+        "trigger_counts": dict(sorted(trigger_counts.items())),
+        "registry_hit_count": sum(
+            event.get("registry_status") == "hit" for event in event_rows
+        ),
+        "explicit_query_hit_count": sum(
+            event.get("query_status") == "hit" for event in event_rows
+        ),
+        "provider_delivery_count": provider_delivery_count,
+        "undelivered_attachment_count": max(
+            0, attached_event_count - provider_delivery_count
+        ),
+    }
+
+
+def _staged_metric_deltas(arms: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    off = arms["staged_memory_off"]
+    on = arms["staged_memory_on"]
+    return {
+        "success_rate": _metric_delta(off, on, "success_rate"),
+        "spl_rate": _metric_delta(off, on, "spl_rate"),
+        "navigation_error_mean": _metric_delta(off, on, "navigation_error_mean"),
+        "steps_mean": _metric_delta(off, on, "steps_mean"),
+        "provider_latency_ms_mean": _optional_delta(
+            off["trace_audit"].get("provider_latency_ms_mean"),
+            on["trace_audit"].get("provider_latency_ms_mean"),
+        ),
+    }
+
+
+def _optional_delta(baseline: Any, treatment: Any) -> Optional[float]:
+    if baseline is None or treatment is None:
+        return None
+    return round(float(treatment) - float(baseline), 6)
 
 
 def validate_qwen_direct_trace(trace_path: Path | str) -> Dict[str, Any]:
@@ -590,6 +714,68 @@ def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _validate_stage_plan_manifest(
+    report: Dict[str, Any], manifest_path: Path
+) -> Dict[str, Any]:
+    validation = {
+        "path": str(manifest_path),
+        "exists": manifest_path.is_file(),
+        "valid": False,
+        "invalid_reasons": [],
+    }
+    if not manifest_path.is_file():
+        validation["invalid_reasons"].append("missing_stage_plan_manifest")
+        return validation
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        validation["invalid_reasons"].append("invalid_stage_plan_manifest_json")
+        return validation
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "staged_stage_plan_manifest_v1"
+        or not isinstance(rows, list)
+    ):
+        validation["invalid_reasons"].append("invalid_stage_plan_manifest_schema")
+        return validation
+    indexed: Dict[str, Dict[str, Any]] = {}
+    duplicates = []
+    for row in rows:
+        if not isinstance(row, dict):
+            validation["invalid_reasons"].append("invalid_stage_plan_manifest_row")
+            continue
+        key = str(row.get("episode_key") or "")
+        if not key:
+            validation["invalid_reasons"].append("invalid_stage_plan_manifest_row")
+            continue
+        if key in indexed:
+            duplicates.append(key)
+        indexed[key] = row
+    exact_keys = report.get("exact_episode_keys") or []
+    if sorted(indexed) != sorted(str(key) for key in exact_keys):
+        validation["invalid_reasons"].append("stage_manifest_episode_keys_mismatch")
+    if duplicates:
+        validation["invalid_reasons"].append("duplicate_stage_manifest_episode_keys")
+    for arm_name in STAGED_MEMORY_ARMS:
+        arm = report.get("arms", {}).get(arm_name, {})
+        arm_fingerprints = arm.get("episode_fingerprints") or {}
+        for key in exact_keys:
+            fingerprint = arm_fingerprints.get(key) or []
+            row = indexed.get(key) or {}
+            if len(fingerprint) < 2 or fingerprint[:2] != [
+                str(row.get("instruction_sha256") or ""),
+                str(row.get("stage_plan_sha256") or ""),
+            ]:
+                validation["invalid_reasons"].append(
+                    f"stage_manifest_fingerprint_mismatch:{arm_name}:{key}"
+                )
+    validation["invalid_reasons"] = sorted(set(validation["invalid_reasons"]))
+    validation["episode_keys"] = sorted(indexed)
+    validation["valid"] = not validation["invalid_reasons"]
+    return validation
+
+
 def _episode_key(row: Dict[str, Any]) -> str:
     if "scene_id" not in row or "episode_id" not in row:
         return ""
@@ -602,12 +788,32 @@ def _metrics(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     success_sum = sum(_float(row.get("success")) for row in row_list)
     spl_sum = sum(_float(row.get("spl")) for row in row_list)
     os_sum = sum(_float(row.get("oracle_success")) for row in row_list)
+    navigation_errors = [
+        _optional_float(row.get("ne", row.get("distance_to_goal"))) for row in row_list
+    ]
+    steps = [_optional_float(row.get("steps")) for row in row_list]
     return {
         "count": count,
         "success_rate": round(success_sum / count, 6) if count else None,
         "spl_rate": round(spl_sum / count, 6) if count else None,
         "oracle_success_rate": round(os_sum / count, 6) if count else None,
+        "navigation_error_mean": _mean_present(navigation_errors),
+        "steps_mean": _mean_present(steps),
     }
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mean_present(values: Iterable[Optional[float]]) -> Optional[float]:
+    present = [value for value in values if value is not None]
+    return round(sum(present) / len(present), 6) if present else None
 
 
 def _overlap_buckets(
@@ -668,7 +874,7 @@ def main() -> int:
         if set(STAGED_MEMORY_ARMS).issubset(resolved_arms):
             report = compare_staged_memory_arms(resolved_arms)
             expected_keys = manifest.get("expected_episode_keys")
-            if isinstance(expected_keys, list):
+            if isinstance(expected_keys, list) and expected_keys:
                 expected = sorted(str(value) for value in expected_keys)
                 report["expected_episode_keys"] = expected
                 report["expected_episode_keys_match"] = (
@@ -676,13 +882,30 @@ def main() -> int:
                 )
                 if not report["expected_episode_keys_match"]:
                     report["valid"] = False
+            else:
+                report["expected_episode_keys"] = []
+                report["expected_episode_keys_match"] = False
+                report["valid"] = False
             stage_manifest = manifest.get("stage_plan_manifest")
             if stage_manifest:
-                stage_manifest_path = (base_dir / Path(stage_manifest)).resolve()
-                report["stage_plan_manifest"] = str(stage_manifest_path)
-                report["stage_plan_manifest_exists"] = stage_manifest_path.is_file()
-                if not report["stage_plan_manifest_exists"]:
+                raw_stage_manifest_path = Path(stage_manifest).expanduser()
+                stage_manifest_path = (
+                    raw_stage_manifest_path.resolve()
+                    if raw_stage_manifest_path.is_absolute()
+                    else (base_dir / raw_stage_manifest_path).resolve()
+                )
+                validation = _validate_stage_plan_manifest(report, stage_manifest_path)
+                report["stage_plan_manifest"] = validation
+                if not validation["valid"]:
                     report["valid"] = False
+            else:
+                report["stage_plan_manifest"] = {
+                    "path": "",
+                    "exists": False,
+                    "valid": False,
+                    "invalid_reasons": ["missing_stage_plan_manifest"],
+                }
+                report["valid"] = False
         else:
             report = compare_ablation_2x2(resolved_arms)
     else:

@@ -715,10 +715,39 @@ class OpenClawVLNRuntime:
             or key.startswith("thinking_")
             or key in {"provider_degradation_mode"}
         }
+        provider_config_fields = (
+            "configured_model_id",
+            "configured_model_id_canonical",
+            "qwen_output_schema",
+            "qwen_transport_mode",
+            "qwen_temperature",
+            "qwen_thinking_enabled",
+            "qwen_thinking_budget",
+            "dynamic_visual_context_enabled",
+            "openclaw_model_max_images",
+            "model_image_count_policy",
+            "openclaw_model_max_images_applied",
+            "openclaw_model_image_interval_steps",
+            "map_assist_mode",
+            "map_frame_interval_steps",
+            "motion_feedback_enabled",
+            "forward_stall_odometry_enabled",
+            "map_collision_overlay_enabled",
+        )
         provider_config = {
             "planner_backend": getattr(decision, "planner_backend", ""),
             "policy_backend": self.policy_backend,
-            "thinking": thinking,
+            "provider": {key: context_audit.get(key) for key in provider_config_fields},
+            "controller": {
+                key: runtime_payload.get(key)
+                for key in (
+                    "keyframe_policy_mode",
+                    "keyframe_min_gap_steps",
+                    "keyframe_episode_cap",
+                    "keyframe_coverage_gap_steps",
+                    "evaluation_max_steps",
+                )
+            },
         }
         provider_config_sha256 = hashlib.sha256(
             json.dumps(

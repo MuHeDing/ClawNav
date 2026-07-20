@@ -672,6 +672,14 @@ class HarnessModelProxy:
             "policy_action": self.last_action_text,
             "run_id": str(self.components.get("output_path") or ""),
             "keyframe_policy_mode": self.components["config"].keyframe_policy_mode,
+            "keyframe_min_gap_steps": self.components["config"].keyframe_min_gap_steps,
+            "keyframe_episode_cap": self.components["config"].keyframe_episode_cap,
+            "keyframe_coverage_gap_steps": self.components[
+                "config"
+            ].keyframe_coverage_gap_steps,
+            "evaluation_max_steps": int(
+                getattr(self.components["args"], "max_steps", 400)
+            ),
             "dynamic_visual_context_enabled": self.components[
                 "config"
             ].dynamic_visual_context_enabled,
