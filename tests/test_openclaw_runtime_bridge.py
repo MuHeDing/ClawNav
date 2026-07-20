@@ -15,7 +15,7 @@ from harness.skill_registry import SkillRegistry
 from harness.skills.base import Skill
 from harness.skills.memory_write import MemoryWriteSkill
 from harness.skills.visual_memory_curator import VisualMemoryCuratorSkill
-from harness.types import SkillResult, VLNState
+from harness.types import MemoryHit, SkillResult, VLNState
 
 
 class EchoNavigationSkill(Skill):
@@ -69,6 +69,39 @@ class RecordingMemorySkill(Skill):
         return SkillResult.ok_result(
             "memory",
             {"policy_context": {"memory_context_text": "doorway"}},
+        )
+
+
+class ImageBackedMemorySkill(Skill):
+    name = "MemoryQuerySkill"
+    description = "Returns one image-backed memory and records calls."
+    input_schema = {"type": "object"}
+    output_schema = {"type": "object"}
+
+    def __init__(self, image_path="/tmp/history.png", fail=False):
+        self.image_path = image_path
+        self.fail = fail
+        self.calls = []
+
+    def run(self, state, payload):
+        self.calls.append(dict(payload))
+        if self.fail:
+            return SkillResult.error_result("query unavailable")
+        return SkillResult.ok_result(
+            "memory_query",
+            {
+                "memory_hits": [
+                    MemoryHit(
+                        memory_id="query_mem_1",
+                        memory_type="episode_visual",
+                        name="hallway",
+                        confidence=0.9,
+                        image_path=self.image_path,
+                        metadata={"stage_id": "stage_00", "image_backed": True},
+                    )
+                ],
+                "policy_context": {"memory_images": [self.image_path]},
+            },
         )
 
 
@@ -155,6 +188,18 @@ class StagedRecordingPlanner(RecordingPlanner):
             error = self.plan_errors.pop(0)
             if error:
                 raise error
+        return self.decision
+
+
+class StagedSequencePlanner(StagedRecordingPlanner):
+    def __init__(self, decisions, stages=None):
+        super().__init__(decisions[-1], stages=stages)
+        self.decisions = list(decisions)
+
+    def plan(self, state, runtime_context):
+        self.payloads.append(dict(runtime_context))
+        if self.decisions:
+            return self.decisions.pop(0)
         return self.decision
 
 
@@ -2782,6 +2827,7 @@ def _two_stage_manifest():
 
 
 def _staged_runtime(planner, **overrides):
+    overrides.setdefault("staged_memory_treatment", "off_ablation")
     return OpenClawVLNRuntime(
         tool_registry=SkillRegistry(),
         planner=planner,
@@ -2897,8 +2943,8 @@ def test_staged_runtime_controller_advances_once_and_emits_next_entry_edge():
         first.runtime_metadata["stage_transition"]["decision"] == "needs_verification"
     )
     assert second.runtime_metadata["stage_transition"]["decision"] == "accepted"
-    assert planner.payloads[2]["active_stage_id"] == "stage_01"
-    assert planner.payloads[2]["trigger_reasons"] == ["stage_entry"]
+    assert planner.payloads[4]["active_stage_id"] == "stage_01"
+    assert "stage_entry" in planner.payloads[4]["trigger_reasons"]
     stage_state = runtime.staged_episode_state["s1::e1"]["stage_state"]
     assert stage_state.active_stage_index == 1
     assert stage_state.completed_stage_ids == ["stage_00"]
@@ -2934,3 +2980,190 @@ def test_disabled_staged_runtime_preserves_legacy_payload_and_never_segments():
     assert planner.segment_calls == []
     assert "active_stage_id" not in planner.payloads[0]
     assert "stage_state" not in planner.payloads[0]
+
+
+def test_stage_entry_forces_both_memory_layers_before_primary_qwen_call():
+    memory_skill = ImageBackedMemorySkill()
+    registry = SkillRegistry()
+    registry.register(memory_skill)
+    store = EpisodeVisualMemoryStore(capacity=8)
+    store.start_episode("s1", "e1")
+    store.add_observation(
+        image_path="/tmp/registry-history.png",
+        step_id=0,
+        stage_id="stage_00",
+        visual_summary="end of hallway",
+        image_roles=["keyframe"],
+    )
+    planner = StagedRecordingPlanner(route_v3_decision(), stages=_two_stage_manifest())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+        episode_visual_store=store,
+    )
+
+    result = runtime.step(
+        make_state(step_id=1), {"current_image_path": "/tmp/current.png"}
+    )
+
+    assert len(memory_skill.calls) == 1
+    assert memory_skill.calls[0]["active_stage_id"] == "stage_00"
+    assert "cross the hallway" in memory_skill.calls[0]["text"]
+    assert planner.payloads[0]["retrieved_memory_image_paths"] == [
+        "/tmp/registry-history.png",
+        "/tmp/history.png",
+    ]
+    event = result.runtime_metadata["staged_memory_event"]
+    assert event["registry_status"] == "hit"
+    assert event["query_status"] == "hit"
+    assert event["trigger_reasons"] == ["stage_entry"]
+
+
+def test_completion_and_stop_candidates_coalesce_and_requery_only_once():
+    registry = SkillRegistry()
+    memory_skill = ImageBackedMemorySkill()
+    registry.register(memory_skill)
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            action_text="STOP",
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            visual_summary="end of hallway",
+            semantic_stop_state="not_ready",
+        ),
+        stages=_two_stage_manifest(),
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+    )
+
+    result = runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/current.png"},
+    )
+
+    assert len(planner.payloads) == 2
+    event = result.runtime_metadata["staged_memory_event"]
+    assert event["trigger_reasons"] == [
+        "stop_candidate",
+        "stage_completion_candidate",
+        "stage_entry",
+    ]
+    assert event["requery_performed"] is True
+    assert result.action_text != "STOP"
+
+
+def test_memory_requery_candidate_controls_gates_but_not_controller_stage_state():
+    registry = SkillRegistry()
+    registry.register(ImageBackedMemorySkill())
+    planner = StagedSequencePlanner(
+        [
+            route_v3_decision(
+                action_text="STOP",
+                stage_complete_candidate=True,
+                stage_relation="past",
+                stage_evidence_refs=["current"],
+                visual_summary="end of hallway",
+                semantic_stop_state="not_ready",
+            ),
+            route_v3_decision(
+                action_text="TURN_RIGHT",
+                stage_complete_candidate=False,
+                stage_relation="unknown",
+                stage_evidence_refs=[],
+                visual_summary="memory suggests checking right",
+            ),
+        ],
+        stages=_two_stage_manifest(),
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+    )
+
+    result = runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/current.png"},
+    )
+
+    assert result.action_text == "TURN_RIGHT"
+    assert result.runtime_metadata["stage_transition"]["decision"] == "rejected"
+    assert result.runtime_metadata["stage_transition"]["rule_ids"] == [
+        "completion_candidate_required"
+    ]
+    assert runtime.staged_episode_state["s1::e1"]["stage_state"].active_stage_index == 0
+
+
+def test_failed_forced_recall_cannot_advance_stage_even_when_candidate_matches():
+    registry = SkillRegistry()
+    memory_skill = ImageBackedMemorySkill(fail=True)
+    registry.register(memory_skill)
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            visual_summary="end of hallway",
+        ),
+        stages=_two_stage_manifest(),
+    )
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+    )
+    runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/current.png"},
+    )
+    result = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/current-1.png"},
+    )
+
+    assert (
+        result.runtime_metadata["stage_transition"]["decision"] == "needs_verification"
+    )
+    assert result.runtime_metadata["stage_transition"]["rule_ids"] == [
+        "forced_recall_unavailable"
+    ]
+    assert runtime.staged_episode_state["s1::e1"]["stage_state"].active_stage_index == 0
+
+
+def test_off_ablation_emits_same_event_without_attaching_history():
+    memory_skill = ImageBackedMemorySkill()
+    registry = SkillRegistry()
+    registry.register(memory_skill)
+    planner = StagedRecordingPlanner(route_v3_decision(), stages=_two_stage_manifest())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+        staged_memory_treatment="off_ablation",
+    )
+
+    result = runtime.step(make_state(step_id=0), {})
+
+    assert memory_skill.calls == []
+    assert "retrieved_memory_image_paths" not in planner.payloads[0]
+    assert result.runtime_metadata["staged_memory_event"]["registry_status"] == (
+        "disabled_ablation"
+    )
+    assert result.runtime_metadata["staged_memory_event"]["query_status"] == (
+        "disabled_ablation"
+    )

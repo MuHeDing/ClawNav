@@ -29,6 +29,13 @@ from harness.openclaw.stage_validation import (
     StageTransitionEvidence,
     StageTransitionValidator,
 )
+from harness.openclaw.staged_visual_memory import (
+    StagedMemoryEvent,
+    StagedMemoryTrigger,
+    StagedVisualMemoryCoordinator,
+    build_stage_memory_query,
+    run_forced_memory_operations,
+)
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
 from harness.skill_registry import SkillRegistry
 from harness.types import VLNState
@@ -107,6 +114,10 @@ class OpenClawVLNRuntime:
         keyframe_debug_save_all_eligible: bool = False,
         dynamic_visual_context_enabled: bool = False,
         staged_visual_memory_enabled: bool = False,
+        staged_memory_treatment: str = "on",
+        staged_memory_event_cap: int = 64,
+        staged_recovery_retrigger_steps: int = 3,
+        staged_registry_max_candidates: int = 2,
         stage_min_translation_m: float = 0.25,
         stage_min_heading_change_deg: float = 15.0,
         episode_visual_store: Optional[EpisodeVisualMemoryStore] = None,
@@ -132,6 +143,16 @@ class OpenClawVLNRuntime:
         self.odometry_episode_state: Dict[str, Dict[str, Any]] = {}
         self.dynamic_visual_context_enabled = bool(dynamic_visual_context_enabled)
         self.staged_visual_memory_enabled = bool(staged_visual_memory_enabled)
+        if staged_memory_treatment not in {"on", "off_ablation"}:
+            raise ValueError("staged_memory_treatment must be on or off_ablation")
+        self.staged_memory_treatment = staged_memory_treatment
+        self.staged_registry_max_candidates = max(
+            1, int(staged_registry_max_candidates)
+        )
+        self.staged_memory_coordinator = StagedVisualMemoryCoordinator(
+            event_cap=staged_memory_event_cap,
+            recovery_retrigger_steps=staged_recovery_retrigger_steps,
+        )
         self.stage_transition_validator = StageTransitionValidator(
             min_translation_m=stage_min_translation_m,
             min_heading_change_deg=stage_min_heading_change_deg,
@@ -143,6 +164,7 @@ class OpenClawVLNRuntime:
         self.qwen_direct_episode_state.clear()
         self.odometry_episode_state.clear()
         self.staged_episode_state.clear()
+        self.staged_memory_coordinator.reset()
         if self.episode_visual_store is not None:
             self.episode_visual_store.reset_episode()
             if scene_id or episode_id:
@@ -213,6 +235,9 @@ class OpenClawVLNRuntime:
             active_stage.transition_type
         )
         controller["stage_entry_pending"] = False
+        controller["forced_recall_required"] = False
+        controller["forced_recall_succeeded"] = False
+        controller["forced_requery_succeeded"] = False
         return controller
 
     @staticmethod
@@ -248,6 +273,23 @@ class OpenClawVLNRuntime:
                 "rule_ids": ["active_stage_id_mismatch"],
                 "evidence_refs": [],
                 "active_stage_id": stage.stage_id,
+                "advanced": False,
+            }
+        if (
+            arguments.get("stage_complete_candidate") is True
+            and controller.get("forced_recall_required") is True
+            and self.staged_memory_treatment == "on"
+            and (
+                controller.get("forced_recall_succeeded") is not True
+                or controller.get("forced_requery_succeeded") is not True
+            )
+        ):
+            return {
+                "decision": StageTransitionDecision.NEEDS_VERIFICATION.value,
+                "rule_ids": ["forced_recall_unavailable"],
+                "evidence_refs": list(arguments.get("stage_evidence_refs") or []),
+                "active_stage_id": stage.stage_id,
+                "next_stage_id": stage.stage_id,
                 "advanced": False,
             }
 
@@ -393,6 +435,190 @@ class OpenClawVLNRuntime:
             or 0.0
         )
 
+    def _observe_staged_pre_memory_event(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        controller: Optional[Dict[str, Any]],
+        tool_calls: List[Dict[str, Any]],
+    ) -> Optional[StagedMemoryEvent]:
+        if controller is None:
+            return None
+        local_control = runtime_payload.get("local_control_context")
+        odometry = (
+            local_control.get("odometry")
+            if isinstance(local_control, dict)
+            and isinstance(local_control.get("odometry"), dict)
+            else {}
+        )
+        event = self.staged_memory_coordinator.observe(
+            f"{state.scene_id}::{state.episode_id}",
+            state.step_id,
+            stage_entry="stage_entry" in (runtime_payload.get("trigger_reasons") or []),
+            no_progress=self._nonnegative_int(
+                odometry.get("consecutive_no_progress_forward")
+            )
+            > 0,
+            turn_loop=(
+                runtime_payload.get("turn_loop_recovery_active") is True
+                or bool(runtime_payload.get("turn_loop_feedback"))
+            ),
+        )
+        if event is not None:
+            self._run_staged_memory_event(
+                state, runtime_payload, controller, event, tool_calls
+            )
+        return event
+
+    def _observe_staged_post_memory_event(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        controller: Optional[Dict[str, Any]],
+        decision: Any,
+        existing_event: Optional[StagedMemoryEvent],
+        tool_calls: List[Dict[str, Any]],
+    ) -> tuple[Any, Optional[StagedMemoryEvent], bool]:
+        if controller is None:
+            return decision, existing_event, False
+        arguments = decision.arguments if isinstance(decision.arguments, dict) else {}
+        completion_candidate = arguments.get("stage_complete_candidate") is True
+        stop_candidate = self._planned_action_text(arguments) == "STOP"
+        event = self.staged_memory_coordinator.observe(
+            f"{state.scene_id}::{state.episode_id}",
+            state.step_id,
+            stage_completion_candidate=completion_candidate,
+            stop_candidate=stop_candidate,
+        )
+        if event is None:
+            return decision, existing_event, False
+        self._run_staged_memory_event(
+            state, runtime_payload, controller, event, tool_calls
+        )
+        has_post_candidate = any(
+            reason
+            in {
+                StagedMemoryTrigger.STAGE_COMPLETION_CANDIDATE,
+                StagedMemoryTrigger.STOP_CANDIDATE,
+            }
+            for reason in event.trigger_reasons
+        )
+        if not has_post_candidate or not event.selected or event.requery_performed:
+            return decision, event, False
+
+        controller["forced_recall_required"] = True
+        controller["forced_recall_succeeded"] = bool(
+            self.staged_memory_treatment == "off_ablation"
+            or (
+                event.operations is not None
+                and event.operations.image_backed_hit_count > 0
+            )
+        )
+        event.requery_performed = True
+        try:
+            requery_decision = self.planner.plan(
+                state,
+                runtime_context=runtime_payload,
+            )
+        except Exception:
+            controller["forced_requery_succeeded"] = False
+            event.status = "failed:memory_requery"
+            return decision, event, True
+        controller["forced_requery_succeeded"] = True
+        return requery_decision, event, True
+
+    def _run_staged_memory_event(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        controller: Dict[str, Any],
+        event: StagedMemoryEvent,
+        tool_calls: List[Dict[str, Any]],
+    ) -> None:
+        runtime_payload["trigger_reasons"] = [
+            reason.value for reason in event.trigger_reasons
+        ]
+        if not event.selected:
+            return
+        if event.operations is None:
+            stage_state: EpisodeStageState = controller["stage_state"]
+            stage = stage_state.active_stage
+            query = build_stage_memory_query(
+                stage,
+                event.trigger_reasons,
+                visual_summary=str(runtime_payload.get("visual_summary") or ""),
+                stage_relation=str(runtime_payload.get("stage_relation") or "unknown"),
+            )
+            query_calls: List[Dict[str, Any]] = []
+
+            def registry_call() -> Any:
+                if self.episode_visual_store is None:
+                    return None
+                return self.episode_visual_store.select_registry_evidence(
+                    active_stage_id=stage.stage_id,
+                    expected_landmarks=stage.expected_landmarks,
+                    trigger_reasons=[reason.value for reason in event.trigger_reasons],
+                    limit=self.staged_registry_max_candidates,
+                )
+
+            def query_call() -> Dict[str, Any]:
+                result = self.tool_adapter.call_tool(
+                    "MemoryQuerySkill",
+                    {
+                        "text": query,
+                        "step_id": state.step_id,
+                        "reason": "forced_staged_visual_memory",
+                        "n_results": 4,
+                        "allowed_scopes": ["episode"],
+                        "memory_namespace": (
+                            f"episode:{state.scene_id}:{state.episode_id}"
+                        ),
+                        "active_stage_id": stage.stage_id,
+                        "expected_landmarks": list(stage.expected_landmarks),
+                        "trigger_reasons": [
+                            reason.value for reason in event.trigger_reasons
+                        ],
+                        "use_episode_visual_store": True,
+                    },
+                    state=state,
+                )
+                query_calls.append(result)
+                return result
+
+            event.operations = run_forced_memory_operations(
+                registry_call=registry_call,
+                query_call=query_call,
+                treatment=self.staged_memory_treatment,
+                exclude_image_path=str(runtime_payload.get("current_image_path") or ""),
+            )
+            tool_calls.extend(query_calls)
+        self._attach_staged_memory_evidence(runtime_payload, event)
+
+    @staticmethod
+    def _attach_staged_memory_evidence(
+        runtime_payload: Dict[str, Any],
+        event: StagedMemoryEvent,
+    ) -> None:
+        operations = event.operations
+        if operations is None or not operations.selected_evidence:
+            return
+        evidence = [dict(item) for item in operations.selected_evidence]
+        runtime_payload["retrieved_memory_images"] = evidence
+        runtime_payload["retrieved_memory_image_paths"] = [
+            item["image_path"] for item in evidence
+        ]
+        runtime_payload["retrieved_memory_ids"] = [
+            item["memory_id"] for item in evidence
+        ]
+        manifest = runtime_payload.get("stage_attachment_manifest")
+        if not isinstance(manifest, dict):
+            manifest = {}
+        for item in evidence:
+            reference = str(item.get("memory_id") or "")
+            if reference:
+                manifest[reference] = dict(item)
+        runtime_payload["stage_attachment_manifest"] = manifest
+
     def step(
         self,
         state: VLNState,
@@ -429,6 +655,12 @@ class OpenClawVLNRuntime:
         if self._dynamic_visual_context_active(runtime_payload):
             self._record_visual_evidence_frame(state, runtime_payload)
             self._attach_visual_evidence_registry(state, runtime_payload)
+        staged_memory_event = self._observe_staged_pre_memory_event(
+            state,
+            runtime_payload,
+            staged_controller,
+            tool_calls,
+        )
         image_paths_used = self._image_paths_used(runtime_payload)
         try:
             decision = self.planner.plan(state, runtime_context=runtime_payload)
@@ -589,6 +821,21 @@ class OpenClawVLNRuntime:
 
         planned_action_text = self._planned_action_text(decision.arguments)
         if self.policy_backend == QWEN_DIRECT_POLICY_BACKEND:
+            (
+                decision,
+                staged_memory_event,
+                staged_requery_performed,
+            ) = self._observe_staged_post_memory_event(
+                state,
+                runtime_payload,
+                staged_controller,
+                decision,
+                staged_memory_event,
+                tool_calls,
+            )
+            if staged_requery_performed:
+                self._merge_planner_visual_observations(runtime_payload, decision)
+                planned_action_text = self._planned_action_text(decision.arguments)
             self._promote_visual_semantic_evidence(
                 state,
                 runtime_payload,
@@ -604,7 +851,9 @@ class OpenClawVLNRuntime:
             )
             gate_result = self.qwen_direct_gates.apply(decision.arguments, gate_context)
             requery_metadata: Dict[str, Any] = {}
-            if self._qwen_direct_should_requery_gate(runtime_payload, gate_result):
+            if not staged_requery_performed and self._qwen_direct_should_requery_gate(
+                runtime_payload, gate_result
+            ):
                 requery_result = self._qwen_direct_requery_after_gate(
                     state,
                     runtime_payload,
@@ -659,6 +908,8 @@ class OpenClawVLNRuntime:
             metadata.update(requery_metadata)
             if stage_transition:
                 metadata["stage_transition"] = stage_transition
+            if staged_memory_event is not None:
+                metadata["staged_memory_event"] = staged_memory_event.to_dict()
             metadata["policy_backend"] = QWEN_DIRECT_POLICY_BACKEND
             metadata["direct_policy"] = True
             metadata.setdefault("janus_loaded", False)
