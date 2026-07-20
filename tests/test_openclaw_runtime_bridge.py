@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
@@ -3103,6 +3106,55 @@ def test_memory_requery_candidate_controls_gates_but_not_controller_stage_state(
         "completion_candidate_required"
     ]
     assert runtime.staged_episode_state["s1::e1"]["stage_state"].active_stage_index == 0
+    audit = result.runtime_metadata["staged_visual_memory"]
+    assert (
+        audit["memory_event_id"]
+        == result.runtime_metadata["staged_memory_event"]["memory_event_id"]
+    )
+    assert audit["candidate_action_before"] == "STOP"
+    assert audit["candidate_action_after"] == "TURN_RIGHT"
+    assert audit["transition_decision"] == "rejected"
+    assert audit["executed_action"] == "TURN_RIGHT"
+    assert audit["oracle_fields_used"] is False
+
+
+def test_runtime_writes_selected_shadow_snapshot_before_provider_call(tmp_path):
+    selection = tmp_path / "shadow-selection.jsonl"
+    selection.write_text(
+        json.dumps({"episode_key": "s1:e1", "trigger_classes": ["stage_entry"]}) + "\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry()
+    registry.register(ImageBackedMemorySkill())
+    planner = StagedRecordingPlanner(route_v3_decision(), stages=_two_stage_manifest())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=registry,
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+        staged_shadow_manifest_path=str(selection),
+    )
+
+    result = runtime.step(
+        make_state(step_id=0),
+        {
+            "run_id": str(tmp_path / "run"),
+            "current_image_path": "/tmp/current.png",
+        },
+    )
+
+    assert result.ok is True
+    manifest = tmp_path / "run/harness_traces/shadow_manifest.jsonl"
+    row = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert row["selected"] is True
+    assert row["provider_call_id"] == "primary"
+    snapshot = json.loads(Path(row["snapshot_path"]).read_text(encoding="utf-8"))
+    assert (
+        snapshot["memory_event_id"]
+        == result.runtime_metadata["staged_visual_memory"]["memory_event_id"]
+    )
+    assert "executed_action" not in snapshot
 
 
 def test_failed_forced_recall_cannot_advance_stage_even_when_candidate_matches():

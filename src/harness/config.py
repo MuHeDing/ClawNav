@@ -54,6 +54,8 @@ class HarnessConfig:
     staged_semantic_query_max_records: int = 4
     staged_memory_event_cap: int = 64
     staged_recovery_retrigger_steps: int = 3
+    staged_shadow_manifest_path: str = ""
+    staged_shadow_max_events: int = 5
 
     def __post_init__(self) -> None:
         if self.staged_memory_treatment not in {"on", "off_ablation"}:
@@ -75,6 +77,7 @@ class HarnessConfig:
             "staged_semantic_query_max_records",
             "staged_memory_event_cap",
             "staged_recovery_retrigger_steps",
+            "staged_shadow_max_events",
         )
         for field_name in positive_integer_fields:
             if int(getattr(self, field_name)) <= 0:

@@ -1,4 +1,6 @@
 from dataclasses import dataclass, field
+import hashlib
+import json
 import math
 from pathlib import Path
 import shutil
@@ -29,6 +31,7 @@ from harness.openclaw.stage_validation import (
     StageTransitionEvidence,
     StageTransitionValidator,
 )
+from harness.openclaw.shadow_snapshot import ShadowSnapshotWriter
 from harness.openclaw.staged_visual_memory import (
     StagedMemoryEvent,
     StagedMemoryTrigger,
@@ -118,6 +121,8 @@ class OpenClawVLNRuntime:
         staged_memory_event_cap: int = 64,
         staged_recovery_retrigger_steps: int = 3,
         staged_registry_max_candidates: int = 2,
+        staged_shadow_manifest_path: str = "",
+        staged_shadow_max_events: int = 5,
         stage_min_translation_m: float = 0.25,
         stage_min_heading_change_deg: float = 15.0,
         episode_visual_store: Optional[EpisodeVisualMemoryStore] = None,
@@ -149,6 +154,9 @@ class OpenClawVLNRuntime:
         self.staged_registry_max_candidates = max(
             1, int(staged_registry_max_candidates)
         )
+        self.staged_shadow_manifest_path = str(staged_shadow_manifest_path or "")
+        self.staged_shadow_max_events = max(1, int(staged_shadow_max_events))
+        self.shadow_snapshot_writers: Dict[str, ShadowSnapshotWriter] = {}
         self.staged_memory_coordinator = StagedVisualMemoryCoordinator(
             event_cap=staged_memory_event_cap,
             recovery_retrigger_steps=staged_recovery_retrigger_steps,
@@ -495,6 +503,10 @@ class OpenClawVLNRuntime:
         self._run_staged_memory_event(
             state, runtime_payload, controller, event, tool_calls
         )
+        event.candidate_action_before = self._planned_action_text(arguments) or ""
+        event.stage_candidate_before = completion_candidate
+        event.candidate_action_after = event.candidate_action_before
+        event.stage_candidate_after = event.stage_candidate_before
         has_post_candidate = any(
             reason
             in {
@@ -515,6 +527,13 @@ class OpenClawVLNRuntime:
             )
         )
         event.requery_performed = True
+        event.provider_call_ids.append("memory_requery")
+        self._write_staged_shadow_snapshot(
+            state,
+            runtime_payload,
+            event,
+            "memory_requery",
+        )
         try:
             requery_decision = self.planner.plan(
                 state,
@@ -525,6 +544,17 @@ class OpenClawVLNRuntime:
             event.status = "failed:memory_requery"
             return decision, event, True
         controller["forced_requery_succeeded"] = True
+        requery_arguments = (
+            requery_decision.arguments
+            if isinstance(requery_decision.arguments, dict)
+            else {}
+        )
+        event.candidate_action_after = (
+            self._planned_action_text(requery_arguments) or ""
+        )
+        event.stage_candidate_after = (
+            requery_arguments.get("stage_complete_candidate") is True
+        )
         return requery_decision, event, True
 
     def _run_staged_memory_event(
@@ -549,6 +579,7 @@ class OpenClawVLNRuntime:
                 visual_summary=str(runtime_payload.get("visual_summary") or ""),
                 stage_relation=str(runtime_payload.get("stage_relation") or "unknown"),
             )
+            event.query_text = query
             query_calls: List[Dict[str, Any]] = []
 
             def registry_call() -> Any:
@@ -619,6 +650,108 @@ class OpenClawVLNRuntime:
                 manifest[reference] = dict(item)
         runtime_payload["stage_attachment_manifest"] = manifest
 
+    def _write_staged_shadow_snapshot(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        event: StagedMemoryEvent,
+        provider_call_id: str,
+    ) -> None:
+        if not self.staged_shadow_manifest_path:
+            return
+        output_path = str(runtime_payload.get("run_id") or "")
+        if not output_path:
+            return
+        writer = self.shadow_snapshot_writers.get(output_path)
+        if writer is None:
+            writer = ShadowSnapshotWriter(
+                output_path,
+                self.staged_shadow_manifest_path,
+                max_events_per_episode=self.staged_shadow_max_events,
+            )
+            self.shadow_snapshot_writers[output_path] = writer
+        stage_state = runtime_payload.get("stage_state")
+        writer.consider(
+            scene_id=state.scene_id,
+            episode_id=state.episode_id,
+            step_id=state.step_id,
+            memory_event_id=event.event_id,
+            trigger_reasons=[reason.value for reason in event.trigger_reasons],
+            provider_call_id=provider_call_id,
+            stage_state=stage_state if isinstance(stage_state, dict) else {},
+            runtime_context=runtime_payload,
+        )
+
+    def _staged_visual_memory_audit(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        decision: Any,
+        event: Optional[StagedMemoryEvent],
+        transition: Dict[str, Any],
+        executed_action: str,
+    ) -> Dict[str, Any]:
+        if not self.staged_visual_memory_enabled:
+            return {}
+        stage_context = runtime_payload.get("stage_state")
+        stage_context = stage_context if isinstance(stage_context, dict) else {}
+        decision_metadata = getattr(decision, "runtime_metadata", {}) or {}
+        context_audit = (
+            decision_metadata.get("context_audit")
+            if isinstance(decision_metadata, dict)
+            and isinstance(decision_metadata.get("context_audit"), dict)
+            else {}
+        )
+        thinking = {
+            key: value
+            for key, value in context_audit.items()
+            if key.startswith("qwen_thinking")
+            or key.startswith("thinking_")
+            or key in {"provider_degradation_mode"}
+        }
+        provider_config = {
+            "planner_backend": getattr(decision, "planner_backend", ""),
+            "policy_backend": self.policy_backend,
+            "thinking": thinking,
+        }
+        provider_config_sha256 = hashlib.sha256(
+            json.dumps(
+                provider_config,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        event_payload = event.to_dict() if event is not None else {}
+        candidate_before = str(event_payload.get("candidate_action_before") or "")
+        candidate_after = str(event_payload.get("candidate_action_after") or "")
+        intervention = "none"
+        if transition.get("decision") in {"rejected", "needs_verification"} and bool(
+            event_payload.get("stage_candidate_after")
+        ):
+            intervention = "blocked_stage_transition"
+        if candidate_after == "STOP" and executed_action != "STOP":
+            intervention = "blocked_stop"
+        return {
+            "stage_schema_version": "instruction_stages_v1",
+            "action_schema_version": "route_v3_staged",
+            "segmentation_source": stage_context.get("segmentation_source", ""),
+            "instruction_sha256": stage_context.get("instruction_sha256", ""),
+            "stage_plan_sha256": stage_context.get("stage_plan_sha256", ""),
+            "provider_config_sha256": provider_config_sha256,
+            "provider_thinking": thinking,
+            "active_stage_id": transition.get("active_stage_id")
+            or stage_context.get("active_stage_id", ""),
+            **event_payload,
+            "candidate_action_before": candidate_before,
+            "candidate_action_after": candidate_after,
+            "transition_decision": transition.get("decision", ""),
+            "transition_rule_ids": list(transition.get("rule_ids") or []),
+            "controller_intervention": intervention,
+            "executed_action": executed_action,
+            "oracle_fields_used": False,
+        }
+
     def step(
         self,
         state: VLNState,
@@ -661,6 +794,14 @@ class OpenClawVLNRuntime:
             staged_controller,
             tool_calls,
         )
+        if staged_memory_event is not None and staged_memory_event.selected:
+            staged_memory_event.provider_call_ids.append("primary")
+            self._write_staged_shadow_snapshot(
+                state,
+                runtime_payload,
+                staged_memory_event,
+                "primary",
+            )
         image_paths_used = self._image_paths_used(runtime_payload)
         try:
             decision = self.planner.plan(state, runtime_context=runtime_payload)
@@ -910,6 +1051,14 @@ class OpenClawVLNRuntime:
                 metadata["stage_transition"] = stage_transition
             if staged_memory_event is not None:
                 metadata["staged_memory_event"] = staged_memory_event.to_dict()
+            metadata["staged_visual_memory"] = self._staged_visual_memory_audit(
+                state,
+                runtime_payload,
+                decision,
+                staged_memory_event,
+                stage_transition,
+                gate_result.final_action,
+            )
             metadata["policy_backend"] = QWEN_DIRECT_POLICY_BACKEND
             metadata["direct_policy"] = True
             metadata.setdefault("janus_loaded", False)

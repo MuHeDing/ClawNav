@@ -35,6 +35,12 @@ class StagedMemoryEvent:
     _reasons: set[StagedMemoryTrigger] = field(default_factory=set)
     operations: Optional["ForcedMemoryOperationsResult"] = None
     requery_performed: bool = False
+    query_text: str = ""
+    candidate_action_before: str = ""
+    candidate_action_after: str = ""
+    stage_candidate_before: bool = False
+    stage_candidate_after: bool = False
+    provider_call_ids: list[str] = field(default_factory=list)
 
     @property
     def trigger_reasons(self) -> Tuple[StagedMemoryTrigger, ...]:
@@ -51,6 +57,12 @@ class StagedMemoryEvent:
             "selected": self.selected,
             "status": self.status,
             "requery_performed": self.requery_performed,
+            "query_text": self.query_text,
+            "provider_call_ids": list(self.provider_call_ids),
+            "candidate_action_before": self.candidate_action_before,
+            "candidate_action_after": self.candidate_action_after,
+            "stage_candidate_before": self.stage_candidate_before,
+            "stage_candidate_after": self.stage_candidate_after,
         }
         if self.operations is not None:
             payload.update(self.operations.to_dict())

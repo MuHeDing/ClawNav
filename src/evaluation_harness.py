@@ -210,6 +210,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG", "15.0")),
     )
+    parser.add_argument(
+        "--staged_shadow_manifest_path",
+        default=os.environ.get("OPENCLAW_STAGED_SHADOW_MANIFEST_PATH", ""),
+    )
+    parser.add_argument(
+        "--staged_shadow_max_events",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_STAGED_SHADOW_MAX_EVENTS", "5")),
+    )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
     parser.add_argument("--openclaw_service_registry_path", type=str, default="")
@@ -320,6 +329,8 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             "stage_min_heading_change_deg",
             15.0,
         ),
+        staged_shadow_manifest_path=getattr(args, "staged_shadow_manifest_path", ""),
+        staged_shadow_max_events=getattr(args, "staged_shadow_max_events", 5),
         harness_runtime=args.harness_runtime,
         openclaw_workspace_path=args.openclaw_workspace_path,
         openclaw_service_registry_path=args.openclaw_service_registry_path,
@@ -483,6 +494,8 @@ def build_harness_components(
             staged_memory_event_cap=config.staged_memory_event_cap,
             staged_recovery_retrigger_steps=config.staged_recovery_retrigger_steps,
             staged_registry_max_candidates=config.staged_registry_max_candidates,
+            staged_shadow_manifest_path=config.staged_shadow_manifest_path,
+            staged_shadow_max_events=config.staged_shadow_max_events,
             stage_min_translation_m=config.stage_min_translation_m,
             stage_min_heading_change_deg=config.stage_min_heading_change_deg,
             episode_visual_store=episode_visual_store,
