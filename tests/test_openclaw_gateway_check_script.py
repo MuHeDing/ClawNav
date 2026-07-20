@@ -69,6 +69,39 @@ def test_validate_gateway_health_rejects_low_timeout_budget_when_enforced():
         raise AssertionError("expected ValueError")
 
 
+def test_validate_gateway_health_requires_supported_and_active_staged_schemas():
+    valid = {
+        "ok": True,
+        "instruction_segmentation": True,
+        "stage_schema_versions": ["instruction_stages_v1"],
+        "action_schema_versions": ["route_v2", "route_v3_staged"],
+        "active_stage_schema": "instruction_stages_v1",
+        "active_action_schema": "route_v3_staged",
+    }
+    validate_gateway_health(
+        valid,
+        required_stage_schema="instruction_stages_v1",
+        required_action_schema="route_v3_staged",
+    )
+
+    for override in (
+        {"instruction_segmentation": False},
+        {"active_stage_schema": "legacy"},
+        {"active_action_schema": "route_v2"},
+        {"action_schema_versions": ["route_v2"]},
+    ):
+        try:
+            validate_gateway_health(
+                {**valid, **override},
+                required_stage_schema="instruction_stages_v1",
+                required_action_schema="route_v3_staged",
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected staged capability validation failure")
+
+
 def test_build_visual_probe_payload_passes_image_content_summary_not_oracle_metrics():
     observations = [
         {
@@ -78,7 +111,9 @@ def test_build_visual_probe_payload_passes_image_content_summary_not_oracle_metr
         }
     ]
 
-    payload = build_visual_probe_payload("go to kitchen", "/tmp/frame.png", observations)
+    payload = build_visual_probe_payload(
+        "go to kitchen", "/tmp/frame.png", observations
+    )
 
     assert payload["runtime_context"]["current_image_path"] == "/tmp/frame.png"
     assert payload["runtime_context"]["recent_keyframe_paths"] == ["/tmp/frame.png"]

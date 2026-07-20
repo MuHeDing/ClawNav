@@ -64,6 +64,67 @@ def test_gateway_client_builds_request_payload_without_oracle_fields():
     assert decision.reason == "gateway"
 
 
+def test_gateway_client_segments_instruction_with_text_only_timeout():
+    captured = {}
+
+    def post_json(url, payload, timeout):
+        captured.update(url=url, payload=payload, timeout=timeout)
+        return {
+            "stage_plan": {
+                "schema_version": "instruction_stages_v1",
+                "stages": [
+                    {
+                        "order": 0,
+                        "route_clause": "go to kitchen",
+                        "transition_type": "traverse",
+                        "expected_landmarks": ["kitchen"],
+                        "completion_cues": ["inside kitchen"],
+                        "final_stage": True,
+                    }
+                ],
+            },
+            "runtime_metadata": {
+                "segmentation_source": "qwen",
+                "fallback_category": "none",
+            },
+        }
+
+    client = OpenClawGatewayClient(
+        base_url="http://127.0.0.1:8011",
+        timeout_s=360,
+        segmentation_timeout_s=120,
+        post_json=post_json,
+    )
+
+    result = client.segment_instruction(
+        "s1",
+        "e1",
+        "go to kitchen",
+    )
+
+    assert captured["url"].endswith("/segment_instruction")
+    assert captured["timeout"] == 120
+    assert captured["payload"] == {
+        "scene_id": "s1",
+        "episode_id": "e1",
+        "instruction": "go to kitchen",
+    }
+    assert result.stage_plan.stages[0].stage_id == "stage_00"
+    assert result.stage_plan.segmentation_source == "qwen"
+    assert result.runtime_metadata["segmentation_source"] == "qwen"
+
+
+def test_gateway_client_rejects_segmentation_over_non_loopback_url():
+    client = OpenClawGatewayClient(base_url="http://gateway.internal:8011")
+
+    try:
+        client.segment_instruction("s1", "e1", "go")
+    except OpenClawGatewayError as exc:
+        assert "loopback" in str(exc)
+    else:
+        raise AssertionError("expected OpenClawGatewayError")
+
+
 def test_gateway_client_drops_non_json_runtime_context_fields():
     captured = {}
 

@@ -70,14 +70,18 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ClawNav OpenClaw-style harness evaluation")
+    parser = argparse.ArgumentParser(
+        description="ClawNav OpenClaw-style harness evaluation"
+    )
     parser.add_argument("--model_path", type=str, default="")
     parser.add_argument(
         "--policy_backend",
         choices=(JANUS_POLICY_BACKEND, QWEN_DIRECT_POLICY_BACKEND),
         default=JANUS_POLICY_BACKEND,
     )
-    parser.add_argument("--habitat_config_path", type=str, default="config/vln_r2r.yaml")
+    parser.add_argument(
+        "--habitat_config_path", type=str, default="config/vln_r2r.yaml"
+    )
     parser.add_argument("--eval_split", type=str, default="val_unseen")
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--data_path", type=str, default=None)
@@ -107,11 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--save_step_artifacts", action="store_true", default=False)
-    parser.add_argument("--save_step_artifacts_with_video_only", action="store_true", default=False)
-    parser.add_argument("--disable_qualitative_json", action="store_true", default=False)
+    parser.add_argument(
+        "--save_step_artifacts_with_video_only", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--disable_qualitative_json", action="store_true", default=False
+    )
     parser.add_argument("--harness_mode", type=str, default="memory_recall")
     parser.add_argument("--harness_memory_backend", type=str, default="fake")
-    parser.add_argument("--spatial_memory_url", type=str, default="http://127.0.0.1:8022")
+    parser.add_argument(
+        "--spatial_memory_url", type=str, default="http://127.0.0.1:8022"
+    )
     parser.add_argument("--memory_manifest_path", type=str, default="")
     parser.add_argument("--harness_memory_source", type=str, default="episode-local")
     parser.add_argument("--harness_max_internal_calls", type=int, default=3)
@@ -198,9 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stage_min_heading_change_deg",
         type=float,
-        default=float(
-            os.environ.get("OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG", "15.0")
-        ),
+        default=float(os.environ.get("OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG", "15.0")),
     )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
@@ -212,14 +220,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openclaw_executor_backend", type=str, default="habitat")
     parser.add_argument("--openclaw_robot_executor_url", type=str, default="")
     parser.add_argument("--openclaw_subagent_backend", type=str, default="fake")
-    parser.add_argument("--openclaw_enable_subagent_planner", action="store_true", default=False)
-    parser.add_argument("--openclaw_enable_subagent_critic", action="store_true", default=False)
+    parser.add_argument(
+        "--openclaw_enable_subagent_planner", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--openclaw_enable_subagent_critic", action="store_true", default=False
+    )
     parser.add_argument(
         "--openclaw_enable_subagent_memory_curator",
         action="store_true",
         default=False,
     )
-    parser.add_argument("--openclaw_allow_planner_action_override", action="store_true", default=False)
+    parser.add_argument(
+        "--openclaw_allow_planner_action_override", action="store_true", default=False
+    )
     return parser
 
 
@@ -325,7 +339,10 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             False,
         ),
     )
-    if config.openclaw_service_registry_path and config.memory_backend == "spatial_http":
+    if (
+        config.openclaw_service_registry_path
+        and config.memory_backend == "spatial_http"
+    ):
         from harness.openclaw.service_registry import OpenClawServiceRegistry
 
         registry = OpenClawServiceRegistry.from_file(
@@ -398,9 +415,13 @@ def build_harness_components(
         from harness.openclaw.runtime import OpenClawVLNRuntime
 
         if direct_policy and config.openclaw_enable_subagent_planner:
-            raise ValueError("qwen_direct policy backend does not support subagent planner fallback")
+            raise ValueError(
+                "qwen_direct policy backend does not support subagent planner fallback"
+            )
         if direct_policy and config.openclaw_planner_backend != "gateway":
-            raise ValueError("qwen_direct policy backend requires openclaw_planner_backend=gateway")
+            raise ValueError(
+                "qwen_direct policy backend requires openclaw_planner_backend=gateway"
+            )
 
         if config.openclaw_enable_subagent_planner:
             from harness.openclaw.planner import SubagentOpenClawPlanner
@@ -426,6 +447,7 @@ def build_harness_components(
             planner = OpenClawGatewayClient(
                 base_url=config.openclaw_gateway_url,
                 timeout_s=config.openclaw_gateway_timeout_s,
+                segmentation_timeout_s=config.staged_segmentation_timeout_s,
             )
         else:
             planner = RuleOpenClawPlanner(
@@ -493,7 +515,9 @@ class HarnessModelProxy:
             if args is not None
             else False
         )
-        self.save_video_ratio = float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
+        self.save_video_ratio = (
+            float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
+        )
         self.last_action_text = None
         self.episode_invalid = False
         self.episode_invalid_reason = ""
@@ -569,7 +593,9 @@ class HarnessModelProxy:
         safe_diagnostics = self._proxy_safe_diagnostics(state.diagnostics)
         working_memory = self.components.get("working_memory")
         if working_memory is not None:
-            if state.online_metrics and hasattr(working_memory, "append_online_metrics"):
+            if state.online_metrics and hasattr(
+                working_memory, "append_online_metrics"
+            ):
                 working_memory.append_online_metrics(state.online_metrics)
             if safe_diagnostics and hasattr(working_memory, "append_diagnostics"):
                 working_memory.append_diagnostics(safe_diagnostics)
@@ -703,7 +729,9 @@ class HarnessModelProxy:
         payload["map_assist_mode"] = config.map_assist_mode
         payload["map_frame_interval_steps"] = config.map_frame_interval_steps
         payload["motion_feedback_enabled"] = config.motion_feedback_enabled
-        payload["forward_stall_odometry_enabled"] = config.forward_stall_odometry_enabled
+        payload[
+            "forward_stall_odometry_enabled"
+        ] = config.forward_stall_odometry_enabled
         payload["map_collision_overlay_enabled"] = config.map_collision_overlay_enabled
         map_context = getattr(self, "_pending_map_context", None)
         if isinstance(map_context, dict):
@@ -786,12 +814,16 @@ class HarnessModelProxy:
         root_dir = Path(self.components["output_path"]) / root_dir_name
         if not self.current_scene_id or not self.current_episode_id:
             return root_dir
-        return root_dir / self._safe_path_part(self.current_scene_id) / self._safe_path_part(
-            self.current_episode_id
+        return (
+            root_dir
+            / self._safe_path_part(self.current_scene_id)
+            / self._safe_path_part(self.current_episode_id)
         )
 
     def _safe_path_part(self, value: str) -> str:
-        return "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+        return "".join(
+            char if char.isalnum() or char in "._-" else "_" for char in value
+        )
 
     def _remember_keyframe_path(self, image_path: str) -> None:
         if image_path in self.recent_keyframe_paths:
@@ -826,12 +858,7 @@ class HarnessModelProxy:
     def _episode_video_path(self) -> Path:
         safe_scene = self._safe_path_part(self.current_scene_id or "scene")
         safe_episode = self._safe_path_part(self.current_episode_id or "episode")
-        return (
-            self._output_path()
-            / "videos"
-            / safe_scene
-            / f"{safe_episode}.mp4"
-        )
+        return self._output_path() / "videos" / safe_scene / f"{safe_episode}.mp4"
 
     def _episode_video_tmp_path(self) -> Path:
         final_path = self._episode_video_path()
@@ -940,9 +967,7 @@ class HarnessModelProxy:
         if not isinstance(diagnostics, dict):
             return {}
         return {
-            key: value
-            for key, value in diagnostics.items()
-            if key != "raw_metrics"
+            key: value for key, value in diagnostics.items() if key != "raw_metrics"
         }
 
     def _append_working_memory(self, images, action_text: str) -> None:
@@ -1014,7 +1039,9 @@ class QwenDirectPolicyProxy:
             if args is not None
             else False
         )
-        self.save_video_ratio = float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
+        self.save_video_ratio = (
+            float(getattr(args, "save_video_ratio", 0.0)) if args is not None else 0.0
+        )
         self.processor = None
         self.tokenizer = None
         self.model = _InertQwenDirectBackbone()
@@ -1057,7 +1084,9 @@ class QwenDirectPolicyProxy:
     _remember_promoted_keyframe_from_runtime = (
         HarnessModelProxy._remember_promoted_keyframe_from_runtime
     )
-    _attach_structured_runtime_context = HarnessModelProxy._attach_structured_runtime_context
+    _attach_structured_runtime_context = (
+        HarnessModelProxy._attach_structured_runtime_context
+    )
     _init_map_context_provider = HarnessModelProxy._init_map_context_provider
     _reset_map_context_provider = HarnessModelProxy._reset_map_context_provider
     _update_pending_map_context = HarnessModelProxy._update_pending_map_context
@@ -1082,8 +1111,9 @@ class QwenDirectPolicyProxy:
         if runtime_metadata.get("episode_invalid"):
             self.episode_invalid = True
             self.episode_invalid_reason = str(
-                runtime_metadata.get("qwen_failure_reason") or "qwen_direct_policy_abort"
-        )
+                runtime_metadata.get("qwen_failure_reason")
+                or "qwen_direct_policy_abort"
+            )
         action_text = runtime_result.action_text if runtime_result.ok else "STOP"
         self._remember_map_recovery_from_runtime(runtime_result)
         self._remember_promoted_keyframe_from_runtime(runtime_result)
@@ -1165,10 +1195,22 @@ def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
 
     ep_num_all = [torch.zeros_like(ep_num) for _ in range(world_size)]
     dist.all_gather(ep_num_all, ep_num)
-    sucs_all = [torch.zeros(ep_num_all[i], dtype=sucs.dtype).to(sucs.device) for i in range(world_size)]
-    spls_all = [torch.zeros(ep_num_all[i], dtype=spls.dtype).to(spls.device) for i in range(world_size)]
-    oss_all = [torch.zeros(ep_num_all[i], dtype=oss.dtype).to(oss.device) for i in range(world_size)]
-    ones_all = [torch.zeros(ep_num_all[i], dtype=ones.dtype).to(ones.device) for i in range(world_size)]
+    sucs_all = [
+        torch.zeros(ep_num_all[i], dtype=sucs.dtype).to(sucs.device)
+        for i in range(world_size)
+    ]
+    spls_all = [
+        torch.zeros(ep_num_all[i], dtype=spls.dtype).to(spls.device)
+        for i in range(world_size)
+    ]
+    oss_all = [
+        torch.zeros(ep_num_all[i], dtype=oss.dtype).to(oss.device)
+        for i in range(world_size)
+    ]
+    ones_all = [
+        torch.zeros(ep_num_all[i], dtype=ones.dtype).to(ones.device)
+        for i in range(world_size)
+    ]
     dist.barrier()
     dist.all_gather(sucs_all, sucs)
     dist.all_gather(spls_all, spls)
@@ -1190,7 +1232,9 @@ def evaluate_harness(model: Any, args: argparse.Namespace) -> None:
     print(result_all)
     if get_rank() == 0:
         os.makedirs(args.output_path, exist_ok=True)
-        with open(os.path.join(args.output_path, "summary.json"), "w", encoding="utf-8") as file:
+        with open(
+            os.path.join(args.output_path, "summary.json"), "w", encoding="utf-8"
+        ) as file:
             json.dump(result_all, file)
 
 
@@ -1199,14 +1243,18 @@ def main() -> None:
     args = validate_args(parser.parse_args())
     # Heavy imports and model loading are intentionally delayed until main().
     import evaluation as eval_mod  # pylint: disable=import-outside-toplevel
-    from utils.dist import init_distributed_mode  # pylint: disable=import-outside-toplevel
+    from utils.dist import (
+        init_distributed_mode,
+    )  # pylint: disable=import-outside-toplevel
 
     init_distributed_mode(args)
     eval_mod.max_pixels = args.max_pixels
     eval_mod.min_pixels = args.min_pixels
     model = None
     if args.policy_backend == JANUS_POLICY_BACKEND:
-        from evaluation import JanusVLN_Inference  # pylint: disable=import-outside-toplevel
+        from evaluation import (
+            JanusVLN_Inference,
+        )  # pylint: disable=import-outside-toplevel
 
         model = JanusVLN_Inference(
             args.model_path,

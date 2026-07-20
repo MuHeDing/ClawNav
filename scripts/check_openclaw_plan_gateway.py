@@ -41,6 +41,8 @@ def validate_gateway_health(
     require_service: str = "",
     client_timeout_s: float = 0.0,
     enforce_timeout_budget: bool = False,
+    required_stage_schema: str = "",
+    required_action_schema: str = "",
 ) -> None:
     if not isinstance(data, dict):
         raise ValueError("gateway health response must be an object")
@@ -53,18 +55,47 @@ def validate_gateway_health(
                 f"gateway service must be {require_service}; got {service or '<missing>'}"
             )
     if enforce_timeout_budget:
-        budget = data.get("timeout_budget") if isinstance(data.get("timeout_budget"), dict) else {}
+        budget = (
+            data.get("timeout_budget")
+            if isinstance(data.get("timeout_budget"), dict)
+            else {}
+        )
         recommended = budget.get("recommended_gateway_timeout_s")
         if recommended is None:
             return
         try:
             recommended_timeout_s = float(recommended)
         except (TypeError, ValueError) as exc:
-            raise ValueError("timeout_budget.recommended_gateway_timeout_s must be numeric") from exc
+            raise ValueError(
+                "timeout_budget.recommended_gateway_timeout_s must be numeric"
+            ) from exc
         if client_timeout_s < recommended_timeout_s:
             raise ValueError(
                 "OPENCLAW_GATEWAY_TIMEOUT is below the adapter timeout budget: "
                 f"{client_timeout_s:g}s < recommended {recommended_timeout_s:g}s"
+            )
+    if required_stage_schema or required_action_schema:
+        if data.get("instruction_segmentation") is not True:
+            raise ValueError("gateway does not enable instruction segmentation")
+    if required_stage_schema:
+        supported = data.get("stage_schema_versions")
+        if not isinstance(supported, list) or required_stage_schema not in supported:
+            raise ValueError(
+                f"gateway does not support stage schema {required_stage_schema}"
+            )
+        if data.get("active_stage_schema") != required_stage_schema:
+            raise ValueError(
+                f"gateway active stage schema is not {required_stage_schema}"
+            )
+    if required_action_schema:
+        supported = data.get("action_schema_versions")
+        if not isinstance(supported, list) or required_action_schema not in supported:
+            raise ValueError(
+                f"gateway does not support action schema {required_action_schema}"
+            )
+        if data.get("active_action_schema") != required_action_schema:
+            raise ValueError(
+                f"gateway active action schema is not {required_action_schema}"
             )
 
 
@@ -75,6 +106,8 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--require_service", default="")
     parser.add_argument("--enforce_timeout_budget", action="store_true")
+    parser.add_argument("--required_stage_schema", default="")
+    parser.add_argument("--required_action_schema", default="")
     args = parser.parse_args()
 
     session = requests.Session()
@@ -86,6 +119,8 @@ def main() -> None:
         require_service=args.require_service,
         client_timeout_s=args.timeout,
         enforce_timeout_budget=args.enforce_timeout_budget,
+        required_stage_schema=args.required_stage_schema,
+        required_action_schema=args.required_action_schema,
     )
     response = session.post(
         f"{args.gateway_url.rstrip('/')}/plan",
