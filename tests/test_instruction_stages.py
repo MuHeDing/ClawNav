@@ -28,8 +28,7 @@ def plan_payload(stages):
 @pytest.mark.parametrize("count", [1, 12])
 def test_stage_plan_accepts_supported_boundaries(count):
     stages = [
-        stage_payload(index, final_stage=index == count - 1)
-        for index in range(count)
+        stage_payload(index, final_stage=index == count - 1) for index in range(count)
     ]
 
     plan = parse_instruction_stage_plan(plan_payload(stages), "follow the route")
@@ -45,11 +44,12 @@ def test_stage_plan_accepts_supported_boundaries(count):
 @pytest.mark.parametrize("count", [0, 13])
 def test_stage_plan_falls_back_for_unsupported_stage_count(count):
     stages = [
-        stage_payload(index, final_stage=index == count - 1)
-        for index in range(count)
+        stage_payload(index, final_stage=index == count - 1) for index in range(count)
     ]
 
-    plan = parse_instruction_stage_plan(plan_payload(stages), "Keep this exact instruction")
+    plan = parse_instruction_stage_plan(
+        plan_payload(stages), "Keep this exact instruction"
+    )
 
     assert plan.fallback_category is StageFallbackCategory.SCHEMA_ERROR
     assert len(plan.stages) == 1
@@ -144,4 +144,3 @@ def test_oracle_guard_allows_non_target_odometry_and_visual_evidence():
             "evidence_refs": ["current", "registry:obs_0001"],
         }
     )
-

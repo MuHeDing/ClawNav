@@ -57,9 +57,7 @@ class HarnessConfig:
 
     def __post_init__(self) -> None:
         if self.staged_memory_treatment not in {"on", "off_ablation"}:
-            raise ValueError(
-                "staged_memory_treatment must be one of: on, off_ablation"
-            )
+            raise ValueError("staged_memory_treatment must be one of: on, off_ablation")
         if (
             self.staged_memory_treatment == "off_ablation"
             and not self.staged_visual_memory_enabled

@@ -26,7 +26,9 @@ def make_evidence(**overrides):
         "stage_complete_candidate": True,
         "relation": StageRelation.AT,
         "evidence_refs": ("current",),
-        "attachment_manifest": {"current": {"image_role": "current", "stage_id": "stage_00"}},
+        "attachment_manifest": {
+            "current": {"image_role": "current", "stage_id": "stage_00"}
+        },
         "grounded_landmarks": ("doorway",),
         "grounded_completion_cues": ("threshold crossed",),
         "current_landmark_grounded": True,
@@ -133,4 +135,3 @@ def test_transition_validator_rejects_cross_stage_historical_evidence():
 
     assert result.decision is StageTransitionDecision.REJECTED
     assert "evidence_stage_mismatch" in result.rule_ids
-

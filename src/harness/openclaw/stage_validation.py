@@ -110,7 +110,10 @@ class StageTransitionValidator:
             return self._needs("turn_relation_unverified", evidence)
         if evidence.relation is StageRelation.BEFORE:
             return self._reject("turn_relation_before", evidence)
-        if abs(evidence.heading_change_since_stage_entry_deg) < self.min_heading_change_deg:
+        if (
+            abs(evidence.heading_change_since_stage_entry_deg)
+            < self.min_heading_change_deg
+        ):
             return self._needs("turn_heading_change_insufficient", evidence)
         return self._accept("turn_heading_and_relation_confirmed", evidence)
 

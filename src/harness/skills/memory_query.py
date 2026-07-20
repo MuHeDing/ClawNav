@@ -7,7 +7,9 @@ from harness.types import SkillResult
 
 class MemoryQuerySkill(Skill):
     name = "MemoryQuerySkill"
-    description = "Query spatial memory for instruction, subgoal, or failure-recovery context."
+    description = (
+        "Query spatial memory for instruction, subgoal, or failure-recovery context."
+    )
     input_schema = {
         "type": "object",
         "properties": {

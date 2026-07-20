@@ -168,7 +168,9 @@ class MemoryManager:
                 image_paths.append(hit.image_path)
         memory_context_text = "\n".join(texts)
         if len(memory_context_text) > self.config.max_prompt_context_chars:
-            memory_context_text = memory_context_text[: self.config.max_prompt_context_chars]
+            memory_context_text = memory_context_text[
+                : self.config.max_prompt_context_chars
+            ]
         return {
             "memory_context_text": memory_context_text,
             "memory_images": image_paths[: self.config.max_memory_images],
@@ -344,9 +346,7 @@ class MemoryManager:
 
     def _term_set(self, text: str) -> Set[str]:
         return {
-            term
-            for term in re.findall(r"[a-zA-Z0-9_]+", text.lower())
-            if len(term) > 2
+            term for term in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(term) > 2
         }
 
     def _visual_evidence_text(self, hit: MemoryHit) -> str:
@@ -382,7 +382,9 @@ class MemoryManager:
         if not compact:
             compact = self._clean_policy_segment(evidence)
         if len(compact) > MAX_POLICY_EVIDENCE_CHARS:
-            compact = compact[:MAX_POLICY_EVIDENCE_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:.")
+            compact = (
+                compact[:MAX_POLICY_EVIDENCE_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:.")
+            )
         return compact
 
     def _policy_hit_name(self, hit: MemoryHit) -> str:

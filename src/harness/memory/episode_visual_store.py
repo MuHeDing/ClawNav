@@ -143,9 +143,7 @@ class EpisodeVisualMemoryStore:
         normalized_roles = self._bounded_values(image_roles or (), 16, 64)
         normalized_provenance = self._bounded_values(provenance or (), 24, 120)
         normalized_stage_id = self._bounded_text(stage_id, 64, allow_empty=True)
-        normalized_summary = self._bounded_text(
-            visual_summary, 512, allow_empty=True
-        )
+        normalized_summary = self._bounded_text(visual_summary, 512, allow_empty=True)
         normalized_before = self._bounded_text(
             action_before_capture, 64, allow_empty=True
         )
@@ -216,9 +214,7 @@ class EpisodeVisualMemoryStore:
         return record
 
     def record_action_after_capture(self, step_id: int, action_text: str) -> int:
-        normalized_action = self._bounded_text(
-            action_text, 64, allow_empty=False
-        )
+        normalized_action = self._bounded_text(action_text, 64, allow_empty=False)
         normalized_step = int(step_id)
         updated = 0
         for index, record in enumerate(self._records):
@@ -384,8 +380,7 @@ class EpisodeVisualMemoryStore:
         if len(raw) > maximum_items:
             raise ValueError("visual memory list field exceeds item limit")
         normalized = tuple(
-            cls._bounded_text(value, maximum_chars, allow_empty=False)
-            for value in raw
+            cls._bounded_text(value, maximum_chars, allow_empty=False) for value in raw
         )
         return cls._merge_values((), normalized)
 

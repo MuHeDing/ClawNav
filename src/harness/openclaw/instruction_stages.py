@@ -240,7 +240,9 @@ def _validate_stage(raw: Any, expected_order: int) -> InstructionStage:
         raise InstructionStageSchemaError("stage fields mismatch")
     order = raw.get("order")
     if isinstance(order, bool) or not isinstance(order, int) or order != expected_order:
-        raise InstructionStageSchemaError("stage order must be contiguous and zero-based")
+        raise InstructionStageSchemaError(
+            "stage order must be contiguous and zero-based"
+        )
     route_clause = _bounded_text(raw.get("route_clause"), MAX_ROUTE_CLAUSE_CHARS)
     try:
         transition_type = TransitionType(raw.get("transition_type"))

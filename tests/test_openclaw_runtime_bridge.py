@@ -94,7 +94,9 @@ class MemoryContextSkill(Skill):
 
 class FailingGatewayPlanner:
     def plan(self, state, runtime_context):
-        raise OpenClawGatewayError("502 Server Error: Bad Gateway for url: http://gateway/plan")
+        raise OpenClawGatewayError(
+            "502 Server Error: Bad Gateway for url: http://gateway/plan"
+        )
 
 
 class StaticPlanner:
@@ -364,7 +366,10 @@ def test_qwen_direct_runtime_records_local_odometry_without_changing_action():
     assert second.runtime_metadata["odometry_last_forward_delta_m"] == 0.25
     assert second.runtime_metadata["odometry_last_action_had_progress"] is True
     assert second.runtime_metadata["odometry_consecutive_no_progress_forward"] == 0
-    assert second.runtime_metadata["local_control_context"]["odometry"]["available"] is True
+    assert (
+        second.runtime_metadata["local_control_context"]["odometry"]["available"]
+        is True
+    )
 
 
 def test_qwen_direct_runtime_counts_forward_no_progress_and_collision():
@@ -406,8 +411,12 @@ def test_qwen_direct_runtime_counts_forward_no_progress_and_collision():
     )
 
     assert first_blocked.runtime_metadata["odometry_last_action_had_progress"] is False
-    assert first_blocked.runtime_metadata["odometry_consecutive_no_progress_forward"] == 1
-    assert second_blocked.runtime_metadata["odometry_consecutive_no_progress_forward"] == 2
+    assert (
+        first_blocked.runtime_metadata["odometry_consecutive_no_progress_forward"] == 1
+    )
+    assert (
+        second_blocked.runtime_metadata["odometry_consecutive_no_progress_forward"] == 2
+    )
     assert second_blocked.runtime_metadata["odometry_collision"] is True
     assert second_blocked.runtime_metadata["odometry_consecutive_collision"] == 1
 
@@ -468,9 +477,10 @@ def test_qwen_direct_runtime_tracks_turn_round_and_negated_waypoint_context():
     final_route_progress = result.runtime_metadata["route_progress"]
     assert final_route_progress["turn_round_completed"] is False
     assert final_route_progress["negated_waypoint_mentions"] == ["billiard table"]
-    assert final_route_progress["waypoint_states"]["billiard table"][
-        "negated_mentions"
-    ] == 2
+    assert (
+        final_route_progress["waypoint_states"]["billiard table"]["negated_mentions"]
+        == 2
+    )
 
 
 def test_qwen_direct_runtime_marks_waypoint_passed_after_two_effective_forwards():
@@ -526,9 +536,12 @@ def test_qwen_direct_runtime_marks_waypoint_passed_after_two_effective_forwards(
     route_progress = planner.payloads[2]["route_progress"]
     assert route_progress["positively_seen_waypoints"] == ["billiard table"]
     assert route_progress["passed_waypoints"] == ["billiard table"]
-    assert route_progress["waypoint_states"]["billiard table"][
-        "effective_forward_after_seen"
-    ] == 2
+    assert (
+        route_progress["waypoint_states"]["billiard table"][
+            "effective_forward_after_seen"
+        ]
+        == 2
+    )
     assert result.runtime_metadata["route_progress"] == route_progress
 
 
@@ -570,9 +583,10 @@ def test_dynamic_visual_registry_records_previous_executed_action_and_resets():
         payload={"current_image_path": "/tmp/new-frame.png"},
     )
 
-    assert [record["image_path"] for record in planner.payloads[0]["visual_evidence_registry"]] == [
-        "/tmp/new-frame.png"
-    ]
+    assert [
+        record["image_path"]
+        for record in planner.payloads[0]["visual_evidence_registry"]
+    ] == ["/tmp/new-frame.png"]
 
 
 def test_dynamic_visual_registry_assigns_stall_anchor_and_signed_scan_roles():
@@ -830,7 +844,11 @@ def test_dynamic_visual_registry_promotes_only_schema_valid_positive_semantics()
 
     for step_id in range(3):
         runtime.step(
-            make_pose_state(step_id=step_id, position=(0, 0, step_id * 0.25), instruction=instruction),
+            make_pose_state(
+                step_id=step_id,
+                position=(0, 0, step_id * 0.25),
+                instruction=instruction,
+            ),
             payload={"current_image_path": f"/tmp/semantic{step_id}.png"},
         )
 
@@ -935,8 +953,12 @@ def test_dynamic_visual_registry_mirrors_into_shared_episode_store():
 
 
 def test_signed_heading_delta_handles_wraparound():
-    assert OpenClawVLNRuntime._signed_heading_delta(170.0, -170.0) == pytest.approx(20.0)
-    assert OpenClawVLNRuntime._signed_heading_delta(-170.0, 170.0) == pytest.approx(-20.0)
+    assert OpenClawVLNRuntime._signed_heading_delta(170.0, -170.0) == pytest.approx(
+        20.0
+    )
+    assert OpenClawVLNRuntime._signed_heading_delta(-170.0, 170.0) == pytest.approx(
+        -20.0
+    )
 
 
 def test_qwen_direct_runtime_keeps_turn_round_completion_after_further_rotation():
@@ -980,7 +1002,9 @@ def test_qwen_direct_runtime_keeps_turn_round_completion_after_further_rotation(
             payload={"instruction": instruction},
         )
 
-    assert planner.payloads[1]["route_progress"]["heading_change_from_start_deg"] == 180.0
+    assert (
+        planner.payloads[1]["route_progress"]["heading_change_from_start_deg"] == 180.0
+    )
     assert planner.payloads[1]["route_progress"]["turn_round_completed"] is True
     assert planner.payloads[2]["route_progress"]["heading_change_from_start_deg"] == 0.0
     assert planner.payloads[2]["route_progress"]["turn_round_completed"] is True
@@ -1342,7 +1366,10 @@ def test_runtime_executes_write_memory_intent_before_action():
     assert result.ok is True
     assert result.runtime_metadata["planned_intent"] == "write_memory"
     assert result.runtime_metadata["tool_calls"][0]["tool_name"] == "MemoryWriteSkill"
-    assert result.runtime_metadata["tool_calls"][-1]["tool_name"] == "NavigationPolicySkill"
+    assert (
+        result.runtime_metadata["tool_calls"][-1]["tool_name"]
+        == "NavigationPolicySkill"
+    )
 
 
 def test_runtime_executes_critic_and_replan_intents_before_action():
@@ -1363,7 +1390,10 @@ def test_runtime_executes_critic_and_replan_intents_before_action():
 
         assert result.ok is True
         assert result.runtime_metadata["tool_calls"][0]["tool_name"] == tool
-        assert result.runtime_metadata["tool_calls"][-1]["tool_name"] == "NavigationPolicySkill"
+        assert (
+            result.runtime_metadata["tool_calls"][-1]["tool_name"]
+            == "NavigationPolicySkill"
+        )
 
 
 def test_runtime_passes_replan_subgoal_to_navigation_policy():
@@ -1420,7 +1450,10 @@ def test_runtime_can_treat_planner_action_as_guidance_without_skipping_policy():
     decision = OpenClawPlanDecision(
         intent="act",
         tool_name="NavigationPolicySkill",
-        arguments={"action_text": "MOVE_FORWARD", "active_subgoal": "follow the archway"},
+        arguments={
+            "action_text": "MOVE_FORWARD",
+            "active_subgoal": "follow the archway",
+        },
         reason="planner guidance",
         planner_backend="gateway",
     )
@@ -1744,9 +1777,7 @@ def test_qwen_direct_structural_stop_uses_same_step_non_translating_verification
             }
         },
     )
-    planner = SequencePlanner(
-        [stop_decision, stop_decision]
-    )
+    planner = SequencePlanner([stop_decision, stop_decision])
     runtime = OpenClawVLNRuntime(
         tool_registry=SkillRegistry(),
         planner=planner,
@@ -1821,7 +1852,9 @@ def test_qwen_direct_structural_stop_verification_never_executes_forward():
     )
 
     result = runtime.step(
-        make_state(step_id=15, instruction="Walk across the floor and wait the archway."),
+        make_state(
+            step_id=15, instruction="Walk across the floor and wait the archway."
+        ),
         payload={"recent_actions": ["MOVE_FORWARD"] * 11},
     )
 
@@ -2112,7 +2145,10 @@ def test_qwen_direct_forward_stall_requeries_for_non_forward_action():
     assert planner.payloads[1]["control_context"]["force_non_forward_action"] is True
     assert result.runtime_metadata["qwen_direct_requery_triggered"] is True
     assert result.runtime_metadata["qwen_direct_requery_reason"] == "forward_stall_gate"
-    assert result.runtime_metadata["qwen_direct_initial_candidate_action"] == "MOVE_FORWARD"
+    assert (
+        result.runtime_metadata["qwen_direct_initial_candidate_action"]
+        == "MOVE_FORWARD"
+    )
     assert result.runtime_metadata["qwen_direct_initial_fallback_action"] == "TURN_LEFT"
     assert result.runtime_metadata["forward_stall_gate_decision"] == "blocked"
     assert result.runtime_metadata["blocked_action"] == "MOVE_FORWARD"
@@ -2333,7 +2369,10 @@ def test_runtime_auto_writes_and_recalls_planner_visual_analysis_for_policy():
 
     assert result.ok is True
     assert store[0]["image_path"] == "/tmp/current.png"
-    assert result.runtime_metadata["tool_calls"][0]["tool_name"] == "VisualMemoryCuratorSkill"
+    assert (
+        result.runtime_metadata["tool_calls"][0]["tool_name"]
+        == "VisualMemoryCuratorSkill"
+    )
     assert result.runtime_metadata["tool_calls"][1]["tool_name"] == "MemoryWriteSkill"
     assert result.runtime_metadata["tool_calls"][2]["tool_name"] == "MemoryQuerySkill"
     assert result.runtime_metadata["memory_writes"][0]["written"] is True
@@ -2380,7 +2419,9 @@ def test_runtime_supplies_auto_recalled_visual_memory_to_next_planner_call():
         allow_planner_action_override=False,
     )
 
-    runtime.step(make_state(step_id=0), payload={"current_image_path": "/tmp/current.png"})
+    runtime.step(
+        make_state(step_id=0), payload={"current_image_path": "/tmp/current.png"}
+    )
     runtime.step(make_state(step_id=1), payload={"current_image_path": "/tmp/next.png"})
 
     assert planner.payloads[0].get("memory_context_text") is None
@@ -2567,7 +2608,10 @@ def test_runtime_adds_default_write_gate_for_visual_memory_writes():
 
     first_call = result.runtime_metadata["tool_calls"][0]
     assert first_call["payload_summary"]["write_gate"]["curator_decision"] == "write"
-    assert first_call["payload_summary"]["write_gate"]["candidate_reason"] == "planner_request"
+    assert (
+        first_call["payload_summary"]["write_gate"]["candidate_reason"]
+        == "planner_request"
+    )
 
 
 def test_runtime_applies_visual_memory_curator_before_write_memory():
@@ -2605,10 +2649,16 @@ def test_runtime_applies_visual_memory_curator_before_write_memory():
     )
 
     assert result.ok is True
-    assert result.runtime_metadata["tool_calls"][0]["tool_name"] == "VisualMemoryCuratorSkill"
+    assert (
+        result.runtime_metadata["tool_calls"][0]["tool_name"]
+        == "VisualMemoryCuratorSkill"
+    )
     assert result.runtime_metadata["tool_calls"][1]["tool_name"] == "MemoryWriteSkill"
     assert result.runtime_metadata["memory_writes"][0]["skipped"] is True
-    assert result.runtime_metadata["memory_writes"][0]["write_gate"]["curator_decision"] == "skip"
+    assert (
+        result.runtime_metadata["memory_writes"][0]["write_gate"]["curator_decision"]
+        == "skip"
+    )
     assert result.runtime_metadata["visual_analysis"]["ran"] is True
     assert result.runtime_metadata["visual_analysis"]["visual_observation"] == (
         "Generic wall with no navigation cue."

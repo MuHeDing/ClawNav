@@ -3,7 +3,9 @@ from harness.types import HarnessDecision, MemoryHit, SkillResult, VLNState
 
 
 def test_skill_result_helpers():
-    ok = SkillResult.ok_result("action", {"action_text": "MOVE_FORWARD"}, confidence=0.7)
+    ok = SkillResult.ok_result(
+        "action", {"action_text": "MOVE_FORWARD"}, confidence=0.7
+    )
     assert ok.ok is True
     assert ok.result_type == "action"
     assert ok.payload["action_text"] == "MOVE_FORWARD"

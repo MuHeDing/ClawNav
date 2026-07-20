@@ -142,7 +142,10 @@ def test_memory_manager_recall_uses_visual_fields_in_policy_context():
 
     result = manager.recall(text="go to kitchen", step_id=3, reason="initial")
 
-    assert "A hallway with a doorway ahead." in result.policy_context["memory_context_text"]
+    assert (
+        "A hallway with a doorway ahead."
+        in result.policy_context["memory_context_text"]
+    )
     assert "doorway ahead" in result.policy_context["memory_context_text"]
     assert result.policy_context["memory_images"] == ["/tmp/keyframe.png"]
     assert result.control_context["best_landmark"] == "doorway"

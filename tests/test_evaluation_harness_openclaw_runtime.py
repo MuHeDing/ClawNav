@@ -268,7 +268,9 @@ def test_qwen_direct_proxy_tracks_and_resets_invalid_episode(tmp_path):
     assert proxy.episode_invalid_reason == ""
 
 
-def test_qwen_direct_proxy_injects_habitat_pose_into_state_without_prompt_leak(tmp_path):
+def test_qwen_direct_proxy_injects_habitat_pose_into_state_without_prompt_leak(
+    tmp_path,
+):
     components = build_harness_components(
         make_args(
             tmp_path,
@@ -372,8 +374,7 @@ def test_proxy_start_episode_resets_last_action_and_updates_state_identity(tmp_p
 
     trace_path = tmp_path / "harness_traces" / "harness_trace_rank0.jsonl"
     records = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
     ]
     assert records[0]["scene_id"] == "scene-a"
     assert records[0]["episode_id"] == "episode-1"
@@ -381,7 +382,9 @@ def test_proxy_start_episode_resets_last_action_and_updates_state_identity(tmp_p
     assert records[1]["episode_id"] == "episode-2"
 
 
-def test_proxy_save_video_does_not_enable_duplicate_harness_stream_video_by_default(tmp_path):
+def test_proxy_save_video_does_not_enable_duplicate_harness_stream_video_by_default(
+    tmp_path,
+):
     base_model = FakeBaseModel()
     components = build_harness_components(
         make_args(tmp_path, save_video=True, save_video_ratio=1.0),
@@ -493,11 +496,18 @@ def test_proxy_payload_exposes_current_image_path_and_recent_keyframe_paths(tmp_
     second_payload = proxy._runtime_payload([SaveableFrame("second")], step_id=1)
 
     assert first_payload["current_image_path"]
-    assert first_payload["current_image_path"] == first_payload["keyframe_candidate"]["image_path"]
-    assert first_payload["recent_keyframe_paths"] == [first_payload["current_image_path"]]
+    assert (
+        first_payload["current_image_path"]
+        == first_payload["keyframe_candidate"]["image_path"]
+    )
+    assert first_payload["recent_keyframe_paths"] == [
+        first_payload["current_image_path"]
+    ]
     assert second_payload["current_image_path"]
     assert second_payload["current_image_path"] != first_payload["current_image_path"]
-    assert second_payload["recent_keyframe_paths"] == [first_payload["current_image_path"]]
+    assert second_payload["recent_keyframe_paths"] == [
+        first_payload["current_image_path"]
+    ]
     assert Path(first_payload["current_image_path"]).exists()
     assert Path(second_payload["current_image_path"]).exists()
     assert first_payload["current_image_path"].endswith("step_000000.png")
@@ -570,14 +580,17 @@ def test_qwen_direct_proxy_payload_exposes_map_context_when_enabled(tmp_path):
     assert first_payload["map_context"]["internal_only"]["map_image_path"].endswith(
         "openclaw_map_frames/scene-a/episode-1/step_000000.png"
     )
-    assert Path(first_payload["map_context"]["internal_only"]["map_image_path"]).exists()
+    assert Path(
+        first_payload["map_context"]["internal_only"]["map_image_path"]
+    ).exists()
     assert second_payload["map_context"]["map_frame_due"] is False
     assert second_payload["map_context"]["map_available"] is False
     assert second_payload["map_context"]["cached_map_available"] is True
     assert second_payload["map_context"]["map_age_steps"] == 1
-    assert second_payload["map_context"]["internal_only"] == first_payload["map_context"][
-        "internal_only"
-    ]
+    assert (
+        second_payload["map_context"]["internal_only"]
+        == first_payload["map_context"]["internal_only"]
+    )
 
 
 def test_qwen_direct_proxy_uses_runtime_turn_loop_state_for_next_local_map(tmp_path):
@@ -661,7 +674,10 @@ def test_qwen_direct_proxy_payload_includes_structured_control_context(tmp_path)
     assert payload["control_context"]["non_oracle_metrics"] == {"collision": True}
     assert "distance_to_goal" not in json.dumps(payload["control_context"])
     assert payload["evidence_context"]["has_current_image"] is True
-    assert payload["evidence_context"]["current_image_path"] == payload["current_image_path"]
+    assert (
+        payload["evidence_context"]["current_image_path"]
+        == payload["current_image_path"]
+    )
 
 
 def test_proxy_start_episode_resets_episode_local_working_memory(tmp_path):

@@ -69,7 +69,9 @@ def test_same_canonical_path_merges_roles_and_provenance(tmp_path):
 def test_store_links_next_observed_executed_action_to_capture(tmp_path):
     store = EpisodeVisualMemoryStore()
     store.start_episode("scene", "episode")
-    record = add_record(store, tmp_path / "frame.png", step_id=4, action_after_capture="")
+    record = add_record(
+        store, tmp_path / "frame.png", step_id=4, action_after_capture=""
+    )
 
     updated = store.record_action_after_capture(4, "MOVE_FORWARD")
 

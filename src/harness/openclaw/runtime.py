@@ -189,7 +189,9 @@ class OpenClawVLNRuntime:
                     runtime_metadata=metadata,
                     error=planner_error,
                 )
-            decision = self.fallback_planner.plan(state, runtime_context=runtime_payload)
+            decision = self.fallback_planner.plan(
+                state, runtime_context=runtime_payload
+            )
             planner_fallback = True
         causal_recall: Dict[str, Any] = {}
         self._merge_planner_visual_observations(runtime_payload, decision)
@@ -199,7 +201,9 @@ class OpenClawVLNRuntime:
             metadata = self._metadata(decision, tool_calls, image_paths_used)
             metadata[f"planner_{cli_fallback_kind}_fallback"] = True
             metadata["planner_fallback"] = True
-            planner_error = str(decision.arguments.get("planner_error") or decision.reason)
+            planner_error = str(
+                decision.arguments.get("planner_error") or decision.reason
+            )
             if planner_error:
                 metadata["planner_error"] = planner_error
             self._record_context_engine_step(
@@ -231,7 +235,9 @@ class OpenClawVLNRuntime:
                 include_memory_images=False,
             )
             if decision.intent == "recall_memory":
-                arguments = self._memory_query_arguments(state, runtime_payload, arguments)
+                arguments = self._memory_query_arguments(
+                    state, runtime_payload, arguments
+                )
             if decision.intent == "write_memory":
                 arguments = self._memory_write_arguments(runtime_payload, arguments)
             if decision.intent == "write_memory":
@@ -257,7 +263,9 @@ class OpenClawVLNRuntime:
                 include_memory_images=False,
             )
             if decision.intent == "recall_memory":
-                after_decision = self._after_recall_decision(state, runtime_payload, nav_payload)
+                after_decision = self._after_recall_decision(
+                    state, runtime_payload, nav_payload
+                )
                 if after_decision is not None:
                     causal_recall = {
                         "before_decision": decision,
@@ -276,7 +284,9 @@ class OpenClawVLNRuntime:
                         )
 
         if decision.intent != "write_memory":
-            auto_write_calls = self._auto_write_visual_memory(state, runtime_payload, decision)
+            auto_write_calls = self._auto_write_visual_memory(
+                state, runtime_payload, decision
+            )
             if auto_write_calls:
                 tool_calls.extend(auto_write_calls)
                 written = any(
@@ -303,7 +313,11 @@ class OpenClawVLNRuntime:
             decision.arguments,
             include_memory_images=False,
         )
-        if decision.intent == "replan" and not nav_payload.get("active_subgoal") and decision.reason:
+        if (
+            decision.intent == "replan"
+            and not nav_payload.get("active_subgoal")
+            and decision.reason
+        ):
             nav_payload["active_subgoal"] = decision.reason
 
         planned_action_text = self._planned_action_text(decision.arguments)
@@ -402,7 +416,9 @@ class OpenClawVLNRuntime:
             return OpenClawRuntimeStepResult(
                 ok=True,
                 action_text=gate_result.final_action,
-                executor_command=self.executor.command_for_action(gate_result.final_action),
+                executor_command=self.executor.command_for_action(
+                    gate_result.final_action
+                ),
                 runtime_metadata=metadata,
             )
         if planned_action_text and self.allow_planner_action_override:
@@ -456,7 +472,9 @@ class OpenClawVLNRuntime:
             state=state,
             runtime_payload=runtime_payload,
             raw_candidate_action=action_text,
-            candidate_action_status=candidate_action_status_from_tool_result(nav_result),
+            candidate_action_status=candidate_action_status_from_tool_result(
+                nav_result
+            ),
         )
         metadata = self._metadata(
             decision,
@@ -559,9 +577,7 @@ class OpenClawVLNRuntime:
         if gate.get("promotion_status") != "promoted":
             return
         image_path = str(
-            gate.get("promoted_image_path")
-            or gate.get("keyframe_target_path")
-            or ""
+            gate.get("promoted_image_path") or gate.get("keyframe_target_path") or ""
         )
         if not image_path:
             return
@@ -584,9 +600,7 @@ class OpenClawVLNRuntime:
         if gate.get("promotion_status") != "promoted":
             return
         promoted_path = str(
-            gate.get("promoted_image_path")
-            or gate.get("keyframe_target_path")
-            or ""
+            gate.get("promoted_image_path") or gate.get("keyframe_target_path") or ""
         )
         current_path = str(runtime_payload.get("current_image_path") or "")
         if not promoted_path or not current_path:
@@ -620,8 +634,7 @@ class OpenClawVLNRuntime:
             record
             for record in records
             if not (
-                isinstance(record, dict)
-                and record.get("image_path") == promoted_path
+                isinstance(record, dict) and record.get("image_path") == promoted_path
             )
         ]
         records.append(promoted)
@@ -729,14 +742,24 @@ class OpenClawVLNRuntime:
                 "turn to recheck alignment or target evidence."
             ),
             "fallback_action": gate_result.final_action,
-            "stop_evidence": self._bounded_metadata_text(arguments.get("stop_evidence")),
-            "current_target": self._bounded_metadata_text(arguments.get("current_target")),
-            "target_relation": self._bounded_metadata_text(arguments.get("target_relation")),
+            "stop_evidence": self._bounded_metadata_text(
+                arguments.get("stop_evidence")
+            ),
+            "current_target": self._bounded_metadata_text(
+                arguments.get("current_target")
+            ),
+            "target_relation": self._bounded_metadata_text(
+                arguments.get("target_relation")
+            ),
             "semantic_stop_state": self._bounded_metadata_text(
                 arguments.get("semantic_stop_state")
             ),
-            "visual_summary": self._bounded_metadata_text(arguments.get("visual_summary")),
-            "progress_state": self._bounded_metadata_text(arguments.get("progress_state")),
+            "visual_summary": self._bounded_metadata_text(
+                arguments.get("visual_summary")
+            ),
+            "progress_state": self._bounded_metadata_text(
+                arguments.get("progress_state")
+            ),
             "qwen_reason": self._bounded_metadata_text(
                 arguments.get("reason") or getattr(decision, "reason", "")
             ),
@@ -784,13 +807,21 @@ class OpenClawVLNRuntime:
                 "MOVE_FORWARD is forbidden during this verification."
             ),
             "fallback_action": gate_result.final_action,
-            "stop_evidence": self._bounded_metadata_text(arguments.get("stop_evidence")),
-            "current_target": self._bounded_metadata_text(arguments.get("current_target")),
-            "target_relation": self._bounded_metadata_text(arguments.get("target_relation")),
+            "stop_evidence": self._bounded_metadata_text(
+                arguments.get("stop_evidence")
+            ),
+            "current_target": self._bounded_metadata_text(
+                arguments.get("current_target")
+            ),
+            "target_relation": self._bounded_metadata_text(
+                arguments.get("target_relation")
+            ),
             "semantic_stop_state": self._bounded_metadata_text(
                 arguments.get("semantic_stop_state")
             ),
-            "visual_summary": self._bounded_metadata_text(arguments.get("visual_summary")),
+            "visual_summary": self._bounded_metadata_text(
+                arguments.get("visual_summary")
+            ),
             "qwen_reason": self._bounded_metadata_text(
                 arguments.get("reason") or getattr(decision, "reason", "")
             ),
@@ -821,8 +852,12 @@ class OpenClawVLNRuntime:
                 for action in recent_actions[-4:]
                 if self._normalize_action_text(action)
             ],
-            "visual_summary": self._bounded_metadata_text(arguments.get("visual_summary")),
-            "progress_state": self._bounded_metadata_text(arguments.get("progress_state")),
+            "visual_summary": self._bounded_metadata_text(
+                arguments.get("visual_summary")
+            ),
+            "progress_state": self._bounded_metadata_text(
+                arguments.get("progress_state")
+            ),
             "qwen_reason": self._bounded_metadata_text(
                 arguments.get("reason") or getattr(decision, "reason", "")
             ),
@@ -899,7 +934,9 @@ class OpenClawVLNRuntime:
                         arguments.get("target_relation")
                     ),
                     "qwen_direct_initial_semantic_stop_state": (
-                        self._bounded_metadata_text(arguments.get("semantic_stop_state"))
+                        self._bounded_metadata_text(
+                            arguments.get("semantic_stop_state")
+                        )
                     ),
                     "stop_gate_decision": "blocked",
                     "blocked_action": "STOP",
@@ -936,7 +973,9 @@ class OpenClawVLNRuntime:
                         arguments.get("target_relation")
                     ),
                     "qwen_direct_initial_semantic_stop_state": (
-                        self._bounded_metadata_text(arguments.get("semantic_stop_state"))
+                        self._bounded_metadata_text(
+                            arguments.get("semantic_stop_state")
+                        )
                     ),
                     "qwen_direct_initial_stop_gate_block_reason": (
                         gate_result.metadata.get("stop_gate_block_reason")
@@ -1031,7 +1070,10 @@ class OpenClawVLNRuntime:
             record["mirrored_memory_ids"] = mirrored_memory_ids
         if seeded_keyframe_memory_ids:
             record["seeded_keyframe_memory_ids"] = seeded_keyframe_memory_ids
-        if state.step_id > 0 and state.step_id % context_engine.review_interval_steps == 0:
+        if (
+            state.step_id > 0
+            and state.step_id % context_engine.review_interval_steps == 0
+        ):
             record["review"] = context_engine.review_and_compact(
                 current_step_id=state.step_id
             )
@@ -1163,9 +1205,9 @@ class OpenClawVLNRuntime:
         if planner_visual_analysis:
             metadata["visual_analysis"] = planner_visual_analysis
             if visual_analysis.get("latency_ms") is not None:
-                metadata["visual_analysis"]["memory_write_latency_ms"] = visual_analysis.get(
-                    "latency_ms"
-                )
+                metadata["visual_analysis"][
+                    "memory_write_latency_ms"
+                ] = visual_analysis.get("latency_ms")
         elif visual_analysis:
             metadata["visual_analysis"] = visual_analysis
         recall_usage = self._recall_usage(
@@ -1315,9 +1357,9 @@ class OpenClawVLNRuntime:
             )
 
         episode_state["last_pose"] = pose
-        episode_state["consecutive_no_progress_forward"] = (
-            consecutive_no_progress_forward
-        )
+        episode_state[
+            "consecutive_no_progress_forward"
+        ] = consecutive_no_progress_forward
         episode_state["consecutive_collision"] = consecutive_collision
         heading_change_from_start = self._rotation_delta_deg(
             initial_rotation,
@@ -1490,7 +1532,11 @@ class OpenClawVLNRuntime:
                     gate_context.setdefault("current_visual_evidence", True)
         control_context = gate_context.get("control_context")
         if isinstance(control_context, dict):
-            for key in ("force_visual_refresh", "recent_forward_count", "visual_age_steps"):
+            for key in (
+                "force_visual_refresh",
+                "recent_forward_count",
+                "visual_age_steps",
+            ):
                 if key in control_context and key not in gate_context:
                     gate_context[key] = control_context[key]
         return gate_context
@@ -1527,8 +1573,10 @@ class OpenClawVLNRuntime:
             if not summaries or summaries[-1] != visual_summary:
                 summaries.append(visual_summary)
             episode_state["observed_visual_summaries"] = summaries[-24:]
-        required_waypoints = self.qwen_direct_gates.required_intermediate_route_waypoints(
-            state.instruction
+        required_waypoints = (
+            self.qwen_direct_gates.required_intermediate_route_waypoints(
+                state.instruction
+            )
         )
         if not visual_summary or not required_waypoints:
             return
@@ -1550,9 +1598,9 @@ class OpenClawVLNRuntime:
             if status == "positive":
                 waypoint_state["positively_seen"] = True
             elif status == "negated":
-                waypoint_state["negated_mentions"] = self._nonnegative_int(
-                    waypoint_state.get("negated_mentions")
-                ) + 1
+                waypoint_state["negated_mentions"] = (
+                    self._nonnegative_int(waypoint_state.get("negated_mentions")) + 1
+                )
 
     def _update_route_progress_from_odometry(
         self,
@@ -1561,7 +1609,10 @@ class OpenClawVLNRuntime:
     ) -> None:
         if not odometry:
             return
-        if self._normalize_action_text(odometry.get("previous_action")) != "MOVE_FORWARD":
+        if (
+            self._normalize_action_text(odometry.get("previous_action"))
+            != "MOVE_FORWARD"
+        ):
             return
         if odometry.get("last_action_had_progress") is not True:
             return
@@ -1576,9 +1627,12 @@ class OpenClawVLNRuntime:
                 continue
             if waypoint_state.get("passed") is True:
                 continue
-            forward_count = self._nonnegative_int(
-                waypoint_state.get("effective_forward_after_seen")
-            ) + 1
+            forward_count = (
+                self._nonnegative_int(
+                    waypoint_state.get("effective_forward_after_seen")
+                )
+                + 1
+            )
             waypoint_state["effective_forward_after_seen"] = forward_count
             if forward_count >= ROUTE_WAYPOINT_PASS_FORWARD_ACTIONS:
                 waypoint_state["passed"] = True
@@ -1588,8 +1642,10 @@ class OpenClawVLNRuntime:
         state: VLNState,
         runtime_payload: Dict[str, Any],
     ) -> None:
-        required_waypoints = self.qwen_direct_gates.required_intermediate_route_waypoints(
-            state.instruction
+        required_waypoints = (
+            self.qwen_direct_gates.required_intermediate_route_waypoints(
+                state.instruction
+            )
         )
         turn_round_required = self.qwen_direct_gates.route_requires_turn_round(
             state.instruction
@@ -1632,20 +1688,13 @@ class OpenClawVLNRuntime:
                     and isinstance(existing_states.get(waypoint), dict)
                     else {}
                 )
-            existing_seen = existing_route_progress.get(
-                "positively_seen_waypoints"
-            )
+            existing_seen = existing_route_progress.get("positively_seen_waypoints")
             existing_passed = existing_route_progress.get("passed_waypoints")
-            existing_negated = existing_route_progress.get(
-                "negated_waypoint_mentions"
-            )
+            existing_negated = existing_route_progress.get("negated_waypoint_mentions")
             serialized = {
                 "positively_seen": (
                     state_value.get("positively_seen") is True
-                    or (
-                        isinstance(existing_seen, list)
-                        and waypoint in existing_seen
-                    )
+                    or (isinstance(existing_seen, list) and waypoint in existing_seen)
                 ),
                 "effective_forward_after_seen": self._nonnegative_int(
                     state_value.get("effective_forward_after_seen")
@@ -1659,9 +1708,9 @@ class OpenClawVLNRuntime:
                 ),
                 "negated_mentions": self._nonnegative_int(
                     state_value.get("negated_mentions")
-                ) or int(
-                    isinstance(existing_negated, list)
-                    and waypoint in existing_negated
+                )
+                or int(
+                    isinstance(existing_negated, list) and waypoint in existing_negated
                 ),
             }
             serialized_states[waypoint] = serialized
@@ -1709,8 +1758,10 @@ class OpenClawVLNRuntime:
         runtime_payload["control_context"] = control_context
 
     def _dynamic_visual_context_active(self, runtime_payload: Dict[str, Any]) -> bool:
-        return self.staged_visual_memory_enabled or self.dynamic_visual_context_enabled or (
-            runtime_payload.get("dynamic_visual_context_enabled") is True
+        return (
+            self.staged_visual_memory_enabled
+            or self.dynamic_visual_context_enabled
+            or (runtime_payload.get("dynamic_visual_context_enabled") is True)
         )
 
     def _record_visual_evidence_frame(
@@ -1790,7 +1841,9 @@ class OpenClawVLNRuntime:
         state: VLNState,
     ) -> None:
         pose = self._pose_from_state(state)
-        position = self._numeric_list(pose.get("position")) if isinstance(pose, dict) else None
+        position = (
+            self._numeric_list(pose.get("position")) if isinstance(pose, dict) else None
+        )
         if position is None or len(position) < 3:
             return
         samples = episode_state.setdefault("turn_loop_pose_history", [])
@@ -1889,14 +1942,16 @@ class OpenClawVLNRuntime:
             return {}
         turns = [action for action in tail if action in {"TURN_LEFT", "TURN_RIGHT"}]
         forward_count = sum(action == "MOVE_FORWARD" for action in tail)
-        if len(turns) < TURN_LOOP_MIN_TURNS or forward_count > TURN_LOOP_MAX_FORWARD_ACTIONS:
+        if (
+            len(turns) < TURN_LOOP_MIN_TURNS
+            or forward_count > TURN_LOOP_MAX_FORWARD_ACTIONS
+        ):
             return {}
         left_turns = turns.count("TURN_LEFT")
         right_turns = turns.count("TURN_RIGHT")
         oscillating = left_turns >= 2 and right_turns >= 2
-        same_direction_spin = (
-            len(turns) >= TURN_LOOP_SAME_DIRECTION_TURNS
-            and (left_turns == 0 or right_turns == 0)
+        same_direction_spin = len(turns) >= TURN_LOOP_SAME_DIRECTION_TURNS and (
+            left_turns == 0 or right_turns == 0
         )
         route_progress = runtime_payload.get("route_progress")
         legitimate_turn_round = (
@@ -1910,12 +1965,15 @@ class OpenClawVLNRuntime:
         samples = episode_state.get("turn_loop_pose_history")
         if not isinstance(samples, list) or len(samples) < TURN_LOOP_MIN_TURNS:
             return {}
-        window = [sample for sample in samples[-(len(tail) + 1):] if isinstance(sample, dict)]
-        positions = [
-            self._numeric_list(sample.get("position"))
-            for sample in window
+        window = [
+            sample for sample in samples[-(len(tail) + 1) :] if isinstance(sample, dict)
         ]
-        positions = [position for position in positions if position is not None and len(position) >= 3]
+        positions = [self._numeric_list(sample.get("position")) for sample in window]
+        positions = [
+            position
+            for position in positions
+            if position is not None and len(position) >= 3
+        ]
         if len(positions) < TURN_LOOP_MIN_TURNS:
             return {}
         x_values = [position[0] for position in positions]
@@ -1980,7 +2038,9 @@ class OpenClawVLNRuntime:
             return
         reason = str(recovery.get("reason") or "")
         runtime_payload["visual_recovery_reason"] = reason
-        requested_scan_roles = [] if reason == "turn_loop" else ["left_scan", "right_scan"]
+        requested_scan_roles = (
+            [] if reason == "turn_loop" else ["left_scan", "right_scan"]
+        )
         missing_scan_roles = [
             role for role in requested_scan_roles if not role_paths.get(role)
         ]
@@ -2070,9 +2130,10 @@ class OpenClawVLNRuntime:
             if isinstance(runtime_metadata, dict)
             else {}
         )
-        if not isinstance(context_audit, dict) or context_audit.get(
-            "qwen_output_json_valid"
-        ) is not True:
+        if (
+            not isinstance(context_audit, dict)
+            or context_audit.get("qwen_output_json_valid") is not True
+        ):
             return
         arguments = getattr(decision, "arguments", {}) or {}
         if not isinstance(arguments, dict):
@@ -2104,10 +2165,13 @@ class OpenClawVLNRuntime:
             normalized = self._normalize_semantic_text(landmark, 80)
             if not normalized:
                 continue
-            if self.qwen_direct_gates.classify_waypoint_observation(
-                visual_summary,
-                normalized,
-            ) == "positive":
+            if (
+                self.qwen_direct_gates.classify_waypoint_observation(
+                    visual_summary,
+                    normalized,
+                )
+                == "positive"
+            ):
                 positive_landmarks.append(normalized)
         route_stage = self._normalize_semantic_text(arguments.get("route_stage"), 40)
         if route_stage not in {
@@ -2121,7 +2185,9 @@ class OpenClawVLNRuntime:
             "unknown",
         }:
             route_stage = "unknown"
-        current_target = self._normalize_semantic_text(arguments.get("current_target"), 120)
+        current_target = self._normalize_semantic_text(
+            arguments.get("current_target"), 120
+        )
         current_record["capture_route_stage"] = route_stage
         current_record["capture_current_target"] = current_target
         roles = {
@@ -2133,11 +2199,17 @@ class OpenClawVLNRuntime:
             self._replace_latest_semantic_role(records, "confirmed_landmark")
             roles.add("confirmed_landmark")
             current_record["confirmed_landmarks"] = positive_landmarks
-            current_record["confirmation_basis"] = "schema_valid_positive_visual_summary"
-        if current_target and self.qwen_direct_gates.classify_waypoint_observation(
-            visual_summary,
-            current_target,
-        ) == "positive":
+            current_record[
+                "confirmation_basis"
+            ] = "schema_valid_positive_visual_summary"
+        if (
+            current_target
+            and self.qwen_direct_gates.classify_waypoint_observation(
+                visual_summary,
+                current_target,
+            )
+            == "positive"
+        ):
             self._replace_latest_semantic_role(records, "target_candidate")
             roles.add("target_candidate")
             if not current_record.get("confirmation_basis"):
@@ -2184,9 +2256,11 @@ class OpenClawVLNRuntime:
         ]
         if record.get("keyframe") and "keyframe" not in record_roles:
             record_roles.append("keyframe")
-        if str(record.get("image_path") or "") == str(
-            runtime_payload.get("current_image_path") or ""
-        ) and "current" not in record_roles:
+        if (
+            str(record.get("image_path") or "")
+            == str(runtime_payload.get("current_image_path") or "")
+            and "current" not in record_roles
+        ):
             record_roles.append("current")
         self.episode_visual_store.add_observation(
             image_path=str(record.get("image_path") or ""),
@@ -2237,9 +2311,11 @@ class OpenClawVLNRuntime:
         episode_state: Dict[str, Any],
         records: List[Dict[str, Any]],
     ) -> set[str]:
-        pinned = {
-            str(records[-1].get("image_path") or "")
-        } if records and isinstance(records[-1], dict) else set()
+        pinned = (
+            {str(records[-1].get("image_path") or "")}
+            if records and isinstance(records[-1], dict)
+            else set()
+        )
         recovery = episode_state.get("visual_recovery")
         if isinstance(recovery, dict):
             pinned.update(
@@ -2298,7 +2374,9 @@ class OpenClawVLNRuntime:
         progress_state = self._bounded_metadata_text(arguments.get("progress_state"))
         if progress_state:
             metadata["qwen_progress_state"] = progress_state
-        route_stage = self._bounded_metadata_text(arguments.get("route_stage"), limit=40)
+        route_stage = self._bounded_metadata_text(
+            arguments.get("route_stage"), limit=40
+        )
         if route_stage:
             metadata["qwen_route_stage"] = route_stage
         confirmed_landmarks = arguments.get("confirmed_landmarks")
@@ -2395,7 +2473,9 @@ class OpenClawVLNRuntime:
             enriched["write_gate"] = write_gate
         return enriched
 
-    def _merge_planner_visual_observations(self, payload: Dict[str, Any], decision) -> None:
+    def _merge_planner_visual_observations(
+        self, payload: Dict[str, Any], decision
+    ) -> None:
         planner_runtime_metadata = getattr(decision, "runtime_metadata", {}) or {}
         if not isinstance(planner_runtime_metadata, dict):
             return
@@ -2409,9 +2489,7 @@ class OpenClawVLNRuntime:
         if isinstance(existing, list) and existing:
             return
         payload["visual_observations"] = [
-            observation
-            for observation in observations
-            if isinstance(observation, dict)
+            observation for observation in observations if isinstance(observation, dict)
         ]
 
     def _auto_write_visual_memory(
@@ -2448,7 +2526,9 @@ class OpenClawVLNRuntime:
                 },
             },
         )
-        arguments.setdefault("recent_visual_memories", list(self.recent_visual_memories))
+        arguments.setdefault(
+            "recent_visual_memories", list(self.recent_visual_memories)
+        )
         tool_calls: List[Dict[str, Any]] = []
         curator_result = self._curate_memory_write(state, arguments)
         if curator_result:
@@ -2546,7 +2626,9 @@ class OpenClawVLNRuntime:
                 if key in visual_observation and key not in enriched:
                     enriched[key] = visual_observation[key]
         if "write_gate" not in enriched:
-            enriched["write_gate"] = self._default_write_gate(payload, visual_observation)
+            enriched["write_gate"] = self._default_write_gate(
+                payload, visual_observation
+            )
         enriched.setdefault("should_write", True)
         enriched.setdefault("write_type", "episodic_keyframe")
         return enriched
@@ -2564,10 +2646,14 @@ class OpenClawVLNRuntime:
                 str(payload.get("current_image_path") or ""),
             )
             if visual_observation.get("visual_observation"):
-                enriched["visual_observation"] = visual_observation["visual_observation"]
+                enriched["visual_observation"] = visual_observation[
+                    "visual_observation"
+                ]
         enriched.setdefault("allowed_scopes", ["episode"])
         if not enriched.get("memory_namespace"):
-            enriched["memory_namespace"] = f"episode:{state.scene_id}:{state.episode_id}"
+            enriched[
+                "memory_namespace"
+            ] = f"episode:{state.scene_id}:{state.episode_id}"
         return enriched
 
     def _matching_visual_observation(
@@ -2725,14 +2811,24 @@ class OpenClawVLNRuntime:
                 record = {}
             writes.append(
                 {
-                    "written": bool(payload.get("written")) if isinstance(payload, dict) else False,
-                    "skipped": bool(payload.get("skipped")) if isinstance(payload, dict) else False,
-                    "skip_reason": payload.get("skip_reason", "") if isinstance(payload, dict) else "",
+                    "written": bool(payload.get("written"))
+                    if isinstance(payload, dict)
+                    else False,
+                    "skipped": bool(payload.get("skipped"))
+                    if isinstance(payload, dict)
+                    else False,
+                    "skip_reason": payload.get("skip_reason", "")
+                    if isinstance(payload, dict)
+                    else "",
                     "image_path": record.get("image_path") or payload.get("image_path"),
-                    "memory_scope": record.get("memory_scope") or payload.get("memory_scope"),
-                    "memory_namespace": record.get("memory_namespace") or payload.get("memory_namespace"),
-                    "memory_source": record.get("memory_source") or payload.get("memory_source"),
-                    "write_gate": record.get("write_gate") or payload.get("write_gate", {}),
+                    "memory_scope": record.get("memory_scope")
+                    or payload.get("memory_scope"),
+                    "memory_namespace": record.get("memory_namespace")
+                    or payload.get("memory_namespace"),
+                    "memory_source": record.get("memory_source")
+                    or payload.get("memory_source"),
+                    "write_gate": record.get("write_gate")
+                    or payload.get("write_gate", {}),
                 }
             )
         return writes
@@ -2773,7 +2869,7 @@ class OpenClawVLNRuntime:
             return
         self.recent_visual_memories.append(memory)
         self.recent_visual_memories = self.recent_visual_memories[
-            -self.max_recent_visual_memories:
+            -self.max_recent_visual_memories :
         ]
 
     def _visual_analysis(self, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2785,7 +2881,9 @@ class OpenClawVLNRuntime:
             if not isinstance(record, dict):
                 record = {}
             visual_payload = record or payload
-            if visual_payload.get("caption") or visual_payload.get("visual_observation"):
+            if visual_payload.get("caption") or visual_payload.get(
+                "visual_observation"
+            ):
                 return {
                     "ran": True,
                     "image_path": visual_payload.get("image_path", ""),
