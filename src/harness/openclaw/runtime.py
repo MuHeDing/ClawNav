@@ -735,6 +735,7 @@ class OpenClawVLNRuntime:
         return {
             "stage_schema_version": "instruction_stages_v1",
             "action_schema_version": "route_v3_staged",
+            "memory_treatment": self.staged_memory_treatment,
             "segmentation_source": stage_context.get("segmentation_source", ""),
             "instruction_sha256": stage_context.get("instruction_sha256", ""),
             "stage_plan_sha256": stage_context.get("stage_plan_sha256", ""),

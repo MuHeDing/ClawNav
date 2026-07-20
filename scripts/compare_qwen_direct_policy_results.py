@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 ABLATION_ARMS = ("fixed_off", "dynamic_off", "fixed_on", "dynamic_on")
+STAGED_MEMORY_ARMS = ("staged_memory_on", "staged_memory_off")
 PINNED_QWEN_MODEL = "qwen3.5-flash-2026-02-23"
 
 
@@ -49,6 +50,140 @@ def compare_result_files(
     return report
 
 
+def compare_staged_memory_arms(
+    arms: Dict[str, Dict[str, Path | str]],
+) -> Dict[str, Any]:
+    missing_arms = [name for name in STAGED_MEMORY_ARMS if name not in arms]
+    if missing_arms:
+        raise ValueError("missing staged memory arms: " + ", ".join(missing_arms))
+    report_arms: Dict[str, Any] = {}
+    key_sets: Dict[str, set[str]] = {}
+    fingerprints: Dict[str, Dict[str, Tuple[str, str, str]]] = {}
+    for name in STAGED_MEMORY_ARMS:
+        spec = arms[name]
+        result_rows, duplicates = _load_episode_rows(Path(spec["result"]))
+        trace_rows = _load_jsonl(Path(spec["trace"]))
+        result_keys = set(result_rows)
+        key_sets[name] = result_keys
+        arm_fingerprints: Dict[str, Tuple[str, str, str]] = {}
+        treatments = set()
+        event_rows = []
+        trace_keys = set()
+        for row in trace_rows:
+            key = _episode_key(row)
+            if key:
+                trace_keys.add(key)
+            audit = row.get("staged_visual_memory")
+            if not isinstance(audit, dict) or not key:
+                continue
+            fingerprint = (
+                str(audit.get("instruction_sha256") or ""),
+                str(audit.get("stage_plan_sha256") or ""),
+                str(audit.get("provider_config_sha256") or ""),
+            )
+            previous = arm_fingerprints.get(key)
+            if previous is not None and previous != fingerprint:
+                arm_fingerprints[key] = ("inconsistent", "inconsistent", "inconsistent")
+            else:
+                arm_fingerprints[key] = fingerprint
+            treatments.add(str(audit.get("memory_treatment") or ""))
+            if audit.get("memory_event_id"):
+                event_rows.append(audit)
+        fingerprints[name] = arm_fingerprints
+        expected_treatment = "on" if name == "staged_memory_on" else "off_ablation"
+        invalid_reasons = []
+        if duplicates:
+            invalid_reasons.append("duplicate_episode_keys")
+        if not result_keys:
+            invalid_reasons.append("incomplete_no_results")
+        if not result_keys.issubset(trace_keys):
+            invalid_reasons.append("incomplete_trace_episode_keys")
+        if treatments != {expected_treatment}:
+            invalid_reasons.append("unexpected_memory_treatment")
+        if set(arm_fingerprints) != result_keys:
+            invalid_reasons.append("incomplete_fingerprint_keys")
+        shadow_summary = None
+        if spec.get("shadow_summary"):
+            shadow_summary = json.loads(
+                Path(spec["shadow_summary"]).read_text(encoding="utf-8")
+            )
+        report_arms[name] = {
+            "result_count": len(result_rows),
+            "metrics": _metrics(list(result_rows.values())),
+            "duplicate_keys": sorted(duplicates),
+            "treatments": sorted(treatments),
+            "event_audit": _staged_event_audit(event_rows),
+            "shadow_summary": shadow_summary,
+            "invalid_reasons": invalid_reasons,
+            "valid": not invalid_reasons,
+        }
+    exact_keys = key_sets[STAGED_MEMORY_ARMS[0]]
+    exact_key_match = key_sets[STAGED_MEMORY_ARMS[1]] == exact_keys
+    fingerprints_match = exact_key_match and all(
+        fingerprints[STAGED_MEMORY_ARMS[0]].get(key)
+        == fingerprints[STAGED_MEMORY_ARMS[1]].get(key)
+        and all(fingerprints[name].get(key, ("", "", "")))
+        for key in exact_keys
+    )
+    shadow_summaries = [
+        report_arms[name].get("shadow_summary") for name in STAGED_MEMORY_ARMS
+    ]
+    shadow_available = all(isinstance(value, dict) for value in shadow_summaries)
+    shadow_stable = shadow_available and all(
+        all(
+            int(arm.get("unstable_event_count", 0)) == 0
+            for arm in value.get("arms", {}).values()
+            if isinstance(arm, dict)
+        )
+        for value in shadow_summaries
+        if isinstance(value, dict)
+    )
+    valid = (
+        exact_key_match
+        and fingerprints_match
+        and all(report_arms[name]["valid"] for name in STAGED_MEMORY_ARMS)
+        and (not shadow_available or shadow_stable)
+    )
+    return {
+        "schema_version": "staged_memory_comparison_v1",
+        "valid": valid,
+        "exact_key_match": exact_key_match,
+        "exact_episode_keys": sorted(exact_keys) if exact_key_match else [],
+        "fingerprints_match": fingerprints_match,
+        "arms": report_arms,
+        "shadow_agreement": {
+            "available": shadow_available,
+            "stable": shadow_stable if shadow_available else None,
+        },
+    }
+
+
+def _staged_event_audit(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "event_count": len(rows),
+        "registry_attempt_count": sum(
+            int(_float(row.get("registry_attempts"))) for row in rows
+        ),
+        "query_attempt_count": sum(
+            int(_float(row.get("query_attempts"))) for row in rows
+        ),
+        "retrieval_hit_count": sum(
+            row.get("registry_status") == "hit" or row.get("query_status") == "hit"
+            for row in rows
+        ),
+        "attachment_count": sum(bool(row.get("attached_image_roles")) for row in rows),
+        "candidate_change_count": sum(
+            bool(row.get("candidate_action_before"))
+            and row.get("candidate_action_before") != row.get("candidate_action_after")
+            for row in rows
+        ),
+        "intervention_count": sum(
+            str(row.get("controller_intervention") or "none") != "none" for row in rows
+        ),
+        "executed_action_count": sum(bool(row.get("executed_action")) for row in rows),
+    }
+
+
 def validate_qwen_direct_trace(trace_path: Path | str) -> Dict[str, Any]:
     rows = _load_jsonl(Path(trace_path))
     janus_loaded_count = 0
@@ -63,7 +198,11 @@ def validate_qwen_direct_trace(trace_path: Path | str) -> Dict[str, Any]:
     gate_counts: Counter[str] = Counter()
 
     for row in rows:
-        audit = row.get("context_audit") if isinstance(row.get("context_audit"), dict) else {}
+        audit = (
+            row.get("context_audit")
+            if isinstance(row.get("context_audit"), dict)
+            else {}
+        )
         policy_backend = row.get("policy_backend") or audit.get("policy_backend")
         if policy_backend and policy_backend != "qwen_direct":
             non_direct_backend_count += 1
@@ -82,7 +221,9 @@ def validate_qwen_direct_trace(trace_path: Path | str) -> Dict[str, Any]:
         final_action_source = str(row.get("final_action_source") or "")
         if final_action_source:
             final_action_source_counts[final_action_source] += 1
-        planner_step_mode = str(row.get("planner_step_mode") or audit.get("planner_step_mode") or "")
+        planner_step_mode = str(
+            row.get("planner_step_mode") or audit.get("planner_step_mode") or ""
+        )
         if planner_step_mode:
             planner_step_mode_counts[planner_step_mode] += 1
         for gate_key in (
@@ -106,9 +247,7 @@ def validate_qwen_direct_trace(trace_path: Path | str) -> Dict[str, Any]:
     )
     behavior_warnings: List[Dict[str, Any]] = []
     if rows and action_counts.get("MOVE_FORWARD") == len(rows):
-        behavior_warnings.append(
-            {"code": "all_forward_actions", "count": len(rows)}
-        )
+        behavior_warnings.append({"code": "all_forward_actions", "count": len(rows)})
     return {
         "trace_path": str(trace_path),
         "valid": valid,
@@ -243,7 +382,11 @@ def _ablation_trace_audit(
         stage = str(row.get("qwen_route_stage") or "")
         if stage:
             route_stage_counts[stage] += 1
-        audit = row.get("context_audit") if isinstance(row.get("context_audit"), dict) else {}
+        audit = (
+            row.get("context_audit")
+            if isinstance(row.get("context_audit"), dict)
+            else {}
+        )
         if row.get("qwen_failure") is True or audit.get("qwen_failure") is True:
             provider_failure_count += 1
         if audit.get("qwen_model_called") is not True:
@@ -252,7 +395,9 @@ def _ablation_trace_audit(
         selected_count = audit.get("selected_image_count")
         if selected_count is not None:
             selected_count_distribution[str(selected_count)] += 1
-        for role in audit.get("selected_image_roles") or audit.get("model_image_sources") or []:
+        for role in (
+            audit.get("selected_image_roles") or audit.get("model_image_sources") or []
+        ):
             selected_role_counts[str(role)] += 1
         for role in audit.get("missing_image_roles") or []:
             missing_role_counts[str(role)] += 1
@@ -346,9 +491,13 @@ def _ablation_trace_audit(
         ),
         "reasoning_tokens": reasoning_tokens,
         "provider_latency_ms_mean": (
-            round(sum(latency_values) / len(latency_values), 3) if latency_values else None
+            round(sum(latency_values) / len(latency_values), 3)
+            if latency_values
+            else None
         ),
-        "selected_image_count_distribution": dict(sorted(selected_count_distribution.items())),
+        "selected_image_count_distribution": dict(
+            sorted(selected_count_distribution.items())
+        ),
         "selected_image_role_counts": dict(sorted(selected_role_counts.items())),
         "missing_image_role_counts": dict(sorted(missing_role_counts.items())),
         "missing_image_role_rate": (
@@ -513,12 +662,18 @@ def main() -> int:
                 parser.error(f"ablation arm {name} must be an object")
             resolved_arms[name] = {
                 key: (base_dir / Path(spec[key])).resolve()
-                for key in ("result", "trace")
+                for key in ("result", "trace", "shadow_summary")
+                if spec.get(key)
             }
-        report = compare_ablation_2x2(resolved_arms)
+        if set(STAGED_MEMORY_ARMS).issubset(resolved_arms):
+            report = compare_staged_memory_arms(resolved_arms)
+        else:
+            report = compare_ablation_2x2(resolved_arms)
     else:
         if args.qwen_result is None or args.janus_result is None:
-            parser.error("--qwen-result and --janus-result are required without --ablation-manifest")
+            parser.error(
+                "--qwen-result and --janus-result are required without --ablation-manifest"
+            )
         report = compare_result_files(
             args.qwen_result,
             args.janus_result,

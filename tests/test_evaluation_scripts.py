@@ -37,12 +37,21 @@ def test_openclaw_gateway_script_defaults_to_multi_episode_smoke():
     contents = script.read_text(encoding="utf-8")
 
     assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}" in contents
-    assert "HARNESS_USE_DEFAULT_EPISODE_KEYS=${HARNESS_USE_DEFAULT_EPISODE_KEYS:-1}" in contents
+    assert (
+        "HARNESS_USE_DEFAULT_EPISODE_KEYS=${HARNESS_USE_DEFAULT_EPISODE_KEYS:-1}"
+        in contents
+    )
     assert "MAX_STEPS=${MAX_STEPS:-400}" in contents
     assert "OPENCLAW_GATEWAY_TIMEOUT=${OPENCLAW_GATEWAY_TIMEOUT:-300}" in contents
-    assert "OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}" in contents
+    assert (
+        "OPENCLAW_ENFORCE_TIMEOUT_BUDGET=${OPENCLAW_ENFORCE_TIMEOUT_BUDGET:-1}"
+        in contents
+    )
     assert "OPENCLAW_MAP_ASSIST_MODE=${OPENCLAW_MAP_ASSIST_MODE:-off}" in contents
-    assert "OPENCLAW_MAP_FRAME_INTERVAL_STEPS=${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}" in contents
+    assert (
+        "OPENCLAW_MAP_FRAME_INTERVAL_STEPS=${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}"
+        in contents
+    )
     assert "MAX_STEPS must be a positive integer" in contents
     assert "REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}" in contents
     assert "--require_service openclaw_cli_plan_gateway" in contents
@@ -64,7 +73,10 @@ def test_openclaw_gateway_script_can_disable_default_episode_keys_for_custom_dat
         '[[ -z "${HARNESS_EPISODE_KEYS:-}" && "${HARNESS_USE_DEFAULT_EPISODE_KEYS}" == "1" ]]'
         in contents
     )
-    assert 'echo "Use default episode keys: ${HARNESS_USE_DEFAULT_EPISODE_KEYS}"' in contents
+    assert (
+        'echo "Use default episode keys: ${HARNESS_USE_DEFAULT_EPISODE_KEYS}"'
+        in contents
+    )
     assert 'if [[ -n "${HARNESS_EPISODE_KEYS:-}" ]]; then' in contents
 
 
@@ -143,19 +155,36 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "OPENCLAW_GATEWAY_WS_URL" in contents
     assert "OPENCLAW_VISUAL_MODE" in contents
     assert "OPENCLAW_AGENT_TIMEOUT=${OPENCLAW_AGENT_TIMEOUT:-180}" in contents
-    assert "OPENCLAW_AGENT_MAX_INPUT_TOKENS=${OPENCLAW_AGENT_MAX_INPUT_TOKENS:-10000}" in contents
-    assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
+    assert (
+        "OPENCLAW_AGENT_MAX_INPUT_TOKENS=${OPENCLAW_AGENT_MAX_INPUT_TOKENS:-10000}"
+        in contents
+    )
+    assert (
+        "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
+    )
     assert "OPENCLAW_MODEL=${OPENCLAW_MODEL:-qwen/qwen3.5-flash}" in contents
     assert "OPENCLAW_MODEL_PROVIDER=${OPENCLAW_MODEL_PROVIDER:-qwen_api}" in contents
     assert 'if [[ "${POLICY_BACKEND}" == "qwen_direct" ]]; then' in contents
     assert "OPENCLAW_MODEL_MAX_IMAGES=${OPENCLAW_MODEL_MAX_IMAGES:-8}" in contents
     assert "OPENCLAW_MODEL_MAX_IMAGES=${OPENCLAW_MODEL_MAX_IMAGES:-3}" in contents
-    assert "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-20}" in contents
-    assert "OPENCLAW_MODEL_FAST_MODE=${OPENCLAW_MODEL_FAST_MODE:-qwen_text_only}" in contents
-    assert "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT=${OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT:-1}" in contents
+    assert (
+        "OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS=${OPENCLAW_MODEL_IMAGE_INTERVAL_STEPS:-20}"
+        in contents
+    )
+    assert (
+        "OPENCLAW_MODEL_FAST_MODE=${OPENCLAW_MODEL_FAST_MODE:-qwen_text_only}"
+        in contents
+    )
+    assert (
+        "OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT=${OPENCLAW_MODEL_FAST_USE_MEMORY_CONTEXT:-1}"
+        in contents
+    )
     assert "POLICY_BACKEND=${POLICY_BACKEND:-janus_policy}" in contents
     assert "OPENCLAW_VISUAL_TIMEOUT_MS=${OPENCLAW_VISUAL_TIMEOUT_MS:-90000}" in contents
-    assert "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}" in contents
+    assert (
+        "OPENCLAW_VISUAL_INTERVAL_STEPS=${OPENCLAW_VISUAL_INTERVAL_STEPS:-1}"
+        in contents
+    )
     assert "--openclaw_visual_mode" in contents
     assert "--openclaw_visual_interval_steps" in contents
     assert "--openclaw_visual_model" in contents
@@ -167,10 +196,19 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     assert "--openclaw_model_fast_use_memory_context" in contents
     assert "--policy_backend" in contents
     assert "--agent_max_input_tokens" in contents
-    assert "OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED=${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}" in contents
-    assert "OPENCLAW_QWEN_THINKING_MODE=${OPENCLAW_QWEN_THINKING_MODE:-auto}" in contents
-    assert "OPENCLAW_QWEN_OUTPUT_SCHEMA=${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" in contents
-    assert "OPENCLAW_QWEN_TRANSPORT_MODE=${OPENCLAW_QWEN_TRANSPORT_MODE:-sync}" in contents
+    assert (
+        "OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED=${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}"
+        in contents
+    )
+    assert (
+        "OPENCLAW_QWEN_THINKING_MODE=${OPENCLAW_QWEN_THINKING_MODE:-auto}" in contents
+    )
+    assert (
+        "OPENCLAW_QWEN_OUTPUT_SCHEMA=${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" in contents
+    )
+    assert (
+        "OPENCLAW_QWEN_TRANSPORT_MODE=${OPENCLAW_QWEN_TRANSPORT_MODE:-sync}" in contents
+    )
     assert "--dynamic_visual_context_enabled" in contents
     assert "--qwen_thinking_mode" in contents
     assert "--qwen_output_schema" in contents
@@ -182,19 +220,45 @@ def test_run_qwen_starts_gateway_in_qwen_direct_mode():
     script = repo_root / "scripts" / "run_qwen.sh"
     contents = script.read_text(encoding="utf-8")
 
-    gateway_start_block = contents.split("./scripts/start_openclaw_cli_plan_gateway.sh &", 1)[0]
+    gateway_start_block = contents.split(
+        "./scripts/start_openclaw_cli_plan_gateway.sh &", 1
+    )[0]
 
     assert "env -u OPENCLAW_GATEWAY_PORT \\" in gateway_start_block
     assert "POLICY_BACKEND=qwen_direct \\" in gateway_start_block
-    assert 'OPENCLAW_MODEL_MAX_IMAGES="${OPENCLAW_MODEL_MAX_IMAGES:-8}" \\' in gateway_start_block
-    assert 'OPENCLAW_MODEL_FAST_MODE="${OPENCLAW_MODEL_FAST_MODE}" \\' in gateway_start_block
-    assert 'OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED="${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}" \\' in gateway_start_block
-    assert 'OPENCLAW_QWEN_THINKING_MODE="${OPENCLAW_QWEN_THINKING_MODE:-auto}" \\' in gateway_start_block
-    assert 'OPENCLAW_QWEN_OUTPUT_SCHEMA="${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" \\' in gateway_start_block
-    assert 'OPENCLAW_QWEN_TRANSPORT_MODE="${OPENCLAW_QWEN_TRANSPORT_MODE:-sync}" \\' in gateway_start_block
+    assert (
+        'OPENCLAW_MODEL_MAX_IMAGES="${OPENCLAW_MODEL_MAX_IMAGES:-8}" \\'
+        in gateway_start_block
+    )
+    assert (
+        'OPENCLAW_MODEL_FAST_MODE="${OPENCLAW_MODEL_FAST_MODE}" \\'
+        in gateway_start_block
+    )
+    assert (
+        'OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED="${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}" \\'
+        in gateway_start_block
+    )
+    assert (
+        'OPENCLAW_QWEN_THINKING_MODE="${OPENCLAW_QWEN_THINKING_MODE:-auto}" \\'
+        in gateway_start_block
+    )
+    assert (
+        'OPENCLAW_QWEN_OUTPUT_SCHEMA="${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" \\'
+        in gateway_start_block
+    )
+    assert (
+        'OPENCLAW_QWEN_TRANSPORT_MODE="${OPENCLAW_QWEN_TRANSPORT_MODE:-sync}" \\'
+        in gateway_start_block
+    )
     assert 'OPENCLAW_MAP_ASSIST_MODE="${OPENCLAW_MAP_ASSIST_MODE:-off}"' in contents
-    assert 'OPENCLAW_MAP_FRAME_INTERVAL_STEPS="${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}"' in contents
-    assert 'OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED="${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}"' in contents
+    assert (
+        'OPENCLAW_MAP_FRAME_INTERVAL_STEPS="${OPENCLAW_MAP_FRAME_INTERVAL_STEPS:-5}"'
+        in contents
+    )
+    assert (
+        'OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED="${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}"'
+        in contents
+    )
     assert "QWEN_ABLATION_PROFILE=${QWEN_ABLATION_PROFILE:-}" in contents
     for profile in ("fixed_off", "dynamic_off", "fixed_on", "dynamic_on"):
         assert profile in contents
@@ -204,19 +268,52 @@ def test_run_qwen_starts_gateway_in_qwen_direct_mode():
     assert "OPENCLAW_MODEL_MAX_IMAGES=8" not in contents
 
 
+def test_staged_memory_launchers_propagate_strict_controller_contract():
+    repo_root = Path(__file__).resolve().parents[1]
+    run_qwen = (repo_root / "scripts/run_qwen.sh").read_text(encoding="utf-8")
+    evaluation = (repo_root / "scripts/evaluation_openclaw_gateway.sh").read_text(
+        encoding="utf-8"
+    )
+    ablation = (repo_root / "scripts/run_staged_memory_ablation.sh").read_text(
+        encoding="utf-8"
+    )
+    gateway_start = (
+        repo_root / "scripts/start_openclaw_cli_plan_gateway.sh"
+    ).read_text(encoding="utf-8")
+
+    for profile in ("staged_memory_on", "staged_memory_off"):
+        assert profile in run_qwen
+    assert "OPENCLAW_QWEN_OUTPUT_SCHEMA=route_v3_staged" in run_qwen
+    assert "OPENCLAW_STAGE_PLAN_MANIFEST_PATH" in run_qwen
+    assert "requires a frozen OPENCLAW_STAGE_PLAN_MANIFEST_PATH" in run_qwen
+    assert "OPENCLAW_STAGED_MEMORY_TREATMENT" in evaluation
+    assert "--staged_visual_memory_enabled" in evaluation
+    assert "--staged_memory_event_cap" in evaluation
+    assert "--staged_recovery_retrigger_steps" in evaluation
+    assert "--required_stage_schema instruction_stages_v1" in evaluation
+    assert "--required_action_schema route_v3_staged" in evaluation
+    assert "STAGED_MEMORY_ARM must be on or off" in ablation
+    assert "STAGE_PLAN_MANIFEST" in ablation
+    assert "OPENCLAW_STAGE_PLAN_MANIFEST_PATH" in gateway_start
+    assert "--stage_plan_manifest_path" in gateway_start
+
+
 def test_run_qwen_latest_launches_dynamic_thinking_six_episode_smoke():
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "scripts" / "run_qwen_latest.sh"
     contents = script.read_text(encoding="utf-8")
 
-    assert 'QWEN_ABLATION_PROFILE=${QWEN_ABLATION_PROFILE:-dynamic_on}' in contents
+    assert "QWEN_ABLATION_PROFILE=${QWEN_ABLATION_PROFILE:-dynamic_on}" in contents
     assert (
         'EPISODE_KEYS=${EPISODE_KEYS:-"2azQ1b91cZZ:10,2azQ1b91cZZ:11,'
         '2azQ1b91cZZ:12,2azQ1b91cZZ:16,2azQ1b91cZZ:70,2azQ1b91cZZ:1393"}'
     ) in contents
     assert "HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-6}" in contents
     assert "OPENCLAW_GATEWAY_PORT=${OPENCLAW_GATEWAY_PORT:-18013}" in contents
-    assert "OPENCLAW_KILL_EXISTING_GATEWAY=${OPENCLAW_KILL_EXISTING_GATEWAY:-1}" in contents
+    assert (
+        "OPENCLAW_KILL_EXISTING_GATEWAY=${OPENCLAW_KILL_EXISTING_GATEWAY:-1}"
+        in contents
+    )
     assert "unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_WS_URL" in contents
     assert "qwen_latest_${QWEN_ABLATION_PROFILE}_6ep_${RUN_TIMESTAMP}" in contents
     assert "OPENCLAW_MODEL_MAX_IMAGES" not in contents
@@ -229,7 +326,9 @@ def test_openclaw_visual_memory_script_preflights_qwen_visual_gateway():
     contents = script.read_text(encoding="utf-8")
 
     assert "OPENCLAW_VISUAL_MODE=${OPENCLAW_VISUAL_MODE:-describe}" in contents
-    assert "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
+    assert (
+        "OPENCLAW_VISUAL_MODEL=${OPENCLAW_VISUAL_MODEL:-qwen/qwen3.5-flash}" in contents
+    )
     assert "HARNESS_MEMORY_BACKEND=${HARNESS_MEMORY_BACKEND:-spatial_http}" in contents
     assert "OPENCLAW_SERVICE_REGISTRY=${OPENCLAW_SERVICE_REGISTRY-}" in contents
     assert "scripts/check_openclaw_visual_plan_gateway.py" in contents
@@ -244,7 +343,10 @@ def test_openclaw_gateway_script_can_enable_visual_memory_curator_and_critic():
     script = repo_root / "scripts" / "evaluation_openclaw_gateway.sh"
     contents = script.read_text(encoding="utf-8")
 
-    assert "OPENCLAW_ENABLE_SUBAGENT_CRITIC=${OPENCLAW_ENABLE_SUBAGENT_CRITIC:-0}" in contents
+    assert (
+        "OPENCLAW_ENABLE_SUBAGENT_CRITIC=${OPENCLAW_ENABLE_SUBAGENT_CRITIC:-0}"
+        in contents
+    )
     assert (
         "OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR=${OPENCLAW_ENABLE_SUBAGENT_MEMORY_CURATOR:-0}"
         in contents

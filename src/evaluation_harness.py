@@ -219,6 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.environ.get("OPENCLAW_STAGED_SHADOW_MAX_EVENTS", "5")),
     )
+    parser.add_argument(
+        "--staged_memory_event_cap",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_STAGED_MEMORY_EVENT_CAP", "64")),
+    )
+    parser.add_argument(
+        "--staged_recovery_retrigger_steps",
+        type=int,
+        default=int(os.environ.get("OPENCLAW_STAGED_RECOVERY_RETRIGGER_STEPS", "3")),
+    )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
     parser.add_argument("--openclaw_service_registry_path", type=str, default="")
@@ -331,6 +341,10 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
         ),
         staged_shadow_manifest_path=getattr(args, "staged_shadow_manifest_path", ""),
         staged_shadow_max_events=getattr(args, "staged_shadow_max_events", 5),
+        staged_memory_event_cap=getattr(args, "staged_memory_event_cap", 64),
+        staged_recovery_retrigger_steps=getattr(
+            args, "staged_recovery_retrigger_steps", 3
+        ),
         harness_runtime=args.harness_runtime,
         openclaw_workspace_path=args.openclaw_workspace_path,
         openclaw_service_registry_path=args.openclaw_service_registry_path,

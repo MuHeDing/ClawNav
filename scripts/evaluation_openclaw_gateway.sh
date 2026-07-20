@@ -52,6 +52,26 @@ OPENCLAW_MOTION_FEEDBACK_ENABLED=${OPENCLAW_MOTION_FEEDBACK_ENABLED:-0}
 OPENCLAW_FORWARD_STALL_ODOMETRY_ENABLED=${OPENCLAW_FORWARD_STALL_ODOMETRY_ENABLED:-0}
 OPENCLAW_MAP_COLLISION_OVERLAY_ENABLED=${OPENCLAW_MAP_COLLISION_OVERLAY_ENABLED:-0}
 OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED=${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED:-0}
+OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED=${OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED:-0}
+OPENCLAW_STAGED_MEMORY_TREATMENT=${OPENCLAW_STAGED_MEMORY_TREATMENT:-on}
+OPENCLAW_STAGE_MIN_TRANSLATION_M=${OPENCLAW_STAGE_MIN_TRANSLATION_M:-0.25}
+OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG=${OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG:-15}
+OPENCLAW_STAGED_MEMORY_EVENT_CAP=${OPENCLAW_STAGED_MEMORY_EVENT_CAP:-64}
+OPENCLAW_STAGED_RECOVERY_RETRIGGER_STEPS=${OPENCLAW_STAGED_RECOVERY_RETRIGGER_STEPS:-3}
+OPENCLAW_STAGED_SHADOW_MANIFEST_PATH=${OPENCLAW_STAGED_SHADOW_MANIFEST_PATH:-}
+OPENCLAW_STAGED_SHADOW_MAX_EVENTS=${OPENCLAW_STAGED_SHADOW_MAX_EVENTS:-5}
+OPENCLAW_QWEN_OUTPUT_SCHEMA=${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}
+
+if should_enable_flag "${OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED}"; then
+  if [[ "${POLICY_BACKEND}" != "qwen_direct" || "${OPENCLAW_QWEN_OUTPUT_SCHEMA}" != "route_v3_staged" ]]; then
+    echo "Staged visual memory requires qwen_direct with route_v3_staged" >&2
+    exit 2
+  fi
+  if ! should_enable_flag "${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED}"; then
+    echo "Staged visual memory requires dynamic visual context" >&2
+    exit 2
+  fi
+fi
 
 HARNESS_SELECTED_EPISODES=(
   "2azQ1b91cZZ:11"
@@ -160,6 +180,18 @@ fi
 if should_enable_flag "${OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED}"; then
   extra_args+=(--dynamic_visual_context_enabled)
 fi
+if should_enable_flag "${OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED}"; then
+  extra_args+=(--staged_visual_memory_enabled)
+  extra_args+=(--staged_memory_treatment "${OPENCLAW_STAGED_MEMORY_TREATMENT}")
+  extra_args+=(--stage_min_translation_m "${OPENCLAW_STAGE_MIN_TRANSLATION_M}")
+  extra_args+=(--stage_min_heading_change_deg "${OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG}")
+  extra_args+=(--staged_memory_event_cap "${OPENCLAW_STAGED_MEMORY_EVENT_CAP}")
+  extra_args+=(--staged_recovery_retrigger_steps "${OPENCLAW_STAGED_RECOVERY_RETRIGGER_STEPS}")
+  extra_args+=(--staged_shadow_max_events "${OPENCLAW_STAGED_SHADOW_MAX_EVENTS}")
+  if [[ -n "${OPENCLAW_STAGED_SHADOW_MANIFEST_PATH}" ]]; then
+    extra_args+=(--staged_shadow_manifest_path "${OPENCLAW_STAGED_SHADOW_MANIFEST_PATH}")
+  fi
+fi
 
 echo "OpenClaw gateway: ${OPENCLAW_GATEWAY_URL}"
 echo "Executor backend: ${OPENCLAW_EXECUTOR_BACKEND}"
@@ -189,6 +221,10 @@ if [[ "${CHECK_GATEWAY}" == "1" ]]; then
   fi
   if [[ "${OPENCLAW_ENFORCE_TIMEOUT_BUDGET}" == "1" ]]; then
     gateway_check_args+=(--enforce_timeout_budget)
+  fi
+  if should_enable_flag "${OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED}"; then
+    gateway_check_args+=(--required_stage_schema instruction_stages_v1)
+    gateway_check_args+=(--required_action_schema route_v3_staged)
   fi
   if ! PYTHONPATH=.:src /ssd/dingmuhe/anaconda3/envs/janusvln/bin/python \
     scripts/check_openclaw_plan_gateway.py \

@@ -10,8 +10,10 @@ ALLOWED_INTENTS = {"act", "recall_memory", "write_memory", "verify_progress", "r
 REQUIRED_KEYS = {"intent", "tool_name", "arguments", "reason"}
 
 
-def build_probe_payload(instruction: str) -> Dict[str, Any]:
-    return {
+def build_probe_payload(
+    instruction: str, required_action_schema: str = ""
+) -> Dict[str, Any]:
+    payload = {
         "state": {
             "scene_id": "gateway_check",
             "episode_id": "gateway_check",
@@ -24,6 +26,28 @@ def build_probe_payload(instruction: str) -> Dict[str, Any]:
             "recent_actions": [],
         },
     }
+    if required_action_schema == "route_v3_staged":
+        payload["runtime_context"].update(
+            {
+                "active_stage_id": "stage_00",
+                "stage_state": {
+                    "full_instruction": instruction,
+                    "active_stage": {
+                        "stage_id": "stage_00",
+                        "route_clause": instruction,
+                        "transition_type": "final_arrival",
+                        "expected_landmarks": [],
+                        "completion_cues": ["arrived"],
+                        "final_stage": True,
+                    },
+                    "completed_stages": [],
+                    "pending_stages": [],
+                },
+                "trigger_reasons": ["stage_entry"],
+                "requested_evidence": ["semantic_stop", "structural_stop"],
+            }
+        )
+    return payload
 
 
 def validate_plan_response(data: Dict[str, Any]) -> None:
@@ -124,7 +148,7 @@ def main() -> None:
     )
     response = session.post(
         f"{args.gateway_url.rstrip('/')}/plan",
-        json=build_probe_payload(args.instruction),
+        json=build_probe_payload(args.instruction, args.required_action_schema),
         timeout=args.timeout,
     )
     response.raise_for_status()

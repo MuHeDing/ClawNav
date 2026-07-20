@@ -4,6 +4,7 @@ from pathlib import Path
 from scripts.compare_qwen_direct_policy_results import (
     compare_ablation_2x2,
     compare_result_files,
+    compare_staged_memory_arms,
 )
 
 
@@ -20,16 +21,40 @@ def test_compare_qwen_direct_policy_results_aligns_shared_episode_keys(tmp_path)
     _write_jsonl(
         qwen,
         [
-            {"scene_id": "s1", "episode_id": "1", "success": 1.0, "spl": 0.5, "oracle_success": 1.0},
-            {"scene_id": "s1", "episode_id": "2", "success": 0.0, "spl": 0.0, "oracle_success": 1.0},
+            {
+                "scene_id": "s1",
+                "episode_id": "1",
+                "success": 1.0,
+                "spl": 0.5,
+                "oracle_success": 1.0,
+            },
+            {
+                "scene_id": "s1",
+                "episode_id": "2",
+                "success": 0.0,
+                "spl": 0.0,
+                "oracle_success": 1.0,
+            },
             {"summary": True, "success": 99.0},
         ],
     )
     _write_jsonl(
         janus,
         [
-            {"scene_id": "s1", "episode_id": "1", "success": 1.0, "spl": 0.7, "oracle_success": 1.0},
-            {"scene_id": "s1", "episode_id": "2", "success": 1.0, "spl": 0.3, "oracle_success": 1.0},
+            {
+                "scene_id": "s1",
+                "episode_id": "1",
+                "success": 1.0,
+                "spl": 0.7,
+                "oracle_success": 1.0,
+            },
+            {
+                "scene_id": "s1",
+                "episode_id": "2",
+                "success": 1.0,
+                "spl": 0.3,
+                "oracle_success": 1.0,
+            },
             {"summary": True},
         ],
     )
@@ -102,12 +127,18 @@ def test_compare_qwen_direct_policy_trace_preflight_rejects_janus_calls(tmp_path
     assert report["trace_preflight"]["planned_navigation_policy_skill_count"] == 1
 
 
-def test_compare_qwen_direct_policy_trace_preflight_reports_action_diagnostics(tmp_path):
+def test_compare_qwen_direct_policy_trace_preflight_reports_action_diagnostics(
+    tmp_path,
+):
     qwen = tmp_path / "qwen.jsonl"
     janus = tmp_path / "janus.jsonl"
     trace = tmp_path / "trace.jsonl"
-    _write_jsonl(qwen, [{"scene_id": "2azQ1b91cZZ", "episode_id": "11", "success": 0.0}])
-    _write_jsonl(janus, [{"scene_id": "2azQ1b91cZZ", "episode_id": "11", "success": 1.0}])
+    _write_jsonl(
+        qwen, [{"scene_id": "2azQ1b91cZZ", "episode_id": "11", "success": 0.0}]
+    )
+    _write_jsonl(
+        janus, [{"scene_id": "2azQ1b91cZZ", "episode_id": "11", "success": 1.0}]
+    )
     _write_jsonl(
         trace,
         [
@@ -159,6 +190,114 @@ def test_compare_qwen_direct_policy_trace_preflight_reports_action_diagnostics(t
     assert preflight["behavior_warnings"] == [
         {"code": "all_forward_actions", "count": 2}
     ]
+
+
+def test_compare_staged_memory_arms_requires_exact_keys_and_fingerprints(tmp_path):
+    arms = {}
+    for name, treatment, query_status in (
+        ("staged_memory_on", "on", "hit"),
+        ("staged_memory_off", "off_ablation", "disabled_ablation"),
+    ):
+        result = tmp_path / f"{name}.jsonl"
+        trace = tmp_path / f"{name}.trace.jsonl"
+        shadow = tmp_path / f"{name}.shadow.json"
+        _write_jsonl(
+            result,
+            [{"scene_id": "s1", "episode_id": "1", "success": 1, "spl": 0.5}],
+        )
+        _write_jsonl(
+            trace,
+            [
+                {
+                    "scene_id": "s1",
+                    "episode_id": "1",
+                    "staged_visual_memory": {
+                        "instruction_sha256": "instruction-hash",
+                        "stage_plan_sha256": "stage-hash",
+                        "provider_config_sha256": "provider-hash",
+                        "memory_treatment": treatment,
+                        "memory_event_id": "event-1",
+                        "trigger_reasons": ["stage_entry"],
+                        "registry_attempts": 1 if treatment == "on" else 0,
+                        "query_attempts": 1 if treatment == "on" else 0,
+                        "registry_status": query_status,
+                        "query_status": query_status,
+                        "selected_memory_ids": ["m1"] if treatment == "on" else [],
+                        "attached_image_roles": ["retrieved_memory"]
+                        if treatment == "on"
+                        else [],
+                        "candidate_action_before": "STOP",
+                        "candidate_action_after": "TURN_LEFT",
+                        "controller_intervention": "blocked_stop",
+                        "executed_action": "TURN_LEFT",
+                    },
+                }
+            ],
+        )
+        shadow.write_text(
+            json.dumps(
+                {
+                    "event_count": 1,
+                    "arms": {
+                        "memory_on": {
+                            "stable_event_count": 1,
+                            "unstable_event_count": 0,
+                        },
+                        "memory_off": {
+                            "stable_event_count": 1,
+                            "unstable_event_count": 0,
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        arms[name] = {"result": result, "trace": trace, "shadow_summary": shadow}
+
+    report = compare_staged_memory_arms(arms)
+
+    assert report["valid"] is True
+    assert report["exact_episode_keys"] == ["s1:1"]
+    assert report["fingerprints_match"] is True
+    assert report["arms"]["staged_memory_on"]["event_audit"]["retrieval_hit_count"] == 1
+    assert (
+        report["arms"]["staged_memory_off"]["event_audit"]["retrieval_hit_count"] == 0
+    )
+    assert report["shadow_agreement"]["stable"] is True
+
+
+def test_compare_staged_memory_arms_rejects_fingerprint_mismatch(tmp_path):
+    arms = {}
+    for name, stage_hash in (
+        ("staged_memory_on", "stage-a"),
+        ("staged_memory_off", "stage-b"),
+    ):
+        result = tmp_path / f"{name}.jsonl"
+        trace = tmp_path / f"{name}.trace.jsonl"
+        _write_jsonl(result, [{"scene_id": "s1", "episode_id": "1"}])
+        _write_jsonl(
+            trace,
+            [
+                {
+                    "scene_id": "s1",
+                    "episode_id": "1",
+                    "staged_visual_memory": {
+                        "instruction_sha256": "same",
+                        "stage_plan_sha256": stage_hash,
+                        "provider_config_sha256": "same-provider",
+                        "memory_treatment": "on"
+                        if name.endswith("on")
+                        else "off_ablation",
+                    },
+                }
+            ],
+        )
+        arms[name] = {"result": result, "trace": trace}
+
+    report = compare_staged_memory_arms(arms)
+
+    assert report["valid"] is False
+    assert report["fingerprints_match"] is False
 
 
 def _ablation_trace_row(*, dynamic, thinking, exercised, success_action="MOVE_FORWARD"):
@@ -226,7 +365,11 @@ def test_compare_ablation_2x2_uses_exact_keys_and_sr_first_outcomes(tmp_path):
         )
         _write_jsonl(
             trace,
-            [_ablation_trace_row(dynamic=dynamic, thinking=thinking, exercised=exercised)],
+            [
+                _ablation_trace_row(
+                    dynamic=dynamic, thinking=thinking, exercised=exercised
+                )
+            ],
         )
         arms[name] = {"result": result, "trace": trace}
 
@@ -234,13 +377,26 @@ def test_compare_ablation_2x2_uses_exact_keys_and_sr_first_outcomes(tmp_path):
 
     assert report["valid"] is True
     assert report["exact_episode_keys"] == ["s1:1"]
-    assert report["comparisons"]["phase3_dynamic_visual"]["outcome"] == "navigation_improvement"
-    assert report["comparisons"]["phase4_thinking"]["outcome"] == "efficiency_improvement_only"
-    assert report["arms"]["dynamic_on"]["trace_audit"]["thinking_exercised_true_count"] == 1
-    assert report["arms"]["dynamic_on"]["trace_audit"]["selected_image_count_distribution"] == {"3": 1}
+    assert (
+        report["comparisons"]["phase3_dynamic_visual"]["outcome"]
+        == "navigation_improvement"
+    )
+    assert (
+        report["comparisons"]["phase4_thinking"]["outcome"]
+        == "efficiency_improvement_only"
+    )
+    assert (
+        report["arms"]["dynamic_on"]["trace_audit"]["thinking_exercised_true_count"]
+        == 1
+    )
+    assert report["arms"]["dynamic_on"]["trace_audit"][
+        "selected_image_count_distribution"
+    ] == {"3": 1}
 
 
-def test_compare_ablation_2x2_invalidates_unexercised_thinking_and_mutable_model(tmp_path):
+def test_compare_ablation_2x2_invalidates_unexercised_thinking_and_mutable_model(
+    tmp_path,
+):
     arms = {}
     for name, dynamic, thinking in (
         ("fixed_off", False, False),
@@ -254,14 +410,22 @@ def test_compare_ablation_2x2_invalidates_unexercised_thinking_and_mutable_model
         if name == "fixed_off":
             row["context_audit"]["configured_model_id"] = "qwen/qwen3.5-flash"
             row["context_audit"]["configured_model_id_canonical"] = "qwen3.5-flash"
-        _write_jsonl(result, [{"scene_id": "s1", "episode_id": "1", "success": 1, "spl": 1}])
+        _write_jsonl(
+            result, [{"scene_id": "s1", "episode_id": "1", "success": 1, "spl": 1}]
+        )
         _write_jsonl(trace, [row])
         arms[name] = {"result": result, "trace": trace}
 
     report = compare_ablation_2x2(arms)
 
     assert report["valid"] is False
-    assert "mutable_or_wrong_configured_model" in report["arms"]["fixed_off"]["invalid_reasons"]
+    assert (
+        "mutable_or_wrong_configured_model"
+        in report["arms"]["fixed_off"]["invalid_reasons"]
+    )
     assert "thinking_not_exercised" in report["arms"]["dynamic_on"]["invalid_reasons"]
-    assert report["comparisons"]["phase3_dynamic_visual"]["outcome"] == "invalid_comparison"
+    assert (
+        report["comparisons"]["phase3_dynamic_visual"]["outcome"]
+        == "invalid_comparison"
+    )
     assert report["comparisons"]["phase4_thinking"]["outcome"] == "invalid_comparison"
