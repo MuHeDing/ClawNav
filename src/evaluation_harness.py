@@ -479,6 +479,8 @@ def build_harness_components(
             keyframe_debug_save_all_eligible=config.keyframe_debug_save_all_eligible,
             dynamic_visual_context_enabled=config.dynamic_visual_context_enabled,
             staged_visual_memory_enabled=config.staged_visual_memory_enabled,
+            stage_min_translation_m=config.stage_min_translation_m,
+            stage_min_heading_change_deg=config.stage_min_heading_change_deg,
             episode_visual_store=episode_visual_store,
         )
     logger = HarnessLogger(

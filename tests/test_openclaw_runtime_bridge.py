@@ -3,7 +3,12 @@ import pytest
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
 from harness.memory.episode_visual_store import EpisodeVisualMemoryStore
 from harness.openclaw.executor import HabitatOpenClawExecutor
-from harness.openclaw.gateway import FakeOpenClawGatewayClient, OpenClawGatewayError
+from harness.openclaw.gateway import (
+    FakeOpenClawGatewayClient,
+    InstructionSegmentationResult,
+    OpenClawGatewayError,
+)
+from harness.openclaw.instruction_stages import parse_instruction_stage_plan
 from harness.openclaw.planner import OpenClawPlanDecision, RuleOpenClawPlanner
 from harness.openclaw.runtime import OpenClawVLNRuntime
 from harness.skill_registry import SkillRegistry
@@ -117,6 +122,42 @@ class RecordingPlanner:
         return self.decision
 
 
+class StagedRecordingPlanner(RecordingPlanner):
+    def __init__(self, decision, stages=None, plan_errors=None):
+        super().__init__(decision)
+        self.stages = stages or [
+            {
+                "order": 0,
+                "route_clause": "go to the kitchen",
+                "transition_type": "final_arrival",
+                "expected_landmarks": ["kitchen"],
+                "completion_cues": ["inside the kitchen"],
+                "final_stage": True,
+            }
+        ]
+        self.segment_calls = []
+        self.plan_errors = list(plan_errors or [])
+
+    def segment_instruction(self, scene_id, episode_id, instruction):
+        self.segment_calls.append((scene_id, episode_id, instruction))
+        plan = parse_instruction_stage_plan(
+            {"schema_version": "instruction_stages_v1", "stages": self.stages},
+            instruction,
+        )
+        return InstructionSegmentationResult(
+            stage_plan=plan,
+            runtime_metadata={"segmentation_source": "qwen"},
+        )
+
+    def plan(self, state, runtime_context):
+        self.payloads.append(dict(runtime_context))
+        if self.plan_errors:
+            error = self.plan_errors.pop(0)
+            if error:
+                raise error
+        return self.decision
+
+
 def route_v2_decision(**overrides):
     arguments = {
         "action_text": "TURN_LEFT",
@@ -140,6 +181,17 @@ def route_v2_decision(**overrides):
         planner_backend="gateway",
         runtime_metadata={"context_audit": {"qwen_output_json_valid": True}},
     )
+
+
+def route_v3_decision(**overrides):
+    arguments = {
+        "active_stage_id": "stage_00",
+        "stage_complete_candidate": False,
+        "stage_relation": "unknown",
+        "stage_evidence_refs": [],
+    }
+    arguments.update(overrides)
+    return route_v2_decision(**arguments)
 
 
 class SequencePlanner:
@@ -2706,3 +2758,179 @@ def test_runtime_supplies_recent_visual_memories_to_curator_for_duplicate_skip()
     assert second_write["skipped"] is True
     assert second_write["write_gate"]["curator_decision"] == "skip"
     assert second_write["write_gate"]["duplicate_of_memory_id"] == "/tmp/red-door.png"
+
+
+def _two_stage_manifest():
+    return [
+        {
+            "order": 0,
+            "route_clause": "cross the hallway",
+            "transition_type": "traverse",
+            "expected_landmarks": ["hallway"],
+            "completion_cues": ["end of hallway"],
+            "final_stage": False,
+        },
+        {
+            "order": 1,
+            "route_clause": "enter the kitchen",
+            "transition_type": "final_arrival",
+            "expected_landmarks": ["kitchen"],
+            "completion_cues": ["inside the kitchen"],
+            "final_stage": True,
+        },
+    ]
+
+
+def _staged_runtime(planner, **overrides):
+    return OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=True,
+        **overrides,
+    )
+
+
+def test_staged_runtime_segments_once_and_exposes_controller_stage_context():
+    planner = StagedRecordingPlanner(route_v3_decision(), stages=_two_stage_manifest())
+    runtime = _staged_runtime(planner)
+
+    runtime.step(make_state(step_id=0), {"current_image_path": "/tmp/0.png"})
+    runtime.step(make_state(step_id=1), {"current_image_path": "/tmp/1.png"})
+
+    assert len(planner.segment_calls) == 1
+    first = planner.payloads[0]
+    assert first["active_stage_id"] == "stage_00"
+    assert first["stage_state"]["original_instruction"] == "go to kitchen"
+    assert first["stage_state"]["completed_stage_ids"] == []
+    assert [stage["stage_id"] for stage in first["stage_state"]["pending_stages"]] == [
+        "stage_01"
+    ]
+    assert first["trigger_reasons"] == ["stage_entry"]
+
+
+def test_staged_runtime_installs_single_stage_fallback_on_segmentation_error():
+    class SegmentationFailurePlanner(StagedRecordingPlanner):
+        def segment_instruction(self, scene_id, episode_id, instruction):
+            self.segment_calls.append((scene_id, episode_id, instruction))
+            raise OpenClawGatewayError("provider secret detail")
+
+    planner = SegmentationFailurePlanner(route_v3_decision())
+    runtime = _staged_runtime(planner)
+
+    result = runtime.step(make_state(step_id=0), {})
+
+    assert result.ok is True
+    assert len(planner.segment_calls) == 1
+    assert planner.payloads[0]["stage_state"]["fallback_category"] == "transport_error"
+    assert planner.payloads[0]["stage_state"]["segmentation_source"] == "fallback"
+    assert "provider secret detail" not in str(planner.payloads[0])
+
+
+def test_staged_runtime_does_not_resegment_after_planner_error():
+    planner = StagedRecordingPlanner(
+        route_v3_decision(),
+        stages=_two_stage_manifest(),
+        plan_errors=[OpenClawGatewayError("plan failed"), None],
+    )
+    runtime = _staged_runtime(planner)
+
+    first = runtime.step(make_state(step_id=0), {})
+    second = runtime.step(make_state(step_id=1), {})
+
+    assert first.ok is False
+    assert second.ok is True
+    assert len(planner.segment_calls) == 1
+
+
+def test_staged_runtime_rejects_unattached_evidence_without_advancing():
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["unknown"],
+            visual_summary="end of hallway",
+        ),
+        stages=_two_stage_manifest(),
+    )
+    runtime = _staged_runtime(planner)
+
+    result = runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+
+    assert runtime.staged_episode_state["s1::e1"]["stage_state"].active_stage_index == 0
+    assert result.runtime_metadata["stage_transition"]["decision"] == "rejected"
+    assert result.runtime_metadata["stage_transition"]["rule_ids"] == [
+        "evidence_ref_not_attached"
+    ]
+
+
+def test_staged_runtime_controller_advances_once_and_emits_next_entry_edge():
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            visual_summary="We reached the end of hallway.",
+        ),
+        stages=_two_stage_manifest(),
+    )
+    runtime = _staged_runtime(planner, stage_min_translation_m=0.25)
+
+    first = runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+    second = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/1.png"},
+    )
+    third = runtime.step(
+        make_pose_state(2, [0.6, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/2.png"},
+    )
+
+    assert (
+        first.runtime_metadata["stage_transition"]["decision"] == "needs_verification"
+    )
+    assert second.runtime_metadata["stage_transition"]["decision"] == "accepted"
+    assert planner.payloads[2]["active_stage_id"] == "stage_01"
+    assert planner.payloads[2]["trigger_reasons"] == ["stage_entry"]
+    stage_state = runtime.staged_episode_state["s1::e1"]["stage_state"]
+    assert stage_state.active_stage_index == 1
+    assert stage_state.completed_stage_ids == ["stage_00"]
+    assert len(stage_state.transition_audit) == 1
+    assert third.ok is True
+
+
+def test_staged_runtime_reset_clears_controller_state_and_resegments():
+    planner = StagedRecordingPlanner(route_v3_decision(), stages=_two_stage_manifest())
+    runtime = _staged_runtime(planner)
+    runtime.step(make_state(step_id=0), {})
+
+    runtime.reset_episode("s1", "e2")
+    other = VLNState("s1", "e2", "go upstairs", 0, None)
+    runtime.step(other, {})
+
+    assert len(planner.segment_calls) == 2
+    assert set(runtime.staged_episode_state) == {"s1::e2"}
+
+
+def test_disabled_staged_runtime_preserves_legacy_payload_and_never_segments():
+    planner = StagedRecordingPlanner(route_v2_decision())
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        staged_visual_memory_enabled=False,
+    )
+
+    runtime.step(make_state(step_id=0), {})
+
+    assert planner.segment_calls == []
+    assert "active_stage_id" not in planner.payloads[0]
+    assert "stage_state" not in planner.payloads[0]

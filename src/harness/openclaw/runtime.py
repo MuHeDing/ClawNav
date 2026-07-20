@@ -12,11 +12,23 @@ from harness.openclaw.control_gates import (
     TURN_ROUND_COMPLETION_THRESHOLD_DEG,
 )
 from harness.openclaw.executor import HabitatOpenClawExecutor
+from harness.openclaw.instruction_stages import (
+    EpisodeStageState,
+    StageFallbackCategory,
+    TransitionType,
+    single_stage_fallback,
+)
 from harness.openclaw.keyframe_gate import (
     EventGatedKeyframeGate,
     candidate_action_status_from_tool_result,
 )
 from harness.openclaw.motion_feedback import build_motion_feedback
+from harness.openclaw.stage_validation import (
+    StageRelation,
+    StageTransitionDecision,
+    StageTransitionEvidence,
+    StageTransitionValidator,
+)
 from harness.openclaw.tool_adapter import OpenClawToolAdapter
 from harness.skill_registry import SkillRegistry
 from harness.types import VLNState
@@ -95,6 +107,8 @@ class OpenClawVLNRuntime:
         keyframe_debug_save_all_eligible: bool = False,
         dynamic_visual_context_enabled: bool = False,
         staged_visual_memory_enabled: bool = False,
+        stage_min_translation_m: float = 0.25,
+        stage_min_heading_change_deg: float = 15.0,
         episode_visual_store: Optional[EpisodeVisualMemoryStore] = None,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
@@ -118,11 +132,17 @@ class OpenClawVLNRuntime:
         self.odometry_episode_state: Dict[str, Dict[str, Any]] = {}
         self.dynamic_visual_context_enabled = bool(dynamic_visual_context_enabled)
         self.staged_visual_memory_enabled = bool(staged_visual_memory_enabled)
+        self.stage_transition_validator = StageTransitionValidator(
+            min_translation_m=stage_min_translation_m,
+            min_heading_change_deg=stage_min_heading_change_deg,
+        )
+        self.staged_episode_state: Dict[str, Dict[str, Any]] = {}
         self.episode_visual_store = episode_visual_store
 
     def reset_episode(self, scene_id: str = "", episode_id: str = "") -> None:
         self.qwen_direct_episode_state.clear()
         self.odometry_episode_state.clear()
+        self.staged_episode_state.clear()
         if self.episode_visual_store is not None:
             self.episode_visual_store.reset_episode()
             if scene_id or episode_id:
@@ -130,6 +150,248 @@ class OpenClawVLNRuntime:
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
+
+    def _prepare_staged_controller_context(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.staged_visual_memory_enabled:
+            return None
+        key = f"{state.scene_id}::{state.episode_id}"
+        controller = self.staged_episode_state.get(key)
+        if controller is None:
+            try:
+                segmentation = self.planner.segment_instruction(
+                    state.scene_id,
+                    state.episode_id,
+                    state.instruction,
+                )
+                stage_plan = segmentation.stage_plan
+                segmentation_metadata = dict(segmentation.runtime_metadata)
+            except Exception:
+                stage_plan = single_stage_fallback(
+                    state.instruction,
+                    StageFallbackCategory.TRANSPORT_ERROR,
+                )
+                segmentation_metadata = {
+                    "segmentation_source": "fallback",
+                    "fallback_category": StageFallbackCategory.TRANSPORT_ERROR.value,
+                }
+            controller = {
+                "stage_state": stage_plan.new_episode_state(),
+                "segmentation_metadata": segmentation_metadata,
+                "stage_entry_pending": True,
+                "stage_entry_pose": self._pose_from_state(state),
+                "first_grounding_pose": None,
+            }
+            self.staged_episode_state[key] = controller
+
+        stage_state: EpisodeStageState = controller["stage_state"]
+        active_stage = stage_state.active_stage
+        runtime_payload["active_stage_id"] = active_stage.stage_id
+        runtime_payload["stage_state"] = {
+            "original_instruction": stage_state.original_instruction,
+            "full_instruction": stage_state.original_instruction,
+            "instruction_sha256": stage_state.instruction_sha256,
+            "stage_plan_sha256": stage_state.stage_plan_sha256,
+            "segmentation_source": stage_state.segmentation_source,
+            "fallback_category": stage_state.fallback_category.value,
+            "active_stage_id": active_stage.stage_id,
+            "active_stage_index": stage_state.active_stage_index,
+            "active_stage": active_stage.to_dict(),
+            "completed_stage_ids": list(stage_state.completed_stage_ids),
+            "completed_stages": [
+                stage.to_dict() for stage in stage_state.completed_stages
+            ],
+            "pending_stages": [stage.to_dict() for stage in stage_state.pending_stages],
+        }
+        runtime_payload["trigger_reasons"] = (
+            ["stage_entry"] if controller.get("stage_entry_pending") else []
+        )
+        runtime_payload["requested_evidence"] = self._stage_requested_evidence(
+            active_stage.transition_type
+        )
+        controller["stage_entry_pending"] = False
+        return controller
+
+    @staticmethod
+    def _stage_requested_evidence(transition_type: TransitionType) -> List[str]:
+        requested = {
+            TransitionType.TURN: ["current_relation", "heading_change"],
+            TransitionType.APPROACH: ["current_landmark", "translation"],
+            TransitionType.PASS: ["landmark", "past_relation", "post_grounding_motion"],
+            TransitionType.ENTER: ["threshold", "inside_relation"],
+            TransitionType.EXIT: ["threshold", "outside_relation"],
+            TransitionType.TRAVERSE: ["completion_cue", "translation"],
+            TransitionType.FINAL_ARRIVAL: ["semantic_stop", "structural_stop"],
+        }
+        return list(requested[transition_type])
+
+    def _validate_staged_transition(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        decision: Any,
+        gate_result: Any,
+        controller: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if controller is None:
+            return {}
+        stage_state: EpisodeStageState = controller["stage_state"]
+        stage = stage_state.active_stage
+        arguments = decision.arguments if isinstance(decision.arguments, dict) else {}
+        proposed_stage_id = str(arguments.get("active_stage_id") or "")
+        if proposed_stage_id != stage.stage_id:
+            return {
+                "decision": StageTransitionDecision.REJECTED.value,
+                "rule_ids": ["active_stage_id_mismatch"],
+                "evidence_refs": [],
+                "active_stage_id": stage.stage_id,
+                "advanced": False,
+            }
+
+        evidence = self._stage_transition_evidence(
+            state,
+            runtime_payload,
+            stage,
+            arguments,
+            gate_result,
+            controller,
+        )
+        result = self.stage_transition_validator.validate(stage, evidence)
+        previous_stage_id = stage.stage_id
+        advanced = False
+        if (
+            result.decision is StageTransitionDecision.ACCEPTED
+            and not stage.final_stage
+        ):
+            advanced = stage_state.advance("controller:stage_transition_validator")
+            if advanced:
+                controller["stage_entry_pending"] = True
+                controller["stage_entry_pose"] = self._pose_from_state(state)
+                controller["first_grounding_pose"] = None
+        return {
+            "decision": result.decision.value,
+            "rule_ids": list(result.rule_ids),
+            "evidence_refs": list(result.evidence_refs),
+            "active_stage_id": previous_stage_id,
+            "next_stage_id": stage_state.active_stage.stage_id,
+            "advanced": advanced,
+        }
+
+    def _stage_transition_evidence(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        stage: Any,
+        arguments: Dict[str, Any],
+        gate_result: Any,
+        controller: Dict[str, Any],
+    ) -> StageTransitionEvidence:
+        try:
+            relation = StageRelation(str(arguments.get("stage_relation") or "unknown"))
+        except ValueError:
+            relation = StageRelation.UNKNOWN
+        refs_value = arguments.get("stage_evidence_refs")
+        evidence_refs = (
+            tuple(
+                str(value) for value in refs_value if isinstance(value, str) and value
+            )
+            if isinstance(refs_value, list)
+            else ()
+        )
+        manifest = self._stage_attachment_manifest(runtime_payload, stage.stage_id)
+        summary = self._normalize_semantic_text(arguments.get("visual_summary"), 1000)
+        confirmed = arguments.get("confirmed_landmarks")
+        confirmed_text = (
+            {
+                self._normalize_semantic_text(value, 96)
+                for value in confirmed
+                if isinstance(value, str)
+            }
+            if isinstance(confirmed, list)
+            else set()
+        )
+        grounded_landmarks = tuple(
+            landmark
+            for landmark in stage.expected_landmarks
+            if self._normalize_semantic_text(landmark, 96) in confirmed_text
+            or self._normalize_semantic_text(landmark, 96) in summary
+        )
+        grounded_cues = tuple(
+            cue
+            for cue in stage.completion_cues
+            if self._normalize_semantic_text(cue, 96) in summary
+        )
+        current_grounded = bool(grounded_landmarks and "current" in evidence_refs)
+        current_pose = self._pose_from_state(state)
+        if current_grounded and controller.get("first_grounding_pose") is None:
+            controller["first_grounding_pose"] = current_pose
+        entry_pose = controller.get("stage_entry_pose")
+        translation = self._pose_translation_delta(entry_pose, current_pose)
+        heading = self._pose_heading_delta(entry_pose, current_pose)
+        after_grounding = self._pose_translation_delta(
+            controller.get("first_grounding_pose"), current_pose
+        )
+        gate_metadata = getattr(gate_result, "metadata", {}) or {}
+        stop_passed = str(
+            getattr(gate_result, "final_action", "")
+        ) == "STOP" and not gate_metadata.get("stop_gate_block_reason")
+        return StageTransitionEvidence(
+            stage_complete_candidate=arguments.get("stage_complete_candidate") is True,
+            relation=relation,
+            evidence_refs=evidence_refs,
+            attachment_manifest=manifest,
+            grounded_landmarks=grounded_landmarks,
+            grounded_completion_cues=grounded_cues,
+            current_landmark_grounded=current_grounded,
+            translation_since_stage_entry_m=translation,
+            heading_change_since_stage_entry_deg=heading,
+            translation_after_grounding_m=after_grounding,
+            semantic_stop_gate_passed=stop_passed,
+            structural_stop_gate_passed=stop_passed,
+        )
+
+    @staticmethod
+    def _stage_attachment_manifest(
+        runtime_payload: Dict[str, Any],
+        active_stage_id: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        candidate = runtime_payload.get("stage_attachment_manifest")
+        manifest = (
+            {
+                str(key): dict(value)
+                for key, value in candidate.items()
+                if isinstance(value, dict)
+            }
+            if isinstance(candidate, dict)
+            else {}
+        )
+        current_path = str(runtime_payload.get("current_image_path") or "")
+        if current_path:
+            manifest["current"] = {
+                "image_path": current_path,
+                "image_role": "current",
+                "stage_id": active_stage_id,
+            }
+        return manifest
+
+    def _pose_translation_delta(self, anchor: Any, current: Any) -> float:
+        if not isinstance(anchor, dict) or not isinstance(current, dict):
+            return 0.0
+        return float(
+            self._position_delta_m(anchor.get("position"), current.get("position"))
+            or 0.0
+        )
+
+    def _pose_heading_delta(self, anchor: Any, current: Any) -> float:
+        if not isinstance(anchor, dict) or not isinstance(current, dict):
+            return 0.0
+        return float(
+            self._rotation_delta_deg(anchor.get("rotation"), current.get("rotation"))
+            or 0.0
+        )
 
     def step(
         self,
@@ -141,6 +403,11 @@ class OpenClawVLNRuntime:
         runtime_payload = dict(payload)
         tool_calls: List[Dict[str, Any]] = []
         context_engine = self._context_engine_for_payload(runtime_payload)
+
+        staged_controller = self._prepare_staged_controller_context(
+            state,
+            runtime_payload,
+        )
 
         pre_planner_recall = self._auto_recall_memory(
             state,
@@ -369,6 +636,13 @@ class OpenClawVLNRuntime:
                         decision.arguments,
                         gate_context,
                     )
+            stage_transition = self._validate_staged_transition(
+                state,
+                runtime_payload,
+                decision,
+                gate_result,
+                staged_controller,
+            )
             metadata = self._metadata(
                 decision,
                 tool_calls,
@@ -383,6 +657,8 @@ class OpenClawVLNRuntime:
             )
             metadata.update(gate_result.metadata)
             metadata.update(requery_metadata)
+            if stage_transition:
+                metadata["stage_transition"] = stage_transition
             metadata["policy_backend"] = QWEN_DIRECT_POLICY_BACKEND
             metadata["direct_policy"] = True
             metadata.setdefault("janus_loaded", False)
