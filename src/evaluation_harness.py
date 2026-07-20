@@ -179,6 +179,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=env_bool("OPENCLAW_DYNAMIC_VISUAL_CONTEXT_ENABLED", False),
     )
+    parser.add_argument(
+        "--staged_visual_memory_enabled",
+        action="store_true",
+        default=env_bool("OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED", False),
+    )
+    parser.add_argument(
+        "--staged_memory_treatment",
+        choices=("on", "off_ablation"),
+        default=os.environ.get("OPENCLAW_STAGED_MEMORY_TREATMENT", "on"),
+    )
+    parser.add_argument(
+        "--stage_min_translation_m",
+        type=float,
+        default=float(os.environ.get("OPENCLAW_STAGE_MIN_TRANSLATION_M", "0.25")),
+    )
+    parser.add_argument(
+        "--stage_min_heading_change_deg",
+        type=float,
+        default=float(
+            os.environ.get("OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG", "15.0")
+        ),
+    )
     parser.add_argument("--harness_runtime", type=str, default="phase2")
     parser.add_argument("--openclaw_workspace_path", type=str, default="")
     parser.add_argument("--openclaw_service_registry_path", type=str, default="")
@@ -270,6 +292,18 @@ def build_harness_config(args: argparse.Namespace) -> HarnessConfig:
             args,
             "dynamic_visual_context_enabled",
             False,
+        ),
+        staged_visual_memory_enabled=getattr(
+            args,
+            "staged_visual_memory_enabled",
+            False,
+        ),
+        staged_memory_treatment=getattr(args, "staged_memory_treatment", "on"),
+        stage_min_translation_m=getattr(args, "stage_min_translation_m", 0.25),
+        stage_min_heading_change_deg=getattr(
+            args,
+            "stage_min_heading_change_deg",
+            15.0,
         ),
         harness_runtime=args.harness_runtime,
         openclaw_workspace_path=args.openclaw_workspace_path,

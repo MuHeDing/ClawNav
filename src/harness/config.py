@@ -41,3 +41,49 @@ class HarnessConfig:
     forward_stall_odometry_enabled: bool = False
     map_collision_overlay_enabled: bool = False
     dynamic_visual_context_enabled: bool = False
+    staged_visual_memory_enabled: bool = False
+    staged_memory_treatment: str = "on"
+    staged_segmentation_timeout_s: float = 120.0
+    staged_instruction_max_chars: int = 4096
+    staged_segmentation_request_max_bytes: int = 64 * 1024
+    staged_max_instruction_stages: int = 12
+    stage_min_translation_m: float = 0.25
+    stage_min_heading_change_deg: float = 15.0
+    staged_visual_store_capacity: int = 64
+    staged_registry_max_candidates: int = 2
+    staged_semantic_query_max_records: int = 4
+    staged_memory_event_cap: int = 64
+    staged_recovery_retrigger_steps: int = 3
+
+    def __post_init__(self) -> None:
+        if self.staged_memory_treatment not in {"on", "off_ablation"}:
+            raise ValueError(
+                "staged_memory_treatment must be one of: on, off_ablation"
+            )
+        if (
+            self.staged_memory_treatment == "off_ablation"
+            and not self.staged_visual_memory_enabled
+        ):
+            raise ValueError(
+                "staged_memory_treatment=off_ablation requires "
+                "staged_visual_memory_enabled"
+            )
+        positive_integer_fields = (
+            "staged_instruction_max_chars",
+            "staged_segmentation_request_max_bytes",
+            "staged_max_instruction_stages",
+            "staged_visual_store_capacity",
+            "staged_registry_max_candidates",
+            "staged_semantic_query_max_records",
+            "staged_memory_event_cap",
+            "staged_recovery_retrigger_steps",
+        )
+        for field_name in positive_integer_fields:
+            if int(getattr(self, field_name)) <= 0:
+                raise ValueError(f"{field_name} must be positive")
+        if float(self.staged_segmentation_timeout_s) <= 0:
+            raise ValueError("staged_segmentation_timeout_s must be positive")
+        if float(self.stage_min_translation_m) < 0:
+            raise ValueError("stage_min_translation_m must be non-negative")
+        if float(self.stage_min_heading_change_deg) < 0:
+            raise ValueError("stage_min_heading_change_deg must be non-negative")

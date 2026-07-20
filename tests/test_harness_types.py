@@ -60,3 +60,29 @@ def test_harness_config_defaults_are_bounded_and_non_oracle():
     assert cfg.recall_interval_steps >= 1
     assert cfg.memory_backend == "fake"
     assert cfg.allow_oracle_metrics_for_decision is False
+    assert cfg.staged_visual_memory_enabled is False
+    assert cfg.staged_memory_treatment == "on"
+    assert cfg.stage_min_translation_m == 0.25
+    assert cfg.stage_min_heading_change_deg == 15.0
+    assert cfg.staged_memory_event_cap == 64
+
+
+def test_harness_config_rejects_ablation_without_staged_mode():
+    try:
+        HarnessConfig(staged_memory_treatment="off_ablation")
+    except ValueError as exc:
+        assert "staged_visual_memory_enabled" in str(exc)
+    else:
+        raise AssertionError("expected staged ablation validation failure")
+
+
+def test_harness_config_accepts_staged_ablation_with_bounded_settings():
+    cfg = HarnessConfig(
+        staged_visual_memory_enabled=True,
+        staged_memory_treatment="off_ablation",
+        staged_memory_event_cap=1,
+        staged_recovery_retrigger_steps=1,
+    )
+
+    assert cfg.staged_memory_treatment == "off_ablation"
+    assert cfg.staged_memory_event_cap == 1
