@@ -667,6 +667,22 @@ def main() -> int:
             }
         if set(STAGED_MEMORY_ARMS).issubset(resolved_arms):
             report = compare_staged_memory_arms(resolved_arms)
+            expected_keys = manifest.get("expected_episode_keys")
+            if isinstance(expected_keys, list):
+                expected = sorted(str(value) for value in expected_keys)
+                report["expected_episode_keys"] = expected
+                report["expected_episode_keys_match"] = (
+                    report.get("exact_episode_keys") == expected
+                )
+                if not report["expected_episode_keys_match"]:
+                    report["valid"] = False
+            stage_manifest = manifest.get("stage_plan_manifest")
+            if stage_manifest:
+                stage_manifest_path = (base_dir / Path(stage_manifest)).resolve()
+                report["stage_plan_manifest"] = str(stage_manifest_path)
+                report["stage_plan_manifest_exists"] = stage_manifest_path.is_file()
+                if not report["stage_plan_manifest_exists"]:
+                    report["valid"] = False
         else:
             report = compare_ablation_2x2(resolved_arms)
     else:

@@ -500,6 +500,10 @@ class OpenClawVLNRuntime:
         )
         if event is None:
             return decision, existing_event, False
+        runtime_payload["visual_summary"] = str(arguments.get("visual_summary") or "")
+        runtime_payload["stage_relation"] = str(
+            arguments.get("stage_relation") or "unknown"
+        )
         self._run_staged_memory_event(
             state, runtime_payload, controller, event, tool_calls
         )
@@ -570,7 +574,8 @@ class OpenClawVLNRuntime:
         ]
         if not event.selected:
             return
-        if event.operations is None:
+        operation_reasons = event.trigger_reasons
+        if event.operations is None or event._operation_reasons != operation_reasons:
             stage_state: EpisodeStageState = controller["stage_state"]
             stage = stage_state.active_stage
             query = build_stage_memory_query(
@@ -622,6 +627,7 @@ class OpenClawVLNRuntime:
                 treatment=self.staged_memory_treatment,
                 exclude_image_path=str(runtime_payload.get("current_image_path") or ""),
             )
+            event._operation_reasons = operation_reasons
             tool_calls.extend(query_calls)
         self._attach_staged_memory_evidence(runtime_payload, event)
 

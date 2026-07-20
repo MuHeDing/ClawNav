@@ -33,6 +33,7 @@ class StagedMemoryEvent:
     selected: bool = True
     status: str = "selected"
     _reasons: set[StagedMemoryTrigger] = field(default_factory=set)
+    _operation_reasons: Tuple[StagedMemoryTrigger, ...] = ()
     operations: Optional["ForcedMemoryOperationsResult"] = None
     requery_performed: bool = False
     query_text: str = ""

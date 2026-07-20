@@ -132,11 +132,21 @@ def _summarize(rows: list[Dict[str, Any]], event_count: int) -> Dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shadow-manifest", type=Path, required=True)
-    parser.add_argument("--gateway-url", required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--primary-result-path", type=Path, required=True)
-    parser.add_argument("--replicas", type=int, default=2)
+    parser.add_argument(
+        "--shadow-manifest",
+        "--manifest",
+        dest="shadow_manifest",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument("--gateway-url", default="http://127.0.0.1:8013")
+    parser.add_argument(
+        "--output-dir", "--output_path", dest="output_dir", type=Path, required=True
+    )
+    parser.add_argument("--primary-result-path", type=Path, default=None)
+    parser.add_argument(
+        "--replicas", "--replicas_per_arm", dest="replicas", type=int, default=2
+    )
     parser.add_argument("--timeout", type=float, default=660.0)
     args = parser.parse_args()
     manifest_rows = [
@@ -169,7 +179,11 @@ def main() -> int:
         post,
         replicas=args.replicas,
         output_dir=args.output_dir,
-        primary_result_path=args.primary_result_path,
+        primary_result_path=(
+            args.primary_result_path
+            if args.primary_result_path is not None
+            else args.shadow_manifest.parent.parent
+        ),
     )
     return (
         0

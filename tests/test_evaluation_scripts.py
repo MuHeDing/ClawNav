@@ -292,8 +292,11 @@ def test_staged_memory_launchers_propagate_strict_controller_contract():
     assert "--staged_recovery_retrigger_steps" in evaluation
     assert "--required_stage_schema instruction_stages_v1" in evaluation
     assert "--required_action_schema route_v3_staged" in evaluation
-    assert "STAGED_MEMORY_ARM must be on or off" in ablation
-    assert "STAGE_PLAN_MANIFEST" in ablation
+    assert "QWEN_STAGE_PLAN_CAPTURE=1" in ablation
+    assert "staged_memory_off" in ablation
+    assert "staged_memory_on" in ablation
+    assert "STAGED_MEMORY_COMPARISON_MANIFEST" in ablation
+    assert "compare_qwen_direct_policy_results.py" in ablation
     assert "OPENCLAW_STAGE_PLAN_MANIFEST_PATH" in gateway_start
     assert "--stage_plan_manifest_path" in gateway_start
 

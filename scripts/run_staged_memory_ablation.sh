@@ -1,33 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STAGED_MEMORY_ARM=${STAGED_MEMORY_ARM:-on}
-STAGE_PLAN_MANIFEST=${STAGE_PLAN_MANIFEST:?Set STAGE_PLAN_MANIFEST to the frozen staged manifest}
+DATA_PATH=${DATA_PATH:?Set DATA_PATH to the selected evaluation dataset}
 EPISODE_KEYS=${EPISODE_KEYS:-2azQ1b91cZZ:10,2azQ1b91cZZ:11,2azQ1b91cZZ:12,2azQ1b91cZZ:16,2azQ1b91cZZ:70,2azQ1b91cZZ:1393}
-RUN_TIMESTAMP=${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
+OPENCLAW_STAGE_PLAN_MANIFEST_PATH=${OPENCLAW_STAGE_PLAN_MANIFEST_PATH:?Set OPENCLAW_STAGE_PLAN_MANIFEST_PATH}
+STAGED_MEMORY_OFF_OUTPUT_PATH=${STAGED_MEMORY_OFF_OUTPUT_PATH:-results/qwen_staged_memory_off_6ep}
+STAGED_MEMORY_ON_OUTPUT_PATH=${STAGED_MEMORY_ON_OUTPUT_PATH:-results/qwen_staged_memory_on_6ep}
+STAGED_MEMORY_COMPARISON_MANIFEST=${STAGED_MEMORY_COMPARISON_MANIFEST:-results/staged_memory_ablation_manifest.json}
+STAGED_MEMORY_COMPARISON_OUTPUT=${STAGED_MEMORY_COMPARISON_OUTPUT:-results/staged_memory_ablation_comparison.json}
+HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-6}
+MAX_STEPS=${MAX_STEPS:-200}
 
-case "${STAGED_MEMORY_ARM}" in
-  on)
-    QWEN_ABLATION_PROFILE=staged_memory_on
-    ;;
-  off)
-    QWEN_ABLATION_PROFILE=staged_memory_off
-    ;;
-  *)
-    echo "STAGED_MEMORY_ARM must be on or off" >&2
-    exit 2
-    ;;
-esac
+if [[ ! -f "${OPENCLAW_STAGE_PLAN_MANIFEST_PATH}" ]]; then
+  QWEN_STAGE_PLAN_CAPTURE=1 \
+  QWEN_ABLATION_PROFILE=staged_memory_on \
+  OPENCLAW_STAGED_VISUAL_MEMORY_ENABLED=1 \
+  OPENCLAW_QWEN_OUTPUT_SCHEMA=route_v3_staged \
+  DATA_PATH="${DATA_PATH}" \
+  EPISODE_KEYS="${EPISODE_KEYS}" \
+  OPENCLAW_STAGE_PLAN_MANIFEST_PATH="${OPENCLAW_STAGE_PLAN_MANIFEST_PATH}" \
+  bash scripts/run_qwen.sh
+fi
 
-export QWEN_ABLATION_PROFILE
-export OPENCLAW_STAGE_PLAN_MANIFEST_PATH="${STAGE_PLAN_MANIFEST}"
-export OPENCLAW_STAGED_SHADOW_MANIFEST_PATH=${OPENCLAW_STAGED_SHADOW_MANIFEST_PATH:-}
-export OPENCLAW_STAGED_MEMORY_EVENT_CAP=${OPENCLAW_STAGED_MEMORY_EVENT_CAP:-64}
-export OPENCLAW_STAGED_RECOVERY_RETRIGGER_STEPS=${OPENCLAW_STAGED_RECOVERY_RETRIGGER_STEPS:-3}
-export OPENCLAW_STAGE_MIN_TRANSLATION_M=${OPENCLAW_STAGE_MIN_TRANSLATION_M:-0.25}
-export OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG=${OPENCLAW_STAGE_MIN_HEADING_CHANGE_DEG:-15}
-export EPISODE_KEYS
-export HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-6}
-export OUTPUT_PATH=${OUTPUT_PATH:-results/qwen_staged_memory_${STAGED_MEMORY_ARM}_${RUN_TIMESTAMP}}
+QWEN_ABLATION_PROFILE=staged_memory_off \
+OPENCLAW_STAGE_PLAN_MANIFEST_PATH="${OPENCLAW_STAGE_PLAN_MANIFEST_PATH}" \
+EPISODE_KEYS="${EPISODE_KEYS}" \
+HARNESS_DEBUG_MAX_EPISODES="${HARNESS_DEBUG_MAX_EPISODES}" \
+OUTPUT_PATH="${STAGED_MEMORY_OFF_OUTPUT_PATH}" \
+MAX_STEPS="${MAX_STEPS}" \
+bash scripts/run_qwen.sh
 
-exec bash scripts/run_qwen.sh
+QWEN_ABLATION_PROFILE=staged_memory_on \
+OPENCLAW_STAGE_PLAN_MANIFEST_PATH="${OPENCLAW_STAGE_PLAN_MANIFEST_PATH}" \
+EPISODE_KEYS="${EPISODE_KEYS}" \
+HARNESS_DEBUG_MAX_EPISODES="${HARNESS_DEBUG_MAX_EPISODES}" \
+OUTPUT_PATH="${STAGED_MEMORY_ON_OUTPUT_PATH}" \
+MAX_STEPS="${MAX_STEPS}" \
+bash scripts/run_qwen.sh
+
+mkdir -p "$(dirname "${STAGED_MEMORY_COMPARISON_MANIFEST}")"
+python - "${STAGED_MEMORY_COMPARISON_MANIFEST}" \
+  "${OPENCLAW_STAGE_PLAN_MANIFEST_PATH}" \
+  "${EPISODE_KEYS}" \
+  "${STAGED_MEMORY_OFF_OUTPUT_PATH}" \
+  "${STAGED_MEMORY_ON_OUTPUT_PATH}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+output, stage_manifest, keys, off_path, on_path = sys.argv[1:]
+payload = {
+    "comparison_type": "staged_memory",
+    "stage_plan_manifest": stage_manifest,
+    "expected_episode_keys": keys.split(","),
+    "arms": {
+        "staged_memory_off": {
+            "result": str((Path(off_path) / "result.json").resolve()),
+            "trace": str((Path(off_path) / "harness_traces/harness_trace_rank0.jsonl").resolve()),
+            "treatment": "off_ablation",
+        },
+        "staged_memory_on": {
+            "result": str((Path(on_path) / "result.json").resolve()),
+            "trace": str((Path(on_path) / "harness_traces/harness_trace_rank0.jsonl").resolve()),
+            "treatment": "on",
+        },
+    },
+}
+Path(output).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
+PYTHONPATH=src:. python scripts/compare_qwen_direct_policy_results.py \
+  --ablation-manifest "${STAGED_MEMORY_COMPARISON_MANIFEST}" \
+  --output "${STAGED_MEMORY_COMPARISON_OUTPUT}"

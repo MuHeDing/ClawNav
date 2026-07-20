@@ -3061,6 +3061,13 @@ def test_completion_and_stop_candidates_coalesce_and_requery_only_once():
         "stage_entry",
     ]
     assert event["requery_performed"] is True
+    assert len(memory_skill.calls) == 2
+    assert (
+        "trigger reasons: stop_candidate, stage_completion_candidate, stage_entry"
+        in (memory_skill.calls[-1]["text"])
+    )
+    assert "current relation: past" in memory_skill.calls[-1]["text"]
+    assert "current visual summary: end of hallway" in memory_skill.calls[-1]["text"]
     assert result.action_text != "STOP"
 
 
