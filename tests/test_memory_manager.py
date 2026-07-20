@@ -1,5 +1,6 @@
 from harness.config import HarnessConfig
 from harness.memory.spatial_memory_client import BaseSpatialMemoryClient
+from harness.memory.episode_visual_store import EpisodeVisualMemoryStore
 from harness.memory.memory_manager import MemoryManager
 from harness.memory.spatial_memory_client import FakeSpatialMemoryClient
 from harness.types import MemoryHit
@@ -29,6 +30,70 @@ class RecordingMemoryClient(BaseSpatialMemoryClient):
             }
         )
         return self.hits[:n_results]
+
+
+def test_staged_recall_merges_episode_visual_hits_before_external_hits(tmp_path):
+    image_path = tmp_path / "doorway.png"
+    image_path.write_bytes(b"png")
+    store = EpisodeVisualMemoryStore()
+    store.start_episode("s1", "e1")
+    store.add_observation(
+        image_path=str(image_path),
+        step_id=2,
+        stage_id="stage_00",
+        visual_summary="A doorway beside the kitchen.",
+        landmarks=["doorway"],
+        image_roles=["confirmed_landmark"],
+        provenance=["runtime:qwen"],
+    )
+    fake_text_hit = MemoryHit(
+        memory_id="fake-text",
+        memory_type="semantic",
+        name="doorway",
+        confidence=1.0,
+        evidence_text="text only",
+        image_path=None,
+    )
+    manager = MemoryManager(
+        RecordingMemoryClient([fake_text_hit]),
+        HarnessConfig(staged_visual_memory_enabled=True),
+        episode_visual_store=store,
+    )
+
+    result = manager.recall(
+        text="find the doorway",
+        step_id=3,
+        reason="stage_entry",
+        active_stage_id="stage_00",
+        expected_landmarks=["doorway"],
+        trigger_reasons=["stage_entry"],
+    )
+
+    assert [hit.memory_id for hit in result.hits] == ["mem_000001", "fake-text"]
+    assert result.control_context["episode_store_query_status"] == "selected"
+    assert result.control_context["visual_memory_hit_count"] == 1
+    assert result.control_context["image_backed_recall"] is True
+    assert result.policy_context["memory_images"] == [str(image_path.resolve())]
+
+
+def test_fake_text_only_hit_does_not_count_as_visual_recall():
+    fake_text_hit = MemoryHit(
+        memory_id="fake-text",
+        memory_type="semantic",
+        name="doorway",
+        confidence=1.0,
+        evidence_text="text only",
+    )
+    manager = MemoryManager(
+        RecordingMemoryClient([fake_text_hit]),
+        HarnessConfig(staged_visual_memory_enabled=True),
+        episode_visual_store=EpisodeVisualMemoryStore(),
+    )
+
+    result = manager.recall("doorway", step_id=1, active_stage_id="stage_00")
+
+    assert result.control_context["visual_memory_hit_count"] == 0
+    assert result.control_context["image_backed_recall"] is False
 
 
 def test_memory_manager_splits_contexts():

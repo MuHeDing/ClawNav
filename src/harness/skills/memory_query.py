@@ -22,6 +22,10 @@ class MemoryQuerySkill(Skill):
             "critic_signal": {"type": "string"},
             "allowed_scopes": {"type": "array"},
             "memory_namespace": {"type": "string"},
+            "active_stage_id": {"type": "string"},
+            "expected_landmarks": {"type": "array"},
+            "trigger_reasons": {"type": "array"},
+            "use_episode_visual_store": {"type": "boolean"},
         },
     }
     output_schema = {
@@ -56,6 +60,10 @@ class MemoryQuerySkill(Skill):
             critic_signal=str(payload.get("critic_signal") or ""),
             allowed_scopes=payload.get("allowed_scopes"),
             memory_namespace=str(payload.get("memory_namespace") or ""),
+            active_stage_id=str(payload.get("active_stage_id") or ""),
+            expected_landmarks=payload.get("expected_landmarks") or [],
+            trigger_reasons=payload.get("trigger_reasons") or [],
+            use_episode_visual_store=payload.get("use_episode_visual_store"),
         )
         return SkillResult.ok_result(
             "memory_query",

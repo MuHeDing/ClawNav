@@ -1,6 +1,7 @@
 import pytest
 
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
+from harness.memory.episode_visual_store import EpisodeVisualMemoryStore
 from harness.openclaw.executor import HabitatOpenClawExecutor
 from harness.openclaw.gateway import FakeOpenClawGatewayClient, OpenClawGatewayError
 from harness.openclaw.planner import OpenClawPlanDecision, RuleOpenClawPlanner
@@ -898,6 +899,39 @@ def test_dynamic_visual_registry_tracks_promoted_keyframe_path_with_semantic_pro
     assert promoted["capture_route_stage"] == "intermediate_landmark"
     assert promoted["capture_current_target"] == "window"
     assert promoted["confirmed_landmarks"] == ["billiard table"]
+
+
+def test_dynamic_visual_registry_mirrors_into_shared_episode_store():
+    planner = RecordingPlanner(route_v2_decision())
+    episode_store = EpisodeVisualMemoryStore()
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+        staged_visual_memory_enabled=True,
+        episode_visual_store=episode_store,
+    )
+    state = make_pose_state(step_id=0, position=(0, 0, 0))
+    payload = {
+        "current_image_path": "/tmp/current-shared-store.png",
+        "active_stage_id": "stage_00",
+    }
+
+    runtime._record_visual_evidence_frame(state, payload)
+    runtime._promote_visual_semantic_evidence(state, payload, route_v2_decision())
+
+    assert episode_store.episode_key == "s1:e1"
+    assert len(episode_store.records) == 1
+    record = episode_store.records[0]
+    assert record.stage_id == "stage_00"
+    assert record.visual_summary.startswith("The billiard table")
+    assert "billiard table" in record.landmarks
+    assert "confirmed_landmark" in record.image_roles
+
+    runtime.reset_episode("s1", "e2")
+    assert episode_store.records == ()
 
 
 def test_signed_heading_delta_handles_wraparound():

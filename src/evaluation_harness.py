@@ -11,6 +11,7 @@ from harness.config import HarnessConfig
 from harness.controller import HarnessController
 from harness.env_adapters.habitat_vln_adapter import HabitatVLNAdapter
 from harness.logging.harness_logger import HarnessLogger
+from harness.memory.episode_visual_store import EpisodeVisualMemoryStore
 from harness.memory.memory_manager import MemoryManager
 from harness.memory.spatial_memory_client import (
     FakeSpatialMemoryClient,
@@ -360,7 +361,14 @@ def build_harness_components(
     if direct_policy and model is not None:
         raise ValueError("qwen_direct policy backend must not receive a Janus model")
     memory_client = build_memory_client(config)
-    memory_manager = MemoryManager(memory_client, config)
+    episode_visual_store = EpisodeVisualMemoryStore(
+        capacity=config.staged_visual_store_capacity
+    )
+    memory_manager = MemoryManager(
+        memory_client,
+        config,
+        episode_visual_store=episode_visual_store,
+    )
     task_memory = TaskMemory()
     working_memory = WorkingMemory(max_recent_frames=args.num_history)
     registry = SkillRegistry()
@@ -448,6 +456,8 @@ def build_harness_components(
             keyframe_coverage_gap_steps=config.keyframe_coverage_gap_steps,
             keyframe_debug_save_all_eligible=config.keyframe_debug_save_all_eligible,
             dynamic_visual_context_enabled=config.dynamic_visual_context_enabled,
+            staged_visual_memory_enabled=config.staged_visual_memory_enabled,
+            episode_visual_store=episode_visual_store,
         )
     logger = HarnessLogger(
         output_path / "harness_traces",
@@ -459,6 +469,7 @@ def build_harness_components(
         "memory_client": memory_client,
         "args": args,
         "memory_manager": memory_manager,
+        "episode_visual_store": episode_visual_store,
         "task_memory": task_memory,
         "working_memory": working_memory,
         "skill_registry": registry,

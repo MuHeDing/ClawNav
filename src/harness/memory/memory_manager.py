@@ -1,7 +1,10 @@
+from dataclasses import replace
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Set
 
 from harness.config import HarnessConfig
+from harness.memory.episode_visual_store import EpisodeVisualMemoryStore
 from harness.memory.spatial_memory_client import BaseSpatialMemoryClient
 from harness.types import MemoryHit, MemoryRecallResult
 
@@ -38,9 +41,11 @@ class MemoryManager:
         self,
         client: BaseSpatialMemoryClient,
         config: Optional[HarnessConfig] = None,
+        episode_visual_store: Optional[EpisodeVisualMemoryStore] = None,
     ) -> None:
         self.client = client
         self.config = config or HarnessConfig()
+        self.episode_visual_store = episode_visual_store
         self.last_recall_step: Optional[int] = None
 
     def should_recall(self, step_id: int, reason: str = "") -> bool:
@@ -65,6 +70,10 @@ class MemoryManager:
         critic_signal: str = "",
         allowed_scopes: Optional[List[str]] = None,
         memory_namespace: str = "",
+        active_stage_id: str = "",
+        expected_landmarks: Optional[List[str]] = None,
+        trigger_reasons: Optional[List[str]] = None,
+        use_episode_visual_store: Optional[bool] = None,
     ) -> MemoryRecallResult:
         query_text = self._build_query_text(
             text=text,
@@ -73,25 +82,53 @@ class MemoryManager:
             planner_reason=planner_reason,
             critic_signal=critic_signal,
         )
-        hits = self.client.query_semantic(
+        external_hits = self.client.query_semantic(
             query_text,
             n_results=n_results,
             allowed_scopes=allowed_scopes,
             memory_namespace=memory_namespace,
         )
-        hits = self._filter_hits(
-            hits,
+        external_hits = self._filter_hits(
+            external_hits,
             allowed_scopes=allowed_scopes,
             memory_namespace=memory_namespace,
         )
-        hits = self._rerank_hits(hits, query_text=query_text, step_id=step_id)
+        external_hits = self._rerank_hits(
+            external_hits, query_text=query_text, step_id=step_id
+        )
+        include_episode_store = (
+            self.config.staged_visual_memory_enabled
+            if use_episode_visual_store is None
+            else bool(use_episode_visual_store)
+        )
+        episode_query_status = "not_attempted"
+        episode_hits: List[MemoryHit] = []
+        if include_episode_store and self.episode_visual_store is not None:
+            episode_result = self.episode_visual_store.query_semantic(
+                query_text,
+                active_stage_id=active_stage_id,
+                expected_landmarks=expected_landmarks or [],
+                trigger_reasons=trigger_reasons or ([reason] if reason else []),
+                limit=min(n_results, self.config.staged_semantic_query_max_records),
+            )
+            episode_query_status = episode_result.status.value
+            episode_hits = episode_result.to_memory_hits()
+        hits = self._merge_hits(episode_hits, external_hits)
         self.mark_recalled(step_id)
+        visual_memory_hit_count = sum(1 for hit in hits if hit.image_path)
         return MemoryRecallResult(
             hits=hits,
             query=query_text,
             backend=self.config.memory_backend,
             policy_context=self._build_policy_context(hits),
-            control_context=self._build_control_context(hits, reason),
+            control_context=self._build_control_context(
+                hits,
+                reason,
+                episode_store_query_status=episode_query_status,
+                episode_hit_count=len(episode_hits),
+                external_hit_count=len(external_hits),
+                visual_memory_hit_count=visual_memory_hit_count,
+            ),
             executor_context=self._build_executor_context(hits),
         )
 
@@ -137,7 +174,16 @@ class MemoryManager:
             "memory_images": image_paths[: self.config.max_memory_images],
         }
 
-    def _build_control_context(self, hits: List[MemoryHit], reason: str) -> Dict[str, Any]:
+    def _build_control_context(
+        self,
+        hits: List[MemoryHit],
+        reason: str,
+        *,
+        episode_store_query_status: str = "not_attempted",
+        episode_hit_count: int = 0,
+        external_hit_count: int = 0,
+        visual_memory_hit_count: int = 0,
+    ) -> Dict[str, Any]:
         best_hit = hits[0] if hits else None
         return {
             "hits": hits,
@@ -146,7 +192,51 @@ class MemoryManager:
             "confidence": best_hit.confidence if best_hit else 0.0,
             "best_landmark": self._best_landmark(best_hit),
             "recall_confidence": best_hit.confidence if best_hit else 0.0,
+            "episode_store_query_status": episode_store_query_status,
+            "episode_hit_count": episode_hit_count,
+            "external_hit_count": external_hit_count,
+            "visual_memory_hit_count": visual_memory_hit_count,
+            "image_backed_recall": visual_memory_hit_count > 0,
         }
+
+    def _merge_hits(
+        self,
+        episode_hits: List[MemoryHit],
+        external_hits: List[MemoryHit],
+    ) -> List[MemoryHit]:
+        merged: List[MemoryHit] = []
+        path_to_index: Dict[str, int] = {}
+        for hit in [*episode_hits, *external_hits]:
+            canonical_path = self._canonical_hit_path(hit.image_path)
+            if canonical_path and canonical_path in path_to_index:
+                index = path_to_index[canonical_path]
+                existing = merged[index]
+                metadata = dict(existing.metadata or {})
+                incoming = dict(hit.metadata or {})
+                for key in ("image_roles", "provenance", "stage_ids"):
+                    values = list(metadata.get(key) or [])
+                    for value in incoming.get(key) or []:
+                        if value not in values:
+                            values.append(value)
+                    if values:
+                        metadata[key] = values
+                merged_ids = list(metadata.get("merged_memory_ids") or [])
+                for memory_id in (existing.memory_id, hit.memory_id):
+                    if memory_id and memory_id not in merged_ids:
+                        merged_ids.append(memory_id)
+                metadata["merged_memory_ids"] = merged_ids
+                merged[index] = replace(existing, metadata=metadata)
+                continue
+            if canonical_path:
+                path_to_index[canonical_path] = len(merged)
+            merged.append(hit)
+        return merged
+
+    @staticmethod
+    def _canonical_hit_path(image_path: Optional[str]) -> str:
+        if not isinstance(image_path, str) or not image_path:
+            return ""
+        return str(Path(image_path).expanduser().resolve(strict=False))
 
     def _build_executor_context(self, hits: List[MemoryHit]) -> Dict[str, Any]:
         target_poses = [hit.target_pose for hit in hits if hit.target_pose is not None]

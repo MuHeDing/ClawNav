@@ -140,6 +140,14 @@ def test_build_components_creates_openclaw_runtime_when_requested(tmp_path):
 
     assert components["openclaw_runtime"] is not None
     assert components["config"].harness_runtime == "openclaw_bridge"
+    assert (
+        components["memory_manager"].episode_visual_store
+        is components["episode_visual_store"]
+    )
+    assert (
+        components["openclaw_runtime"].episode_visual_store
+        is components["episode_visual_store"]
+    )
 
 
 def test_build_components_qwen_direct_leaves_navigation_policy_unregistered(tmp_path):

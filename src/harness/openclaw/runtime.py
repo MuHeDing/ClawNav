@@ -5,6 +5,7 @@ import shutil
 from typing import Any, Dict, List, Optional, Protocol
 
 from harness.memory.context_engine import MemoryAwareContextEngine
+from harness.memory.episode_visual_store import EpisodeVisualMemoryStore
 from harness.openclaw.control_gates import (
     QwenDirectControlGates,
     ROUTE_WAYPOINT_PASS_FORWARD_ACTIONS,
@@ -93,6 +94,8 @@ class OpenClawVLNRuntime:
         keyframe_coverage_gap_steps: int = 20,
         keyframe_debug_save_all_eligible: bool = False,
         dynamic_visual_context_enabled: bool = False,
+        staged_visual_memory_enabled: bool = False,
+        episode_visual_store: Optional[EpisodeVisualMemoryStore] = None,
     ) -> None:
         self.tool_adapter = OpenClawToolAdapter(tool_registry)
         self.planner = planner
@@ -114,10 +117,16 @@ class OpenClawVLNRuntime:
         self.qwen_direct_episode_state: Dict[str, Dict[str, Any]] = {}
         self.odometry_episode_state: Dict[str, Dict[str, Any]] = {}
         self.dynamic_visual_context_enabled = bool(dynamic_visual_context_enabled)
+        self.staged_visual_memory_enabled = bool(staged_visual_memory_enabled)
+        self.episode_visual_store = episode_visual_store
 
     def reset_episode(self, scene_id: str = "", episode_id: str = "") -> None:
         self.qwen_direct_episode_state.clear()
         self.odometry_episode_state.clear()
+        if self.episode_visual_store is not None:
+            self.episode_visual_store.reset_episode()
+            if scene_id or episode_id:
+                self.episode_visual_store.start_episode(scene_id, episode_id)
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -616,6 +625,12 @@ class OpenClawVLNRuntime:
             )
         ]
         records.append(promoted)
+        self._mirror_visual_record_to_episode_store(
+            state,
+            runtime_payload,
+            promoted,
+            provenance="runtime:keyframe_promotion",
+        )
         self._evict_visual_evidence_records(episode_state)
 
     def _qwen_direct_should_requery_gate(
@@ -1694,7 +1709,7 @@ class OpenClawVLNRuntime:
         runtime_payload["control_context"] = control_context
 
     def _dynamic_visual_context_active(self, runtime_payload: Dict[str, Any]) -> bool:
-        return self.dynamic_visual_context_enabled or (
+        return self.staged_visual_memory_enabled or self.dynamic_visual_context_enabled or (
             runtime_payload.get("dynamic_visual_context_enabled") is True
         )
 
@@ -1706,6 +1721,17 @@ class OpenClawVLNRuntime:
         image_path = str(runtime_payload.get("current_image_path") or "")
         if not image_path:
             return
+        if (
+            self.staged_visual_memory_enabled
+            and self.episode_visual_store is not None
+            and state.last_action
+            and state.step_id > 0
+        ):
+            self.episode_visual_store.start_episode(state.scene_id, state.episode_id)
+            self.episode_visual_store.record_action_after_capture(
+                state.step_id - 1,
+                str(state.last_action),
+            )
         episode_state = self._qwen_direct_state_for_episode(state)
         records = episode_state.setdefault("visual_evidence_registry", [])
         if not isinstance(records, list):
@@ -1748,6 +1774,12 @@ class OpenClawVLNRuntime:
             )
         ]
         records.append(record)
+        self._mirror_visual_record_to_episode_store(
+            state,
+            runtime_payload,
+            record,
+            provenance="runtime:current_rgb",
+        )
         self._record_turn_loop_pose_sample(episode_state, state)
         self._update_visual_recovery_state(episode_state, records, runtime_payload)
         self._evict_visual_evidence_records(episode_state)
@@ -2111,7 +2143,65 @@ class OpenClawVLNRuntime:
             if not current_record.get("confirmation_basis"):
                 current_record["confirmation_basis"] = "schema_valid_target_candidate"
         current_record["roles"] = sorted(roles)
+        self._mirror_visual_record_to_episode_store(
+            state,
+            runtime_payload,
+            current_record,
+            visual_summary=visual_summary,
+            landmarks=positive_landmarks,
+            provenance="runtime:qwen_semantic_promotion",
+        )
         self._evict_visual_evidence_records(episode_state)
+
+    def _mirror_visual_record_to_episode_store(
+        self,
+        state: VLNState,
+        runtime_payload: Dict[str, Any],
+        record: Dict[str, Any],
+        *,
+        visual_summary: str = "",
+        landmarks: Optional[List[str]] = None,
+        provenance: str,
+    ) -> None:
+        if not self.staged_visual_memory_enabled or self.episode_visual_store is None:
+            return
+        self.episode_visual_store.start_episode(state.scene_id, state.episode_id)
+        local_control = runtime_payload.get("local_control_context")
+        odometry = (
+            local_control.get("odometry")
+            if isinstance(local_control, dict)
+            and isinstance(local_control.get("odometry"), dict)
+            else {}
+        )
+        active_stage_id = str(runtime_payload.get("active_stage_id") or "")
+        stage_state = runtime_payload.get("stage_state")
+        if not active_stage_id and isinstance(stage_state, dict):
+            active_stage_id = str(stage_state.get("active_stage_id") or "")
+        record_roles = [
+            str(role)
+            for role in record.get("roles") or []
+            if isinstance(role, str) and role
+        ]
+        if record.get("keyframe") and "keyframe" not in record_roles:
+            record_roles.append("keyframe")
+        if str(record.get("image_path") or "") == str(
+            runtime_payload.get("current_image_path") or ""
+        ) and "current" not in record_roles:
+            record_roles.append("current")
+        self.episode_visual_store.add_observation(
+            image_path=str(record.get("image_path") or ""),
+            step_id=int(record.get("step_id", state.step_id)),
+            stage_id=active_stage_id,
+            visual_summary=visual_summary,
+            landmarks=landmarks or record.get("confirmed_landmarks") or [],
+            action_before_capture=str(
+                record.get("previous_executed_action") or state.last_action or ""
+            ),
+            odometry_snapshot=odometry,
+            image_roles=record_roles,
+            provenance=[provenance],
+            importance=1.0 if "confirmed_landmark" in record_roles else 0.5,
+        )
 
     @staticmethod
     def _replace_latest_semantic_role(
