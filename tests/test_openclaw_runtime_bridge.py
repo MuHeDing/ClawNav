@@ -816,6 +816,47 @@ def test_dynamic_visual_turn_loop_recovery_collects_scans_and_clears_after_forwa
     assert "turn_loop_feedback" not in cleared_payload
 
 
+def test_turn_loop_recovery_promotes_existing_forward_stall_recovery():
+    planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
+    runtime = OpenClawVLNRuntime(
+        tool_registry=SkillRegistry(),
+        planner=planner,
+        executor=HabitatOpenClawExecutor(HabitatVLNAdapter()),
+        policy_backend="qwen_direct",
+        dynamic_visual_context_enabled=True,
+    )
+    actions = [
+        "MOVE_FORWARD",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+        "TURN_RIGHT",
+        "TURN_LEFT",
+    ]
+
+    for step_id in range(len(actions) + 1):
+        runtime.step(
+            make_pose_state(
+                step_id=step_id,
+                position=(0.0, 0.0, 0.0),
+                last_action=actions[step_id - 1] if step_id else None,
+            ),
+            payload={
+                "current_image_path": f"/tmp/stall-turn-loop-{step_id}.png",
+                "recent_actions": actions[:step_id],
+                "motion_feedback_enabled": True,
+                "forward_stall_odometry_enabled": True,
+            },
+        )
+
+    recovery_payload = planner.payloads[-1]
+    assert recovery_payload["turn_loop_recovery_active"] is True
+    assert recovery_payload["visual_recovery_reason"] == "turn_loop"
+    assert recovery_payload["turn_loop_feedback"]["turn_count"] >= 6
+
+
 def test_turn_loop_recovery_does_not_force_missing_directional_scans():
     planner = RecordingPlanner(route_v2_decision(action_text="TURN_LEFT"))
     runtime = OpenClawVLNRuntime(
@@ -2859,6 +2900,21 @@ def test_staged_runtime_segments_once_and_exposes_controller_stage_context():
     assert first["trigger_reasons"] == ["stage_entry"]
 
 
+def test_staged_runtime_audit_exposes_effective_episode_step_limit():
+    planner = StagedRecordingPlanner(route_v3_decision(), stages=_two_stage_manifest())
+    runtime = _staged_runtime(planner)
+
+    result = runtime.step(
+        make_state(step_id=0),
+        {"current_image_path": "/tmp/0.png", "evaluation_max_steps": 400},
+    )
+
+    assert result.runtime_metadata["evaluation_max_steps"] == 400
+    assert result.runtime_metadata["staged_visual_memory"][
+        "evaluation_max_steps"
+    ] == 400
+
+
 def test_staged_runtime_installs_single_stage_fallback_on_segmentation_error():
     class SegmentationFailurePlanner(StagedRecordingPlanner):
         def segment_instruction(self, scene_id, episode_id, instruction):
@@ -2953,6 +3009,165 @@ def test_staged_runtime_controller_advances_once_and_emits_next_entry_edge():
     assert stage_state.completed_stage_ids == ["stage_00"]
     assert len(stage_state.transition_audit) == 1
     assert third.ok is True
+
+
+def test_staged_runtime_grounds_traverse_cue_from_structured_progress_state():
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            visual_summary="The current view shows the next doorway ahead.",
+            progress_state="Reached the end of hallway and ready for the next stage.",
+        ),
+        stages=_two_stage_manifest(),
+    )
+    runtime = _staged_runtime(planner, stage_min_translation_m=0.25)
+
+    runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+    result = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/1.png"},
+    )
+
+    assert result.runtime_metadata["stage_transition"]["decision"] == "accepted"
+    assert result.runtime_metadata["stage_transition"]["rule_ids"] == [
+        "traverse_cue_and_progress_confirmed"
+    ]
+    assert runtime.staged_episode_state["s1::e1"][
+        "stage_state"
+    ].active_stage_index == 1
+
+
+@pytest.mark.parametrize(
+    ("completion_cue", "progress_state"),
+    [
+        ("past living room", "Traversing the area past the living room."),
+        ("crossed floor", "Walking across the floor toward the archway."),
+        ("through entry way", "Traversed the entry way and turned right."),
+    ],
+)
+def test_staged_runtime_canonicalizes_online_completion_cue_paraphrases(
+    completion_cue,
+    progress_state,
+):
+    stages = _two_stage_manifest()
+    stages[0]["completion_cues"] = [completion_cue]
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            visual_summary="The next doorway is visible.",
+            progress_state=progress_state,
+        ),
+        stages=stages,
+    )
+    runtime = _staged_runtime(planner, stage_min_translation_m=0.25)
+
+    runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+    result = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/1.png"},
+    )
+
+    assert result.runtime_metadata["stage_transition"]["decision"] == "accepted"
+    assert result.runtime_metadata["stage_transition"][
+        "grounded_completion_cues"
+    ] == [completion_cue]
+
+
+def test_staged_runtime_does_not_ground_negated_completion_cue():
+    stages = _two_stage_manifest()
+    stages[0]["completion_cues"] = ["past living room"]
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            progress_state="Not yet past the living room.",
+        ),
+        stages=stages,
+    )
+    runtime = _staged_runtime(planner, stage_min_translation_m=0.25)
+
+    runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+    result = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/1.png"},
+    )
+
+    assert result.runtime_metadata["stage_transition"]["decision"] == (
+        "needs_verification"
+    )
+    assert result.runtime_metadata["stage_transition"][
+        "grounded_completion_cues"
+    ] == []
+
+
+def test_staged_runtime_ignores_unrelated_negation_before_grounded_cue():
+    stages = _two_stage_manifest()
+    stages[0]["completion_cues"] = ["past living room"]
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=True,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            progress_state=(
+                "The doorway is not blocked. Now past the living room."
+            ),
+        ),
+        stages=stages,
+    )
+    runtime = _staged_runtime(planner, stage_min_translation_m=0.25)
+
+    runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+    result = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/1.png"},
+    )
+
+    assert result.runtime_metadata["stage_transition"]["decision"] == "accepted"
+
+
+def test_staged_runtime_controller_recovers_false_traverse_candidate_from_grounded_cue():
+    stages = _two_stage_manifest()
+    stages[0]["completion_cues"] = ["past living room"]
+    planner = StagedRecordingPlanner(
+        route_v3_decision(
+            stage_complete_candidate=False,
+            stage_relation="past",
+            stage_evidence_refs=["current"],
+            progress_state="Now past the living room and approaching the doorway.",
+        ),
+        stages=stages,
+    )
+    runtime = _staged_runtime(planner, stage_min_translation_m=0.25)
+
+    runtime.step(
+        make_pose_state(0, [0.0, 0.0, 0.0]),
+        {"current_image_path": "/tmp/0.png"},
+    )
+    result = runtime.step(
+        make_pose_state(1, [0.5, 0.0, 0.0], last_action="MOVE_FORWARD"),
+        {"current_image_path": "/tmp/1.png"},
+    )
+
+    transition = result.runtime_metadata["stage_transition"]
+    assert transition["decision"] == "accepted"
+    assert transition["completion_candidate_source"] == "controller_grounded_cue"
 
 
 def test_staged_runtime_reset_clears_controller_state_and_resegments():

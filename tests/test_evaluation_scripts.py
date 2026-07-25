@@ -88,6 +88,30 @@ def test_run_qwen_preserves_caller_max_steps_override():
     assert 'MAX_STEPS="${MAX_STEPS:-200}"' in contents
 
 
+def test_run_qwen_preserves_caller_cuda_visible_devices_override():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_qwen.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert 'CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"' in contents
+
+
+def test_run_qwen2_output_name_matches_effective_episode_step_limit():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "run_qwen2.sh"
+    contents = script.read_text(encoding="utf-8")
+
+    assert "MAX_STEPS=400" in contents
+    assert "qwen_staged_5ep_400step_" in contents
+    assert "qwen_staged_5ep_12step_" not in contents
+    assert "OPENCLAW_CONTROLLER_DISTANCE_EARLY_STOP_M=0" in contents
+    assert "export OPENCLAW_QWEN_THINKING_MODE=on" in contents
+    assert "export OPENCLAW_QWEN_THINKING_INTERVAL_STEPS=10" in contents
+    assert 'export OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18151}"' in contents
+    assert "export OPENCLAW_KILL_EXISTING_GATEWAY=1" in contents
+    assert "exec bash scripts/run_qwen.sh" in contents
+
+
 def test_400_val_unseen_launcher_runs_directly_without_screen_management():
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "scripts" / "run_memory_guided_fast_400_val_unseen_screen.sh"
@@ -204,6 +228,10 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
         "OPENCLAW_QWEN_THINKING_MODE=${OPENCLAW_QWEN_THINKING_MODE:-auto}" in contents
     )
     assert (
+        "OPENCLAW_QWEN_THINKING_INTERVAL_STEPS=${OPENCLAW_QWEN_THINKING_INTERVAL_STEPS:-1}"
+        in contents
+    )
+    assert (
         "OPENCLAW_QWEN_OUTPUT_SCHEMA=${OPENCLAW_QWEN_OUTPUT_SCHEMA:-legacy}" in contents
     )
     assert (
@@ -211,6 +239,7 @@ def test_openclaw_cli_plan_gateway_start_script_uses_adapter_module():
     )
     assert "--dynamic_visual_context_enabled" in contents
     assert "--qwen_thinking_mode" in contents
+    assert "--qwen_thinking_interval_steps" in contents
     assert "--qwen_output_schema" in contents
     assert "--qwen_transport_mode" in contents
 
@@ -240,6 +269,10 @@ def test_run_qwen_starts_gateway_in_qwen_direct_mode():
     )
     assert (
         'OPENCLAW_QWEN_THINKING_MODE="${OPENCLAW_QWEN_THINKING_MODE:-auto}" \\'
+        in gateway_start_block
+    )
+    assert (
+        'OPENCLAW_QWEN_THINKING_INTERVAL_STEPS="${OPENCLAW_QWEN_THINKING_INTERVAL_STEPS:-1}" \\'
         in gateway_start_block
     )
     assert (

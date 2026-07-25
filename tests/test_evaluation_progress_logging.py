@@ -3,7 +3,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evaluation_debug_utils import apply_episode_validity, format_episode_progress_line
+from evaluation_debug_utils import (
+    apply_episode_validity,
+    format_episode_progress_line,
+    should_force_stop_for_episode_limit,
+)
 
 
 def test_format_episode_progress_line_includes_episode_position():
@@ -66,3 +70,17 @@ def test_apply_episode_validity_zeroes_navigation_success_for_policy_abort():
         "oracle_success": 0.0,
         "distance_to_goal": 0.2,
     }
+
+
+def test_episode_step_limit_reserves_final_step_for_controller_stop():
+    assert should_force_stop_for_episode_limit(step_id=10, max_steps=12) is False
+    assert should_force_stop_for_episode_limit(step_id=11, max_steps=12) is True
+
+
+def test_episode_step_limit_rejects_non_positive_limit():
+    try:
+        should_force_stop_for_episode_limit(step_id=0, max_steps=0)
+    except ValueError as exc:
+        assert "max_steps" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")

@@ -58,6 +58,7 @@ from evaluation_debug_utils import (
     resolve_sanitized_vln_dataset_path,
     resolve_step_image_output_path,
     resolve_step_map_output_path,
+    should_force_stop_for_episode_limit,
     should_save_step_artifacts,
 )
 from habitat_extensions import maps as habitat_extension_maps
@@ -740,6 +741,10 @@ class VLNEvaluator:
                         indices = np.linspace(0, history_len, self.num_history + 1, dtype=int)
                         images = [rgb_list[i] for i in indices]
 
+                    force_step_limit_stop = should_force_stop_for_episode_limit(
+                        step_id=step_id,
+                        max_steps=self.args.max_steps,
+                    )
                     if hasattr(self.model, "observe_environment_state"):
                         self.model.observe_environment_state(
                             env=env,
@@ -748,25 +753,42 @@ class VLNEvaluator:
                             metrics=info,
                             step_id=step_id,
                         )
-                    action = self.model.call_model(images, episode_instruction, step_id)[0]
-                    self._log_visual_prune_profile(
-                        scene_id=scene_id,
-                        episode_id=episode_id,
-                        step_id=step_id,
-                        episode_instruction=episode_instruction,
-                        profile=self.model.consume_last_visual_prune_profile(),
-                    )
-                    if (
-                        getattr(self.args, "use_llm_adaptive_sparse_attention", False)
-                        and self.args.adaptive_sparse_log_interval > 0
-                        and step_id % self.args.adaptive_sparse_log_interval == 0
-                    ):
-                        self._log_adaptive_sparse_summary(
+                    if force_step_limit_stop:
+                        if hasattr(self.model, "force_stop_for_episode_limit"):
+                            action = self.model.force_stop_for_episode_limit(
+                                images,
+                                episode_instruction,
+                                step_id,
+                            )[0]
+                        else:
+                            action = "STOP"
+                        action_text = "STOP"
+                    else:
+                        action = self.model.call_model(
+                            images, episode_instruction, step_id
+                        )[0]
+                        self._log_visual_prune_profile(
                             scene_id=scene_id,
                             episode_id=episode_id,
                             step_id=step_id,
+                            episode_instruction=episode_instruction,
+                            profile=self.model.consume_last_visual_prune_profile(),
                         )
-                    action_text = action
+                        if (
+                            getattr(
+                                self.args,
+                                "use_llm_adaptive_sparse_attention",
+                                False,
+                            )
+                            and self.args.adaptive_sparse_log_interval > 0
+                            and step_id % self.args.adaptive_sparse_log_interval == 0
+                        ):
+                            self._log_adaptive_sparse_summary(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                step_id=step_id,
+                            )
+                        action_text = action
                     
                     if action not in self.actions2idx:
                         action = self._normalize_action(action)
@@ -784,10 +806,6 @@ class VLNEvaluator:
                     else:
                         action = 0
 
-
-                    if step_id >= self.args.max_steps:
-                        action = 0
-                        action_text = "STOP"
 
                     observations = env.step(action)
                     step_metrics = env.get_metrics()

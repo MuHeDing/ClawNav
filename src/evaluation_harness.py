@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 from pathlib import Path
@@ -179,6 +180,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--forward_stall_odometry_enabled",
         action="store_true",
         default=env_bool("OPENCLAW_FORWARD_STALL_ODOMETRY_ENABLED", False),
+    )
+    parser.add_argument(
+        "--controller_distance_early_stop_m",
+        type=float,
+        default=float(
+            os.environ.get("OPENCLAW_CONTROLLER_DISTANCE_EARLY_STOP_M", "0")
+        ),
+        help=(
+            "Controller-owned Habitat distance early-stop threshold in meters; "
+            "0 disables this oracle-assisted mode."
+        ),
     )
     parser.add_argument(
         "--map_collision_overlay_enabled",
@@ -664,6 +676,49 @@ class HarnessModelProxy:
         self._log_step(state, result, action_text)
         return [action_text]
 
+    def force_stop_for_episode_limit(self, images, task, step_id):
+        current_image = images[-1] if images else None
+        self._record_video_frame(current_image)
+        state = self._build_proxy_state(task, step_id, current_image)
+        payload = self._runtime_payload(images, step_id)
+        max_steps = int(payload.get("evaluation_max_steps") or 0)
+        current_image_path = str(payload.get("current_image_path") or "")
+        reason = f"episode reached configured max_steps={max_steps}"
+        metadata = {
+            "runtime_mode": "openclaw_bridge",
+            "planner_backend": "controller",
+            "planned_intent": "act",
+            "planned_tool": "ControllerEpisodeStepLimit",
+            "planner_reason": reason,
+            "runtime_executor": "openclaw_habitat",
+            "policy_backend": getattr(
+                self.components.get("args"),
+                "policy_backend",
+                JANUS_POLICY_BACKEND,
+            ),
+            "qwen_model_called": False,
+            "final_action": "STOP",
+            "final_action_source": "controller_episode_step_limit",
+            "evaluation_max_steps": max_steps,
+            "image_paths_used": [current_image_path] if current_image_path else [],
+            "oracle_fields_used": False,
+        }
+        self.last_action_text = "STOP"
+        self._append_working_memory(images, "STOP")
+        self.components["logger"].log_step(
+            state,
+            intent="act",
+            skill="ControllerEpisodeStepLimit",
+            reason=reason,
+            memory_backend=self.components["config"].memory_backend,
+            memory_source=self.components["config"].memory_source,
+            action_text="STOP",
+            fallback=False,
+            decision_inputs={},
+            runtime=metadata,
+        )
+        return ["STOP"]
+
     def _runtime_payload(self, images, step_id: int) -> Dict[str, Any]:
         current_image = images[-1] if images else None
         payload = {
@@ -1138,12 +1193,20 @@ class QwenDirectPolicyProxy:
     _build_proxy_state = HarnessModelProxy._build_proxy_state
     _proxy_safe_diagnostics = HarnessModelProxy._proxy_safe_diagnostics
     _append_working_memory = HarnessModelProxy._append_working_memory
+    force_stop_for_episode_limit = HarnessModelProxy.force_stop_for_episode_limit
     _latest_runtime = HarnessModelProxy._latest_runtime
 
     def call_model(self, images, task, step_id):
         current_image = images[-1] if images else None
         self._record_video_frame(current_image)
         state = self._build_proxy_state(task, step_id, current_image)
+        distance_stop_action = self._controller_distance_early_stop(
+            state,
+            images,
+            step_id,
+        )
+        if distance_stop_action is not None:
+            return distance_stop_action
         runtime_result = self.components["openclaw_runtime"].step(
             state,
             self._runtime_payload(images, step_id),
@@ -1162,6 +1225,64 @@ class QwenDirectPolicyProxy:
         self._append_working_memory(images, action_text)
         self._log_runtime_step(state, runtime_result, action_text)
         return [action_text]
+
+    def _controller_distance_early_stop(self, state, images, step_id):
+        threshold = float(
+            getattr(
+                self.components.get("args"),
+                "controller_distance_early_stop_m",
+                0.0,
+            )
+            or 0.0
+        )
+        raw_distance = (state.diagnostics or {}).get("distance_to_goal")
+        try:
+            distance = float(raw_distance)
+        except (TypeError, ValueError):
+            return None
+        if threshold <= 0 or not math.isfinite(distance) or distance > threshold:
+            return None
+
+        payload = self._runtime_payload(images, step_id)
+        current_image_path = str(payload.get("current_image_path") or "")
+        metadata = {
+            "runtime_mode": "openclaw_bridge",
+            "planner_backend": "controller",
+            "planned_intent": "act",
+            "planned_tool": "ControllerDistanceEarlyStop",
+            "planner_reason": (
+                f"distance_to_goal={distance:.3f}m is within "
+                f"the configured {threshold:.3f}m threshold"
+            ),
+            "runtime_executor": "openclaw_habitat",
+            "policy_backend": QWEN_DIRECT_POLICY_BACKEND,
+            "direct_policy": True,
+            "janus_loaded": False,
+            "qwen_model_called": False,
+            "final_action": "STOP",
+            "final_action_source": "controller_distance_early_stop",
+            "distance_early_stop_enabled": True,
+            "distance_early_stop_threshold_m": threshold,
+            "distance_early_stop_observed_m": distance,
+            "evaluation_max_steps": payload.get("evaluation_max_steps"),
+            "image_paths_used": [current_image_path] if current_image_path else [],
+            "oracle_fields_used": True,
+        }
+        self.last_action_text = "STOP"
+        self._append_working_memory(images, "STOP")
+        self.components["logger"].log_step(
+            state,
+            intent="act",
+            skill="ControllerDistanceEarlyStop",
+            reason=metadata["planner_reason"],
+            memory_backend=self.components["config"].memory_backend,
+            memory_source=self.components["config"].memory_source,
+            action_text="STOP",
+            fallback=False,
+            decision_inputs={"distance_to_goal": distance},
+            runtime=metadata,
+        )
+        return ["STOP"]
 
     def consume_last_visual_prune_profile(self):
         return None

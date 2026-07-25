@@ -97,6 +97,7 @@ def make_args(tmp_path, **overrides):
         "map_frame_interval_steps": 5,
         "motion_feedback_enabled": False,
         "forward_stall_odometry_enabled": False,
+        "controller_distance_early_stop_m": 0.0,
         "map_collision_overlay_enabled": False,
         "dynamic_visual_context_enabled": False,
         "harness_runtime": "openclaw_bridge",
@@ -119,6 +120,82 @@ def make_args(tmp_path, **overrides):
     }
     data.update(overrides)
     return SimpleNamespace(**data)
+
+
+def test_qwen_direct_controller_distance_stop_bypasses_provider_and_is_audited(
+    tmp_path,
+):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+            controller_distance_early_stop_m=3.0,
+        ),
+        model=None,
+    )
+    runtime = FakeDirectRuntime()
+    components["openclaw_runtime"] = runtime
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    proxy._pending_env_state = SimpleNamespace(
+        step_id=7,
+        online_metrics={},
+        diagnostics={"distance_to_goal": 2.5},
+        pose=None,
+        diagnostic_pose=None,
+    )
+
+    action = proxy.call_model([SaveableFrame("current")], "go to target", 7)
+
+    assert action == ["STOP"]
+    assert runtime.calls == []
+    trace_path = tmp_path / "harness_traces" / "harness_trace_rank0.jsonl"
+    trace = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["final_action_source"] == "controller_distance_early_stop"
+    assert trace["distance_early_stop_threshold_m"] == 3.0
+    assert trace["distance_early_stop_observed_m"] == 2.5
+    assert trace["oracle_metrics_used_for_decision"] is True
+    assert trace["oracle_guard_passed"] is False
+
+
+def test_qwen_direct_episode_limit_stop_bypasses_provider_and_is_audited(tmp_path):
+    components = build_harness_components(
+        make_args(
+            tmp_path,
+            policy_backend="qwen_direct",
+            openclaw_planner_backend="gateway",
+            openclaw_gateway_url="http://127.0.0.1:8011",
+            max_steps=12,
+        ),
+        model=None,
+    )
+    runtime = FakeDirectRuntime()
+    components["openclaw_runtime"] = runtime
+    proxy = QwenDirectPolicyProxy(components)
+    proxy.start_episode("scene-a", "episode-1")
+    proxy._pending_env_state = SimpleNamespace(
+        step_id=11,
+        online_metrics={},
+        diagnostics={"distance_to_goal": 8.0},
+        pose=None,
+        diagnostic_pose=None,
+    )
+
+    action = proxy.force_stop_for_episode_limit(
+        [SaveableFrame("current")],
+        "go to target",
+        11,
+    )
+
+    assert action == ["STOP"]
+    assert runtime.calls == []
+    trace_path = tmp_path / "harness_traces" / "harness_trace_rank0.jsonl"
+    trace = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert trace["final_action_source"] == "controller_episode_step_limit"
+    assert trace["evaluation_max_steps"] == 12
+    assert trace["oracle_metrics_used_for_decision"] is False
 
 
 def test_harness_config_defaults_dynamic_visual_context_off(tmp_path):

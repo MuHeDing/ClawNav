@@ -114,6 +114,7 @@ EVAL_SPLIT=${EVAL_SPLIT:-val_unseen}
 DATA_PATH=${DATA_PATH:-}
 HARNESS_DEBUG_MAX_EPISODES=${HARNESS_DEBUG_MAX_EPISODES:-30}
 MAX_STEPS=${MAX_STEPS:-400}
+OPENCLAW_CONTROLLER_DISTANCE_EARLY_STOP_M=${OPENCLAW_CONTROLLER_DISTANCE_EARLY_STOP_M:-0}
 if [[ ! "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MAX_STEPS must be a positive integer; got '${MAX_STEPS}'" >&2
   exit 2
@@ -123,6 +124,7 @@ REQUIRE_GATEWAY=${REQUIRE_GATEWAY:-0}
 REQUIRE_OPENCLAW_CLI_ADAPTER=${REQUIRE_OPENCLAW_CLI_ADAPTER:-1}
 
 extra_args=()
+extra_args+=(--controller_distance_early_stop_m "${OPENCLAW_CONTROLLER_DISTANCE_EARLY_STOP_M}")
 if [[ -n "${DATA_PATH}" ]]; then
   extra_args+=(--data_path "${DATA_PATH}")
 fi
@@ -204,6 +206,7 @@ echo "Max episodes: ${HARNESS_DEBUG_MAX_EPISODES:-all}"
 echo "Use default episode keys: ${HARNESS_USE_DEFAULT_EPISODE_KEYS}"
 echo "Episode keys: ${HARNESS_EPISODE_KEYS:-all}"
 echo "Max steps per episode: ${MAX_STEPS}"
+echo "Controller distance early stop (m, 0=off): ${OPENCLAW_CONTROLLER_DISTANCE_EARLY_STOP_M}"
 echo "Output path: ${OUTPUT_PATH}"
 echo "Policy backend: ${POLICY_BACKEND}"
 echo "CUDA visible devices: ${CUDA_VISIBLE_DEVICES}"

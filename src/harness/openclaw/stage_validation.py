@@ -25,6 +25,7 @@ class StageTransitionDecision(str, Enum):
 @dataclass(frozen=True)
 class StageTransitionEvidence:
     stage_complete_candidate: bool
+    completion_candidate_source: str = "model"
     relation: StageRelation = StageRelation.UNKNOWN
     evidence_refs: Tuple[str, ...] = ()
     attachment_manifest: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)

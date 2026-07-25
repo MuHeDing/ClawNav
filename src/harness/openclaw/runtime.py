@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import shutil
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -81,6 +82,46 @@ TURN_LOOP_MIN_TURNS = 6
 TURN_LOOP_SAME_DIRECTION_TURNS = 8
 TURN_LOOP_MAX_FORWARD_ACTIONS = 1
 TURN_LOOP_MAX_TRANSLATION_SPAN_M = 0.35
+
+SEMANTIC_CUE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "the",
+    "area",
+    "agent",
+    "currently",
+    "is",
+    "was",
+    "walking",
+    "moving",
+    "toward",
+    "towards",
+    "to",
+    "after",
+    "then",
+    "ready",
+    "for",
+}
+SEMANTIC_CUE_ALIASES = {
+    "past": "pass",
+    "passed": "pass",
+    "passing": "pass",
+    "across": "cross",
+    "crossed": "cross",
+    "crossing": "cross",
+    "through": "traverse",
+    "traversed": "traverse",
+    "traversing": "traverse",
+    "exited": "exit",
+    "exiting": "exit",
+    "outside": "exit",
+    "entered": "enter",
+    "entering": "enter",
+    "inside": "enter",
+}
+SEMANTIC_CUE_NEGATIONS = {"not", "never", "without"}
+SEMANTIC_CUE_COMPLETION_TOKENS = {"pass", "cross", "traverse", "exit", "enter"}
 
 
 @dataclass
@@ -325,6 +366,8 @@ class OpenClawVLNRuntime:
             "decision": result.decision.value,
             "rule_ids": list(result.rule_ids),
             "evidence_refs": list(result.evidence_refs),
+            "grounded_completion_cues": list(evidence.grounded_completion_cues),
+            "completion_candidate_source": evidence.completion_candidate_source,
             "active_stage_id": previous_stage_id,
             "next_stage_id": stage_state.active_stage.stage_id,
             "advanced": advanced,
@@ -353,6 +396,10 @@ class OpenClawVLNRuntime:
         )
         manifest = self._stage_attachment_manifest(runtime_payload, stage.stage_id)
         summary = self._normalize_semantic_text(arguments.get("visual_summary"), 1000)
+        progress = self._normalize_semantic_text(arguments.get("progress_state"), 1000)
+        completion_evidence_text = " ".join(
+            value for value in (summary, progress) if value
+        )
         confirmed = arguments.get("confirmed_landmarks")
         confirmed_text = (
             {
@@ -372,7 +419,22 @@ class OpenClawVLNRuntime:
         grounded_cues = tuple(
             cue
             for cue in stage.completion_cues
-            if self._normalize_semantic_text(cue, 96) in summary
+            if self._semantic_cue_matches(cue, completion_evidence_text)
+        )
+        model_complete_candidate = arguments.get("stage_complete_candidate") is True
+        controller_grounded_candidate = bool(
+            stage.transition_type is TransitionType.TRAVERSE
+            and grounded_cues
+            and "current" in evidence_refs
+        )
+        completion_candidate_source = (
+            "model"
+            if model_complete_candidate
+            else (
+                "controller_grounded_cue"
+                if controller_grounded_candidate
+                else "none"
+            )
         )
         current_grounded = bool(grounded_landmarks and "current" in evidence_refs)
         current_pose = self._pose_from_state(state)
@@ -389,7 +451,10 @@ class OpenClawVLNRuntime:
             getattr(gate_result, "final_action", "")
         ) == "STOP" and not gate_metadata.get("stop_gate_block_reason")
         return StageTransitionEvidence(
-            stage_complete_candidate=arguments.get("stage_complete_candidate") is True,
+            stage_complete_candidate=(
+                model_complete_candidate or controller_grounded_candidate
+            ),
+            completion_candidate_source=completion_candidate_source,
             relation=relation,
             evidence_refs=evidence_refs,
             attachment_manifest=manifest,
@@ -775,6 +840,7 @@ class OpenClawVLNRuntime:
             "instruction_sha256": stage_context.get("instruction_sha256", ""),
             "stage_plan_sha256": stage_context.get("stage_plan_sha256", ""),
             "provider_config_sha256": provider_config_sha256,
+            "evaluation_max_steps": runtime_payload.get("evaluation_max_steps"),
             "provider_thinking": thinking,
             "active_stage_id": transition.get("active_stage_id")
             or stage_context.get("active_stage_id", ""),
@@ -1094,6 +1160,9 @@ class OpenClawVLNRuntime:
                 staged_memory_event,
                 stage_transition,
                 gate_result.final_action,
+            )
+            metadata["evaluation_max_steps"] = runtime_payload.get(
+                "evaluation_max_steps"
             )
             metadata["policy_backend"] = QWEN_DIRECT_POLICY_BACKEND
             metadata["direct_policy"] = True
@@ -2591,7 +2660,20 @@ class OpenClawVLNRuntime:
         if previous_action == "MOVE_FORWARD" and had_progress is True:
             episode_state.pop("visual_recovery", None)
             return
-        if isinstance(episode_state.get("visual_recovery"), dict):
+        existing_recovery = episode_state.get("visual_recovery")
+        if isinstance(existing_recovery, dict):
+            detection = self._turn_loop_detection(episode_state, runtime_payload)
+            if detection and existing_recovery.get("reason") != "turn_loop":
+                episode_state["visual_recovery"] = {
+                    "stuck_before_path": str(
+                        existing_recovery.get("stuck_before_path") or ""
+                    ),
+                    "center_path": str(current.get("image_path") or ""),
+                    "anchor_heading_deg": current.get("heading_deg"),
+                    "anchor_step_id": current.get("step_id"),
+                    "reason": "turn_loop",
+                    **detection,
+                }
             return
         if previous_action == "MOVE_FORWARD" and had_progress is False:
             if not isinstance(episode_state.get("visual_recovery"), dict):
@@ -3044,6 +3126,44 @@ class OpenClawVLNRuntime:
     @staticmethod
     def _normalize_semantic_text(value: Any, limit: int) -> str:
         return " ".join(str(value or "").strip().lower().split())[:limit]
+
+    @classmethod
+    def _semantic_cue_tokens(cls, value: Any) -> List[str]:
+        normalized = cls._normalize_semantic_text(value, 1000).replace(
+            "entryway", "entry way"
+        )
+        tokens = re.findall(r"[a-z0-9]+", normalized)
+        return [
+            SEMANTIC_CUE_ALIASES.get(token, token)
+            for token in tokens
+            if token not in SEMANTIC_CUE_STOPWORDS
+        ]
+
+    @classmethod
+    def _semantic_cue_matches(cls, cue: Any, evidence_text: Any) -> bool:
+        cue_text = cls._normalize_semantic_text(cue, 96)
+        evidence = cls._normalize_semantic_text(evidence_text, 1000)
+        if not cue_text or not evidence:
+            return False
+        cue_tokens = cls._semantic_cue_tokens(cue_text)
+        evidence_tokens = cls._semantic_cue_tokens(evidence)
+        cue_token_set = set(cue_tokens)
+        if not cue_tokens or not cue_token_set.issubset(evidence_tokens):
+            return False
+        pivot_tokens = cue_token_set.intersection(SEMANTIC_CUE_COMPLETION_TOKENS)
+        if not pivot_tokens:
+            pivot_tokens = cue_token_set
+        pivot_index = min(
+            index
+            for index, token in enumerate(evidence_tokens)
+            if token in pivot_tokens
+        )
+        locally_negated = any(
+            token in SEMANTIC_CUE_NEGATIONS
+            and 0 < pivot_index - index <= 2
+            for index, token in enumerate(evidence_tokens)
+        )
+        return not locally_negated
 
     def _heading_deg_for_state(self, state: VLNState) -> Optional[float]:
         pose = self._pose_from_state(state)

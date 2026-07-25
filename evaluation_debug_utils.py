@@ -162,6 +162,14 @@ def apply_episode_validity(
     return normalized, episode_invalid, reason
 
 
+def should_force_stop_for_episode_limit(*, step_id: int, max_steps: int) -> bool:
+    """Reserve the final episode action for a local STOP without a model call."""
+    limit = int(max_steps)
+    if limit <= 0:
+        raise ValueError(f"max_steps must be positive; got {max_steps}")
+    return int(step_id) >= limit - 1
+
+
 def extract_multi_goal_positions(episode: Dict[str, Any]) -> List[List[float]]:
     positions: List[List[float]] = []
     for goal_item in episode.get("multi_goals", []):

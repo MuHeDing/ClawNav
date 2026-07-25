@@ -172,6 +172,7 @@ ROUTE_V3_STAGED_REQUIRED_FIELDS = ROUTE_V2_REQUIRED_FIELDS | {
 ROUTE_V3_STAGED_MAX_RESPONSE_CHARS = 3072
 ROUTE_V3_STAGED_MAX_EVIDENCE_REFS = 6
 ROUTE_V3_STAGED_MAX_EVIDENCE_REF_CHARS = 120
+ROUTE_V3_STAGED_LOCAL_REASON_DEFAULT = "qwen_direct_local_schema_default"
 ROUTE_V3_STAGED_RELATIONS = {
     "before",
     "at",
@@ -313,6 +314,7 @@ class QwenApiModelClient:
         model: str,
         timeout_s: float,
         image_labels: Optional[List[str]] = None,
+        thinking_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._ensure_config(timeout_s)
         if not self.api_key:
@@ -332,10 +334,13 @@ class QwenApiModelClient:
             else []
         )
         original_image_count = len(request_image_paths)
+        effective_thinking_mode = thinking_mode or self.thinking_mode
+        if effective_thinking_mode not in {"auto", "off", "on"}:
+            raise ValueError("thinking_mode must be one of auto, off, on")
         thinking_enabled: Optional[bool] = None
-        if self.thinking_mode == "on":
+        if effective_thinking_mode == "on":
             thinking_enabled = True
-        elif self.thinking_mode == "off":
+        elif effective_thinking_mode == "off":
             thinking_enabled = False
         request_attempts = 0
         retry_count = 0
@@ -389,6 +394,7 @@ class QwenApiModelClient:
                         degradation_trigger_detail=degradation_trigger_detail,
                         original_image_count=original_image_count,
                         final_image_count=len(request_image_paths),
+                        thinking_enabled=thinking_enabled,
                     )
                     raise QwenApiRequestError(
                         "Qwen API request failed: category=network_error",
@@ -428,6 +434,7 @@ class QwenApiModelClient:
                         degradation_trigger_detail=degradation_trigger_detail,
                         original_image_count=original_image_count,
                         final_image_count=len(request_image_paths),
+                        thinking_enabled=thinking_enabled,
                     )
                     raise QwenApiRequestError(
                         self._sanitized_error_message(
@@ -484,6 +491,7 @@ class QwenApiModelClient:
                     degradation_trigger_detail=degradation_trigger_detail,
                     original_image_count=original_image_count,
                     final_image_count=len(request_image_paths),
+                    thinking_enabled=thinking_enabled,
                 )
                 raise QwenApiRequestError(
                     self._sanitized_error_message(
@@ -511,6 +519,7 @@ class QwenApiModelClient:
                     degradation_trigger_detail=degradation_trigger_detail,
                     original_image_count=original_image_count,
                     final_image_count=len(request_image_paths),
+                    thinking_enabled=thinking_enabled,
                 )
                 raise QwenApiRequestError(
                     self._sanitized_error_message(
@@ -719,6 +728,7 @@ class QwenApiModelClient:
         degradation_trigger_detail: Optional[str] = None,
         original_image_count: int = 0,
         final_image_count: int = 0,
+        thinking_enabled: Optional[bool] = None,
     ) -> Dict[str, Any]:
         return {
             "provider_error_status": status_code,
@@ -734,7 +744,7 @@ class QwenApiModelClient:
             "provider_final_image_count": final_image_count,
             "qwen_api_request_attempts": request_attempts,
             "qwen_api_retry_count": retry_count,
-            "qwen_thinking_enabled": self.thinking_mode == "on",
+            "qwen_thinking_enabled": thinking_enabled,
             "qwen_thinking_exercised": None,
             "thinking_model_supported": False
             if category == "thinking_unsupported"
@@ -1060,6 +1070,7 @@ class OpenClawCliPlanPlanner:
         policy_backend: str = JANUS_POLICY_BACKEND,
         dynamic_visual_context_enabled: bool = False,
         qwen_thinking_mode: str = "auto",
+        qwen_thinking_interval_steps: int = 1,
         qwen_output_schema: str = "legacy",
         qwen_thinking_budget: Optional[int] = None,
         qwen_transport_mode: str = "sync",
@@ -1098,6 +1109,8 @@ class OpenClawCliPlanPlanner:
         self.policy_backend = policy_backend or JANUS_POLICY_BACKEND
         if qwen_thinking_mode not in {"auto", "off", "on"}:
             raise ValueError("qwen_thinking_mode must be one of auto, off, on")
+        if int(qwen_thinking_interval_steps) <= 0:
+            raise ValueError("qwen_thinking_interval_steps must be a positive integer")
         if qwen_output_schema not in {"legacy", "route_v2", "route_v3_staged"}:
             raise ValueError(
                 "qwen_output_schema must be one of legacy, route_v2, route_v3_staged"
@@ -1110,8 +1123,14 @@ class OpenClawCliPlanPlanner:
             raise ValueError(
                 "explicit Qwen thinking control is only supported by qwen_api"
             )
+        if (
+            openclaw_model_provider == "openclaw_cli"
+            and int(qwen_thinking_interval_steps) != 1
+        ):
+            raise ValueError("periodic Qwen thinking is only supported by qwen_api")
         self.dynamic_visual_context_enabled = bool(dynamic_visual_context_enabled)
         self.qwen_thinking_mode = qwen_thinking_mode
+        self.qwen_thinking_interval_steps = int(qwen_thinking_interval_steps)
         self.qwen_output_schema = qwen_output_schema
         self.qwen_thinking_budget = qwen_thinking_budget
         self.qwen_transport_mode = qwen_transport_mode
@@ -1338,7 +1357,9 @@ class OpenClawCliPlanPlanner:
         return "\n".join(
             [
                 "Segment the immutable navigation instruction into ordered route stages.",
-                "Return exactly one instruction_stages_v1 JSON object and no other text.",
+                "Return exactly one JSON object and no other text.",
+                'Top-level JSON shape: {"schema_version":"instruction_stages_v1",'
+                '"stages":[...]}.',
                 "Do not emit markdown, chain-of-thought, reasoning_content, images, metrics, target coordinates, or reference paths.",
                 "Use 1-12 contiguous zero-based stages. Only the last stage has final_stage=true.",
                 "Each stage has exactly: order, route_clause, transition_type, expected_landmarks, completion_cues, final_stage.",
@@ -1470,6 +1491,11 @@ class OpenClawCliPlanPlanner:
     def _model_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         prompt_payload = self._prompt_payload(payload)
         step_mode = self._planner_step_mode(prompt_payload)
+        effective_thinking_mode, thinking_due = self._qwen_thinking_mode_for_step(
+            prompt_payload
+        )
+        step_mode["qwen_thinking_effective_mode"] = effective_thinking_mode
+        step_mode["qwen_thinking_due"] = thinking_due
         self._apply_model_step_context(prompt_payload, step_mode)
         model_images = self._model_image_files(
             prompt_payload, step_mode["planner_step_mode"]
@@ -1479,7 +1505,10 @@ class OpenClawCliPlanPlanner:
             model_images,
             step_mode["planner_step_mode"],
         )
-        prompt = self._model_prompt_from_prompt_payload(prompt_payload)
+        prompt = self._model_prompt_from_prompt_payload(
+            prompt_payload,
+            qwen_thinking_mode=effective_thinking_mode,
+        )
         assembled_prompt_tokens = self._estimate_tokens(prompt)
         if self._should_use_local_policy_fast_step(step_mode):
             return self._memory_guided_policy_fast_decision(
@@ -1522,7 +1551,11 @@ class OpenClawCliPlanPlanner:
             )
 
         try:
-            model_stdout = self._model_run_stdout(prompt, model_images)
+            model_stdout = self._model_run_stdout(
+                prompt,
+                model_images,
+                thinking_mode=effective_thinking_mode,
+            )
         except Exception as exc:
             context_audit = self._context_audit(
                 prompt=prompt,
@@ -1584,11 +1617,30 @@ class OpenClawCliPlanPlanner:
             context_audit["qwen_output_repair_attempted"] = False
             context_audit["qwen_output_repair_succeeded"] = False
         model_text = self._model_visible_text(model_stdout)
+        parse_model_text = model_text
+        local_boundary_sanitized = False
+        if self.qwen_output_schema == "route_v3_staged":
+            (
+                parse_model_text,
+                local_boundary_sanitized,
+            ) = self._strip_single_json_code_fence(model_text)
         try:
             if strict_route_schema:
-                decision = self._extract_strict_route_json_object(model_text)
+                decision = self._extract_strict_route_json_object(parse_model_text)
             else:
                 decision = self._extract_json_object(model_text)
+            if self.qwen_output_schema == "route_v3_staged":
+                (
+                    decision,
+                    locally_sanitized_fields,
+                ) = self._sanitize_route_v3_primary_text_candidate(decision)
+                if local_boundary_sanitized:
+                    locally_sanitized_fields.append("json_boundary")
+                    locally_sanitized_fields.sort()
+                if locally_sanitized_fields:
+                    context_audit[
+                        "qwen_output_local_sanitized_fields"
+                    ] = locally_sanitized_fields
             normalized = self._normalize_model_decision(decision, prompt_payload)
             if self._is_qwen_direct_policy():
                 context_audit["qwen_output_json_valid"] = True
@@ -1597,14 +1649,27 @@ class OpenClawCliPlanPlanner:
                 context_audit["qwen_output_json_valid"] = False
             if strict_route_schema:
                 context_audit["qwen_output_repair_attempted"] = True
+                context_audit["qwen_output_repair_thinking_enabled"] = False
                 context_audit[
                     "qwen_output_repair_error_category"
                 ] = self._strict_route_error_category(exc)
+                context_audit["qwen_output_repair_error_detail"] = str(exc)[:500]
                 repair_error: Optional[Exception] = None
                 try:
+                    runtime_context = prompt_payload.get("runtime_context")
+                    expected_active_stage_id = (
+                        str(runtime_context.get("active_stage_id") or "")
+                        if isinstance(runtime_context, dict)
+                        else ""
+                    )
                     repair_stdout = self._model_run_stdout(
-                        self._strict_route_repair_prompt(model_text, exc),
+                        self._strict_route_repair_prompt(
+                            model_text,
+                            exc,
+                            expected_active_stage_id=expected_active_stage_id,
+                        ),
                         {"paths": [], "provider_image_labels": []},
+                        thinking_mode="off",
                     )
                     repair_metadata = self._model_request_metadata(repair_stdout)
                     repair_usage = self._agent_usage_metadata(repair_stdout)
@@ -1625,13 +1690,23 @@ class OpenClawCliPlanPlanner:
                             "qwen_output_repair_retry_count"
                         ] = repair_metadata["qwen_api_retry_count"]
                     repair_text = self._model_visible_text(repair_stdout)
+                    repair_parse_text = repair_text
+                    repair_boundary_sanitized = False
+                    if self.qwen_output_schema == "route_v3_staged":
+                        (
+                            repair_parse_text,
+                            repair_boundary_sanitized,
+                        ) = self._strip_single_json_code_fence(repair_text)
                     repair_candidate = self._extract_strict_route_json_object(
-                        repair_text
+                        repair_parse_text
                     )
                     (
                         repair_candidate,
                         sanitized_fields,
                     ) = self._sanitize_strict_route_repair_candidate(repair_candidate)
+                    if repair_boundary_sanitized:
+                        sanitized_fields.append("json_boundary")
+                        sanitized_fields.sort()
                     if sanitized_fields:
                         context_audit[
                             "qwen_output_repair_sanitized_fields"
@@ -1650,6 +1725,9 @@ class OpenClawCliPlanPlanner:
                     context_audit[
                         "qwen_output_repair_final_error_category"
                     ] = self._strict_route_error_category(repair_error)
+                    context_audit["qwen_output_repair_final_error_detail"] = str(
+                        repair_error
+                    )[:500]
                     context_audit[
                         "visual_memory_update_status"
                     ] = self._mark_visual_memory_error(
@@ -1825,6 +1903,7 @@ class OpenClawCliPlanPlanner:
         prompt: str,
         model_images: Dict[str, Any],
         timeout_s: Optional[float] = None,
+        thinking_mode: Optional[str] = None,
     ) -> str:
         request_timeout_s = (
             self.agent_timeout_s if timeout_s is None else float(timeout_s)
@@ -1839,13 +1918,18 @@ class OpenClawCliPlanPlanner:
                     thinking_budget=self.qwen_thinking_budget,
                     transport_mode=self.qwen_transport_mode,
                 )
-            response = self.model_client.run(
-                prompt=prompt,
-                image_paths=image_paths,
-                model=self.openclaw_model,
-                timeout_s=request_timeout_s,
-                image_labels=list(model_images.get("provider_image_labels") or []),
-            )
+            run_kwargs = {
+                "prompt": prompt,
+                "image_paths": image_paths,
+                "model": self.openclaw_model,
+                "timeout_s": request_timeout_s,
+                "image_labels": list(
+                    model_images.get("provider_image_labels") or []
+                ),
+            }
+            if isinstance(self.model_client, QwenApiModelClient):
+                run_kwargs["thinking_mode"] = thinking_mode
+            response = self.model_client.run(**run_kwargs)
             return json.dumps(response, ensure_ascii=True)
 
         args = self._openclaw_args("capability", "model", "run", "--json")
@@ -2122,9 +2206,16 @@ class OpenClawCliPlanPlanner:
             ]
         )
 
-    def _model_prompt_from_prompt_payload(self, prompt_payload: Dict[str, Any]) -> str:
+    def _model_prompt_from_prompt_payload(
+        self,
+        prompt_payload: Dict[str, Any],
+        qwen_thinking_mode: Optional[str] = None,
+    ) -> str:
         if self._is_qwen_direct_policy():
-            return self._direct_model_prompt_from_prompt_payload(prompt_payload)
+            return self._direct_model_prompt_from_prompt_payload(
+                prompt_payload,
+                qwen_thinking_mode=qwen_thinking_mode,
+            )
         compact_payload = json.dumps(prompt_payload, ensure_ascii=True, sort_keys=True)
         runtime_context = prompt_payload.get("runtime_context") or {}
         planner_step_mode = ""
@@ -2147,7 +2238,9 @@ class OpenClawCliPlanPlanner:
         )
 
     def _direct_model_prompt_from_prompt_payload(
-        self, prompt_payload: Dict[str, Any]
+        self,
+        prompt_payload: Dict[str, Any],
+        qwen_thinking_mode: Optional[str] = None,
     ) -> str:
         compact_payload = json.dumps(
             self._direct_model_prompt_payload(prompt_payload),
@@ -2209,12 +2302,14 @@ class OpenClawCliPlanPlanner:
             staged_lines = [
                 "The immutable full instruction and controller-owned active/completed/pending stages are separate fields in the payload.",
                 "Copy active_stage_id exactly. Qwen may propose stage_complete_candidate but must not mutate stage state.",
+                "Evaluate stage_complete_candidate only against the controller-owned active stage, not against later stages or the full instruction.",
+                "When attached visual evidence satisfies the active stage completion_cues, set stage_complete_candidate=true even though later stages remain; otherwise set it false.",
                 "Use stage_relation for the visually grounded relation to the active stage and cite only attached stage_evidence_refs.",
                 "Current RGB is final and authoritative for immediate feasibility; map_view is goal-free coarse topology; historical images are evidence only.",
                 "A visible landmark alone cannot prove pass, enter, exit, or final arrival.",
             ]
         thinking_lines = []
-        if self.qwen_thinking_mode == "on":
+        if (qwen_thinking_mode or self.qwen_thinking_mode) == "on":
             thinking_lines = [
                 "Use Qwen thinking to reason internally before producing the final JSON.",
                 "In that internal reasoning, inspect map_view for coarse topology, agent heading, visited trail, target direction, and route-stage consistency before choosing an action.",
@@ -3036,6 +3131,19 @@ class OpenClawCliPlanPlanner:
         )
         context_audit["fast_break_reason"] = step_mode.get("fast_break_reason")
         context_audit["visual_memory_update_status"] = "not_applicable"
+        context_audit["qwen_thinking_interval_steps"] = (
+            self.qwen_thinking_interval_steps
+        )
+        context_audit["qwen_thinking_due"] = step_mode.get("qwen_thinking_due")
+        effective_thinking_mode = step_mode.get("qwen_thinking_effective_mode")
+        if effective_thinking_mode in {"auto", "off", "on"}:
+            context_audit["qwen_thinking_enabled"] = (
+                True
+                if effective_thinking_mode == "on"
+                else False
+                if effective_thinking_mode == "off"
+                else None
+            )
         for key in (
             "input_regime",
             "map_assist_mode",
@@ -3166,6 +3274,22 @@ class OpenClawCliPlanPlanner:
         except (TypeError, ValueError):
             return 0
 
+    def _qwen_thinking_mode_for_step(
+        self,
+        prompt_payload: Dict[str, Any],
+    ) -> Tuple[str, Optional[bool]]:
+        if self.qwen_thinking_mode == "off":
+            return "off", False
+        if self.qwen_thinking_interval_steps == 1:
+            return (
+                self.qwen_thinking_mode,
+                True if self.qwen_thinking_mode == "on" else None,
+            )
+        state = prompt_payload.get("state") or {}
+        step_id = self._step_id(state if isinstance(state, dict) else {})
+        thinking_due = step_id % self.qwen_thinking_interval_steps == 0
+        return ("on" if thinking_due else "off"), thinking_due
+
     @staticmethod
     def _nonnegative_int(value: Any) -> int:
         try:
@@ -3271,6 +3395,8 @@ class OpenClawCliPlanPlanner:
                 else None
             ),
             "qwen_thinking_exercised": None,
+            "qwen_thinking_interval_steps": self.qwen_thinking_interval_steps,
+            "qwen_thinking_due": None,
             "thinking_model_supported": None,
             "qwen_output_json_valid": None,
             "qwen_output_schema": self.qwen_output_schema,
@@ -3800,6 +3926,22 @@ class OpenClawCliPlanPlanner:
             raise RuntimeError("qwen route_v3_staged response must be a JSON object")
         return value
 
+    @staticmethod
+    def _strip_single_json_code_fence(text: str) -> Tuple[str, bool]:
+        """Strip only an otherwise-whole single JSON code fence."""
+        stripped = text.strip()
+        lines = stripped.splitlines()
+        if len(lines) < 3:
+            return text, False
+        if lines[0].strip().lower() not in {"```", "```json"}:
+            return text, False
+        if lines[-1].strip() != "```":
+            return text, False
+        candidate = "\n".join(lines[1:-1]).strip()
+        if not candidate:
+            return text, False
+        return candidate, True
+
     def _extract_strict_route_json_object(self, text: str) -> Dict[str, Any]:
         if self.qwen_output_schema == "route_v3_staged":
             return self._extract_route_v3_staged_json_object(text)
@@ -3820,16 +3962,28 @@ class OpenClawCliPlanPlanner:
             ]
         )
 
-    def _strict_route_repair_prompt(self, model_text: str, error: Exception) -> str:
+    def _strict_route_repair_prompt(
+        self,
+        model_text: str,
+        error: Exception,
+        *,
+        expected_active_stage_id: str,
+    ) -> str:
         if self.qwen_output_schema == "route_v2":
             return self._route_v2_repair_prompt(model_text, error)
         candidate = model_text[:ROUTE_V3_STAGED_MAX_RESPONSE_CHARS]
+        expected_stage_line = (
+            "Expected active_stage_id: "
+            f"{json.dumps(expected_active_stage_id, ensure_ascii=True)}. "
+            "Copy it exactly."
+        )
         return "\n".join(
             [
                 "Repair the candidate into exactly one valid route_v3_staged JSON object.",
                 "Return JSON only. Do not include markdown, prose, chain-of-thought, or reasoning_content.",
                 "Preserve the candidate action and grounded evidence when valid; only fix schema, types, and boundaries.",
                 f"Validation error category: {self._strict_route_error_category(error)}.",
+                expected_stage_line,
                 ROUTE_V2_FIELD_LIMITS_TEXT,
                 "active_stage_id<=64 chars; stage_evidence_refs<=6 items and each<=120 chars.",
                 ROUTE_V3_STAGED_SCHEMA_LINE,
@@ -3860,6 +4014,36 @@ class OpenClawCliPlanPlanner:
                 sanitized_fields.append("confirmed_landmarks")
         return sanitized, sorted(sanitized_fields)
 
+    @staticmethod
+    def _sanitize_route_v3_primary_text_candidate(
+        candidate: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Apply conservative defaults while keeping action/stage control strict."""
+        sanitized = dict(candidate)
+        sanitized_fields: List[str] = []
+        defaults = {
+            "confidence": 0.0,
+            "visual_summary": "",
+            "progress_state": "",
+            "route_stage": "unknown",
+            "confirmed_landmarks": [],
+            "current_target": "",
+            "target_relation": "unknown",
+            "stop_evidence": "none",
+            "semantic_stop_state": "not_ready",
+            "reason": ROUTE_V3_STAGED_LOCAL_REASON_DEFAULT,
+        }
+        for key, default in defaults.items():
+            if key not in sanitized:
+                sanitized[key] = default
+                sanitized_fields.append(key)
+        for key, limit in ROUTE_V2_STRING_LIMITS.items():
+            value = sanitized.get(key)
+            if isinstance(value, str) and len(value) > limit:
+                sanitized[key] = value[:limit]
+                sanitized_fields.append(key)
+        return sanitized, sorted(sanitized_fields)
+
     def _sanitize_strict_route_repair_candidate(
         self,
         candidate: Dict[str, Any],
@@ -3869,21 +4053,10 @@ class OpenClawCliPlanPlanner:
         )
         if self.qwen_output_schema != "route_v3_staged":
             return sanitized, sanitized_fields
-        active_stage_id = sanitized.get("active_stage_id")
-        if isinstance(active_stage_id, str) and len(active_stage_id) > 64:
-            sanitized["active_stage_id"] = active_stage_id[:64]
-            sanitized_fields.append("active_stage_id")
-        references = sanitized.get("stage_evidence_refs")
-        if isinstance(references, list):
-            clipped = [
-                value[:ROUTE_V3_STAGED_MAX_EVIDENCE_REF_CHARS]
-                if isinstance(value, str)
-                else value
-                for value in references[:ROUTE_V3_STAGED_MAX_EVIDENCE_REFS]
-            ]
-            if clipped != references:
-                sanitized["stage_evidence_refs"] = clipped
-                sanitized_fields.append("stage_evidence_refs")
+        sanitized, local_fields = self._sanitize_route_v3_primary_text_candidate(
+            sanitized
+        )
+        sanitized_fields.extend(local_fields)
         return sanitized, sorted(set(sanitized_fields))
 
     @staticmethod
@@ -4224,6 +4397,7 @@ def main() -> None:
         choices=("auto", "off", "on"),
         default="auto",
     )
+    parser.add_argument("--qwen_thinking_interval_steps", type=int, default=1)
     parser.add_argument(
         "--qwen_output_schema",
         choices=("legacy", "route_v2", "route_v3_staged"),
@@ -4267,6 +4441,7 @@ def main() -> None:
         ),
         dynamic_visual_context_enabled=bool(args.dynamic_visual_context_enabled),
         qwen_thinking_mode=args.qwen_thinking_mode,
+        qwen_thinking_interval_steps=args.qwen_thinking_interval_steps,
         qwen_output_schema=args.qwen_output_schema,
         qwen_thinking_budget=args.qwen_thinking_budget,
         qwen_transport_mode=args.qwen_transport_mode,

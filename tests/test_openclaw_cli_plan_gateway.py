@@ -244,6 +244,10 @@ def test_cli_plan_gateway_segments_instruction_once_without_images():
     assert model_client.calls[0]["image_paths"] == []
     assert model_client.calls[0]["timeout_s"] == 120
     assert "chain-of-thought" in model_client.calls[0]["prompt"]
+    assert (
+        'Top-level JSON shape: {"schema_version":"instruction_stages_v1",'
+        '"stages":[...]}' in model_client.calls[0]["prompt"]
+    )
 
 
 def test_cli_plan_gateway_segmentation_repairs_once_then_falls_back():
@@ -268,6 +272,10 @@ def test_cli_plan_gateway_segmentation_repairs_once_then_falls_back():
 
     assert len(model_client.calls) == 2
     assert model_client.calls[1]["image_paths"] == []
+    assert (
+        'Top-level JSON shape: {"schema_version":"instruction_stages_v1",'
+        '"stages":[...]}' in model_client.calls[1]["prompt"]
+    )
     assert response["stage_plan"]["stages"][0]["route_clause"] == "keep original"
     assert response["runtime_metadata"]["segmentation_source"] == "fallback"
     assert response["runtime_metadata"]["fallback_category"] == "schema_error"
@@ -1870,7 +1878,299 @@ def test_cli_plan_gateway_route_v3_staged_accepts_exact_schema_and_stage():
     assert decision["arguments"]["stage_evidence_refs"] == ["current"]
     prompt = model_client.calls[0]["prompt"]
     assert "stage_complete_candidate" in prompt
+    assert (
+        "Evaluate stage_complete_candidate only against the controller-owned active stage"
+        in prompt
+    )
+    assert "set stage_complete_candidate=true" in prompt
     assert "stage_entry" in prompt
+
+
+def test_cli_plan_gateway_route_v3_locally_clips_bounded_text_without_repair():
+    model_client = FakeModelClient(
+        response={
+            "ok": True,
+            "outputs": [
+                {
+                    "text": json.dumps(
+                        route_v3_staged_payload(
+                            action_text="MOVE_FORWARD",
+                            visual_summary="v" * 241,
+                            progress_state="p" * 121,
+                            reason="r" * 161,
+                        )
+                    )
+                }
+            ],
+            "usage": {},
+        }
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        qwen_output_schema="route_v3_staged",
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 0},
+            "runtime_context": {"active_stage_id": "stage_00"},
+        }
+    )
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert len(model_client.calls) == 1
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+    assert len(decision["arguments"]["visual_summary"]) == 240
+    assert len(decision["arguments"]["progress_state"]) == 120
+    assert len(decision["arguments"]["reason"]) == 160
+    assert audit["qwen_output_local_sanitized_fields"] == [
+        "progress_state",
+        "reason",
+        "visual_summary",
+    ]
+    assert audit["qwen_output_repair_attempted"] is False
+
+
+def test_cli_plan_gateway_route_v3_fills_missing_non_control_fields_without_repair():
+    defaults = {
+        "confidence": 0.0,
+        "visual_summary": "",
+        "progress_state": "",
+        "route_stage": "unknown",
+        "confirmed_landmarks": [],
+        "current_target": "",
+        "target_relation": "unknown",
+        "stop_evidence": "none",
+        "semantic_stop_state": "not_ready",
+        "reason": "qwen_direct_local_schema_default",
+    }
+    for missing_field, expected_default in defaults.items():
+        candidate = route_v3_staged_payload(action_text="MOVE_FORWARD")
+        del candidate[missing_field]
+        model_client = FakeModelClient(
+            response={
+                "ok": True,
+                "outputs": [{"text": json.dumps(candidate)}],
+                "usage": {},
+            }
+        )
+        planner = OpenClawCliPlanPlanner(
+            planner_mode="model",
+            policy_backend="qwen_direct",
+            openclaw_model_provider="qwen_api",
+            qwen_output_schema="route_v3_staged",
+            model_client=model_client,
+        )
+
+        decision = planner.plan_payload(
+            {
+                "state": {"instruction": "go", "step_id": 0},
+                "runtime_context": {"active_stage_id": "stage_00"},
+            }
+        )
+
+        audit = decision["runtime_metadata"]["context_audit"]
+        assert len(model_client.calls) == 1, missing_field
+        assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+        assert decision["arguments"][missing_field] == expected_default
+        assert audit["qwen_output_local_sanitized_fields"] == [missing_field]
+        assert audit["qwen_output_repair_attempted"] is False
+
+
+def test_cli_plan_gateway_route_v3_strips_one_json_fence_without_repair():
+    candidate = route_v3_staged_payload(action_text="MOVE_FORWARD")
+    model_client = FakeModelClient(
+        response={
+            "ok": True,
+            "outputs": [
+                {"text": "```json\n" + json.dumps(candidate) + "\n```"}
+            ],
+            "usage": {},
+        }
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        qwen_output_schema="route_v3_staged",
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 0},
+            "runtime_context": {"active_stage_id": "stage_00"},
+        }
+    )
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert len(model_client.calls) == 1
+    assert decision["arguments"]["action_text"] == "MOVE_FORWARD"
+    assert audit["qwen_output_local_sanitized_fields"] == ["json_boundary"]
+    assert audit["qwen_output_repair_attempted"] is False
+
+
+def test_cli_plan_gateway_route_v3_keeps_prose_wrapped_json_strict():
+    candidate = route_v3_staged_payload(action_text="MOVE_FORWARD")
+    wrapped = {
+        "ok": True,
+        "outputs": [{"text": "Here is the decision:\n" + json.dumps(candidate)}],
+        "usage": {},
+    }
+    model_client = FakeModelClient(response=[wrapped, wrapped])
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        qwen_output_schema="route_v3_staged",
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 0},
+            "runtime_context": {"active_stage_id": "stage_00"},
+        }
+    )
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert len(model_client.calls) == 2
+    assert decision["arguments"]["qwen_failure"] is True
+    assert audit["qwen_output_repair_error_category"] == "invalid_json_boundary"
+    assert audit["qwen_output_repair_error_detail"] == (
+        "qwen route_v3_staged response must be exactly one JSON object"
+    )
+    assert audit["qwen_output_repair_succeeded"] is False
+    assert audit["qwen_output_repair_final_error_detail"] == (
+        "qwen route_v3_staged response must be exactly one JSON object"
+    )
+
+
+def test_cli_plan_gateway_route_v3_repair_defaults_missing_non_control_fields():
+    repaired_candidate = route_v3_staged_payload(action_text="TURN_RIGHT")
+    del repaired_candidate["confirmed_landmarks"]
+    model_client = FakeModelClient(
+        response=[
+            {
+                "ok": True,
+                "outputs": [{"text": "not json"}],
+                "usage": {},
+            },
+            {
+                "ok": True,
+                "outputs": [{"text": json.dumps(repaired_candidate)}],
+                "usage": {},
+            },
+        ]
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        qwen_output_schema="route_v3_staged",
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 0},
+            "runtime_context": {"active_stage_id": "stage_00"},
+        }
+    )
+
+    audit = decision["runtime_metadata"]["context_audit"]
+    assert len(model_client.calls) == 2
+    assert decision["arguments"]["action_text"] == "TURN_RIGHT"
+    assert decision["arguments"]["confirmed_landmarks"] == []
+    assert audit["qwen_output_repair_succeeded"] is True
+    assert audit["qwen_output_repair_sanitized_fields"] == [
+        "confirmed_landmarks"
+    ]
+
+
+def test_cli_plan_gateway_route_v3_keeps_missing_control_fields_strict():
+    for missing_field in (
+        "action_text",
+        "active_stage_id",
+        "stage_relation",
+        "stage_evidence_refs",
+        "stage_complete_candidate",
+    ):
+        candidate = route_v3_staged_payload()
+        del candidate[missing_field]
+        invalid_response = {
+            "ok": True,
+            "outputs": [{"text": json.dumps(candidate)}],
+            "usage": {},
+        }
+        model_client = FakeModelClient(response=[invalid_response, invalid_response])
+        planner = OpenClawCliPlanPlanner(
+            planner_mode="model",
+            policy_backend="qwen_direct",
+            openclaw_model_provider="qwen_api",
+            qwen_output_schema="route_v3_staged",
+            model_client=model_client,
+        )
+
+        decision = planner.plan_payload(
+            {
+                "state": {"instruction": "go", "step_id": 0},
+                "runtime_context": {"active_stage_id": "stage_00"},
+            }
+        )
+
+        audit = decision["runtime_metadata"]["context_audit"]
+        assert len(model_client.calls) == 2, missing_field
+        assert decision["arguments"]["qwen_failure"] is True, missing_field
+        assert audit["qwen_output_repair_attempted"] is True, missing_field
+        assert audit["qwen_output_repair_succeeded"] is False, missing_field
+
+
+def test_cli_plan_gateway_route_v3_repair_names_expected_active_stage():
+    model_client = FakeModelClient(
+        response=[
+            {
+                "ok": True,
+                "outputs": [
+                    {
+                        "text": json.dumps(
+                            route_v3_staged_payload(active_stage_id="stage_01")
+                        )
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "ok": True,
+                "outputs": [{"text": json.dumps(route_v3_staged_payload())}],
+                "usage": {},
+            },
+        ]
+    )
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        qwen_output_schema="route_v3_staged",
+        model_client=model_client,
+    )
+
+    decision = planner.plan_payload(
+        {
+            "state": {"instruction": "go", "step_id": 0},
+            "runtime_context": {"active_stage_id": "stage_00"},
+        }
+    )
+
+    assert decision["arguments"]["active_stage_id"] == "stage_00"
+    assert len(model_client.calls) == 2
+    assert (
+        'Expected active_stage_id: "stage_00". Copy it exactly.'
+        in model_client.calls[1]["prompt"]
+    )
 
 
 def test_cli_plan_gateway_route_v3_staged_rejects_mismatched_stage_and_extra_fields():
@@ -1878,6 +2178,7 @@ def test_cli_plan_gateway_route_v3_staged_rejects_mismatched_stage_and_extra_fie
         route_v3_staged_payload(active_stage_id="stage_01"),
         route_v3_staged_payload(reasoning_content="hidden"),
         route_v3_staged_payload(stage_evidence_refs=["current"] * 7),
+        route_v3_staged_payload(stage_evidence_refs=["x" * 121]),
     ):
         planner = OpenClawCliPlanPlanner(
             planner_mode="model",
@@ -2133,6 +2434,58 @@ def test_cli_plan_gateway_route_v2_thinking_prompt_requires_internal_map_reasoni
     assert "confirmed_landmarks<=8" in prompt
 
 
+def test_cli_plan_gateway_periodic_thinking_runs_only_every_ten_episode_steps():
+    session = SequenceSession(
+        [
+            FakeHttpResponse(
+                {"choices": [{"message": {"content": json.dumps(route_v2_payload())}}]}
+            )
+            for _ in range(3)
+        ]
+    )
+    client = QwenApiModelClient(
+        api_key="sk-test",
+        base_url="https://dashscope.example/v1",
+        thinking_mode="on",
+        thinking_budget=1024,
+    )
+    client.session = session
+    planner = OpenClawCliPlanPlanner(
+        planner_mode="model",
+        policy_backend="qwen_direct",
+        openclaw_model_provider="qwen_api",
+        qwen_thinking_mode="on",
+        qwen_thinking_interval_steps=10,
+        qwen_output_schema="route_v2",
+        qwen_thinking_budget=1024,
+        model_client=client,
+    )
+
+    decisions = [
+        planner.plan_payload({"state": {"instruction": "go", "step_id": step_id}})
+        for step_id in (0, 1, 10)
+    ]
+
+    request_jsons = [post["kwargs"]["json"] for post in session.posts]
+    assert [request["enable_thinking"] for request in request_jsons] == [
+        True,
+        False,
+        True,
+    ]
+    assert ["thinking_budget" in request for request in request_jsons] == [
+        True,
+        False,
+        True,
+    ]
+    assert "reason internally" in request_jsons[0]["messages"][0]["content"][0]["text"]
+    assert "reason internally" not in request_jsons[1]["messages"][0]["content"][0]["text"]
+    assert "reason internally" in request_jsons[2]["messages"][0]["content"][0]["text"]
+    audits = [decision["runtime_metadata"]["context_audit"] for decision in decisions]
+    assert [audit["qwen_thinking_enabled"] for audit in audits] == [True, False, True]
+    assert [audit["qwen_thinking_due"] for audit in audits] == [True, False, True]
+    assert all(audit["qwen_thinking_interval_steps"] == 10 for audit in audits)
+
+
 def test_dynamic_visual_normal_selects_purpose_order_with_current_last(tmp_path):
     paths = {
         role: tmp_path / f"{role}.png"
@@ -2377,6 +2730,7 @@ def test_cli_plan_gateway_new_policy_controls_preserve_compatibility_defaults():
 
     assert planner.dynamic_visual_context_enabled is False
     assert planner.qwen_thinking_mode == "auto"
+    assert planner.qwen_thinking_interval_steps == 1
     assert planner.qwen_output_schema == "legacy"
     assert planner.qwen_thinking_budget is None
     assert planner.qwen_transport_mode == "sync"
@@ -2389,6 +2743,7 @@ def test_cli_plan_gateway_accepts_independent_dynamic_and_thinking_controls():
         openclaw_model_provider="qwen_api",
         dynamic_visual_context_enabled=True,
         qwen_thinking_mode="on",
+        qwen_thinking_interval_steps=10,
         qwen_output_schema="route_v2",
         qwen_thinking_budget=1024,
         qwen_transport_mode="sync",
@@ -2396,6 +2751,7 @@ def test_cli_plan_gateway_accepts_independent_dynamic_and_thinking_controls():
 
     assert planner.dynamic_visual_context_enabled is True
     assert planner.qwen_thinking_mode == "on"
+    assert planner.qwen_thinking_interval_steps == 10
     assert planner.qwen_output_schema == "route_v2"
     assert planner.qwen_thinking_budget == 1024
 
@@ -2405,6 +2761,7 @@ def test_cli_plan_gateway_rejects_invalid_thinking_configuration():
         {"qwen_thinking_mode": "sometimes"},
         {"qwen_thinking_budget": 0},
         {"qwen_thinking_budget": -1},
+        {"qwen_thinking_interval_steps": 0},
     ):
         try:
             OpenClawCliPlanPlanner(**kwargs)
