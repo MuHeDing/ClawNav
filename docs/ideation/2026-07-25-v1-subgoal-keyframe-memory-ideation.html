@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ideation: Simple R2R Keyframe Memory</title>
+  <style>
+    :root {
+      --bg: #f5f7f4; --paper: #fff; --ink: #17211b; --muted: #59655d;
+      --line: #d9e1db; --accent: #176b4d; --soft: #e7f3ed;
+      --blue: #2f5d99; --blue-soft: #eaf0f8; --amber-soft: #fff3d7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 15px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { width: min(900px, calc(100% - 28px)); margin: 30px auto 72px; }
+    header, section {
+      padding: 30px 34px; margin-top: 20px; background: var(--paper);
+      border: 1px solid var(--line); border-radius: 16px;
+      box-shadow: 0 10px 28px rgba(27, 54, 38, .07);
+    }
+    header { margin-top: 0; }
+    h1, h2, h3 { line-height: 1.25; letter-spacing: -.02em; }
+    h1 { margin: 6px 0 12px; font-size: clamp(28px, 4vw, 40px); }
+    h2 { margin: 0 0 16px; font-size: 23px; }
+    h3 { margin: 0 0 8px; font-size: 19px; }
+    p { max-width: 74ch; }
+    code {
+      padding: .12em .38em; border-radius: 5px; background: #eef1ee;
+      font: .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    pre {
+      padding: 17px; overflow-x: auto; border: 1px solid var(--line);
+      border-radius: 12px; background: #f7f9f7; line-height: 1.55;
+    }
+    pre code { padding: 0; background: none; }
+    .eyebrow {
+      color: var(--accent); font-size: 12px; font-weight: 800;
+      letter-spacing: .12em; text-transform: uppercase;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 17px; }
+    .chip {
+      padding: 5px 10px; border-radius: 999px; border: 1px solid #c9ddd3;
+      background: var(--soft); color: #164e3a; font-size: 12px; font-weight: 750;
+    }
+    nav { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+    nav a { margin-right: 16px; color: var(--accent); font-weight: 700; }
+    .axes, .rules, .slots {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+    }
+    .card {
+      padding: 16px; border-radius: 12px; border: 1px solid var(--line);
+      background: #fafbfa;
+    }
+    .card.blue { background: var(--blue-soft); color: #244b7e; }
+    .card.green { background: var(--soft); color: #164e3a; }
+    .card.amber { background: var(--amber-soft); color: #6d5014; }
+    .rule-number {
+      display: inline-grid; place-items: center; width: 28px; height: 28px;
+      margin-bottom: 8px; border-radius: 8px; background: var(--accent);
+      color: #fff; font-weight: 800;
+    }
+    .flow {
+      display: flex; align-items: stretch; gap: 8px; margin: 20px 0;
+      overflow-x: auto;
+    }
+    .flow-step {
+      min-width: 135px; flex: 1; padding: 14px; border: 1px solid var(--line);
+      border-radius: 12px; background: #f8faf8; text-align: center; font-weight: 700;
+    }
+    .arrow { display: grid; place-items: center; color: var(--accent); font-size: 24px; }
+    .callout {
+      margin-top: 18px; padding: 15px 18px; border-radius: 12px;
+      background: var(--soft); color: #164e3a;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f1f5f2; }
+    ul, ol { padding-left: 22px; }
+    li + li { margin-top: 7px; }
+    footer { margin: -44px auto 24px; text-align: center; color: var(--muted); font-size: 12px; }
+    @media (max-width: 720px) {
+      header, section { padding: 23px 20px; }
+      .axes, .rules, .slots { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">R2R-focused · Simple V1</div>
+    <h1>简单关键帧保存与检索</h1>
+    <p>针对 R2R 指令通常由 landmark、转向、房间/区域切换组成的特点，只保留最容易解释和实现的规则。不引入证据角色、效用函数、动态配额、复杂 embedding 或 replanning。</p>
+    <div class="chips">
+      <span class="chip">日期 · <time datetime="2026-07-25">2026-07-25</time></span>
+      <span class="chip">主题 · simple-r2r-keyframe-memory</span>
+      <span class="chip">模式 · repo-grounded</span>
+      <span class="chip">复杂度 · Low</span>
+    </div>
+    <nav>
+      <a href="#context">基础</a>
+      <a href="#proposal">推荐方案</a>
+      <a href="#save">保存</a>
+      <a href="#retrieve">检索</a>
+      <a href="#slots">槽位</a>
+      <a href="#cuts">删减项</a>
+    </nav>
+  </header>
+
+  <section id="context">
+    <div class="eyebrow">Grounding context</div>
+    <h2>为什么 R2R 可以做简单</h2>
+    <p>R2R 路径指令通常按顺序描述若干可观察 landmark、转弯动作和房间切换。V1 不需要建立完整地图，只需要让 JanusVLN 看到当前 subgoal 的入口位置、最近一次相关转折或 landmark，以及连续的普通历史。</p>
+    <div class="axes">
+      <div class="card blue"><strong>保存</strong><br>只保存阶段边界和转弯等明确事件。</div>
+      <div class="card green"><strong>检索</strong><br>优先当前 subgoal，最多返回2张关键帧。</div>
+      <div class="card amber"><strong>输入</strong><br>固定9张图，不改变 JanusVLN 图像预算。</div>
+    </div>
+  </section>
+
+  <section id="proposal">
+    <div class="eyebrow">Ranked idea · 1 survivor</div>
+    <h2>推荐：Stage-Keyframe V1</h2>
+    <p>把此前的多个复杂方向合并并收缩成一个规则方案：<strong>按导航阶段保存关键帧，按当前 subgoal 检索最多2张，再替换普通历史中的2个中间槽位。</strong></p>
+    <div class="flow" aria-label="Simple R2R keyframe flow">
+      <div class="flow-step">当前 subgoal</div><div class="arrow">→</div>
+      <div class="flow-step">保存明确事件帧</div><div class="arrow">→</div>
+      <div class="flow-step">检索当前阶段最多2张</div><div class="arrow">→</div>
+      <div class="flow-step">替换中间历史槽位</div><div class="arrow">→</div>
+      <div class="flow-step">JanusVLN 输出动作</div>
+    </div>
+    <div class="chips"><span class="chip">Confidence · High</span><span class="chip">Complexity · Low</span></div>
+  </section>
+
+  <section id="save">
+    <div class="eyebrow">Save policy</div>
+    <h2>关键帧怎么保存</h2>
+    <div class="rules">
+      <div class="card">
+        <span class="rule-number">1</span>
+        <h3>初始帧</h3>
+        <p>episode 的 step 0 固定保存，不参与淘汰。</p>
+      </div>
+      <div class="card">
+        <span class="rule-number">2</span>
+        <h3>阶段入口帧</h3>
+        <p>切换到新 subgoal 时保存当前帧。上一阶段完成帧通常可直接作为下一阶段入口帧，避免重复。</p>
+      </div>
+      <div class="card">
+        <span class="rule-number">3</span>
+        <h3>转向帧</h3>
+        <p>JanusVLN 第一次进入连续 TURN_LEFT 或 TURN_RIGHT 动作段时保存一张；连续相同 TURN 不重复保存。</p>
+      </div>
+      <div class="card">
+        <span class="rule-number">4</span>
+        <h3>阶段完成帧</h3>
+        <p>Verifier 判断当前 subgoal 完成时保存，用于连接当前阶段与下一阶段。</p>
+      </div>
+      <div class="card">
+        <span class="rule-number">5</span>
+        <h3>长直行兜底</h3>
+        <p>距离上一次保存超过20 step 时保存一张，防止长走廊完全没有中间视觉记录。</p>
+      </div>
+      <div class="card">
+        <span class="rule-number">6</span>
+        <h3>简单去重</h3>
+        <p>最小间隔5 step；阶段入口和完成帧可以绕过该间隔。episode 最多保存64张。</p>
+      </div>
+    </div>
+    <p>每张关键帧只保存以下简单 metadata：</p>
+    <pre><code>{
+  "scene_id": "...",
+  "episode_id": "...",
+  "step_id": 42,
+  "subgoal_id": 1,
+  "subgoal_text": "turn left and enter the kitchen",
+  "landmarks": ["kitchen"],
+  "save_reason": "stage_entry | turn | stage_complete | coverage_gap",
+  "image_path": "..."
+}</code></pre>
+  </section>
+
+  <section id="retrieve">
+    <div class="eyebrow">Retrieval policy</div>
+    <h2>关键帧怎么检索</h2>
+    <p>只在当前 episode 的过去帧中检索，最多返回2张，不使用复杂向量数据库。</p>
+    <ol>
+      <li>优先取当前 <code>subgoal_id</code> 的阶段入口帧。</li>
+      <li>再取当前 subgoal 中最新的转向帧或完成相关帧。</li>
+      <li>如果当前阶段没有足够关键帧，用上一 subgoal 的完成帧补一张。</li>
+      <li>如果仍不足，不强行补关键帧，保留普通历史帧。</li>
+      <li>候选多于2张时，先按 landmark 关键词重合过滤，再选择最新的一张。</li>
+      <li>选完以后按照 <code>step_id</code> 排序，保持历史时间顺序。</li>
+    </ol>
+    <pre><code>candidates = prior_episode_keyframes
+current = candidates where subgoal_id == current_subgoal_id
+
+K1 = stage_entry(current)
+K2 = latest(turn_or_stage_complete(current))
+
+if K1 or K2 missing:
+    use previous_subgoal_completion
+
+return at most 2 keyframes, sorted by step_id</code></pre>
+    <div class="callout"><strong>核心原则：</strong>检索不到相关帧时宁可使用普通历史，也不要塞入旧阶段或不相关 landmark 的关键帧。</div>
+  </section>
+
+  <section id="slots">
+    <div class="eyebrow">Fixed visual input</div>
+    <h2>9张图像怎么组成</h2>
+    <p>先从原始轨迹得到1张初始帧、7张中间历史帧和1张当前帧。若检索到关键帧，只替换7个中间槽位中的最多2个。</p>
+    <div class="slots">
+      <div class="card blue"><strong>没有关键帧</strong><br><code>[Initial, H1, H2, H3, H4, H5, H6, H7, Current]</code></div>
+      <div class="card green"><strong>检索到1张</strong><br><code>[Initial, H1, H2, K1, H3, H4, H5, H6, Current]</code></div>
+      <div class="card amber"><strong>检索到2张</strong><br><code>[Initial, H1, K1, H2, H3, K2, H4, H5, Current]</code></div>
+    </div>
+    <p>实际输入前对7张中间帧统一按 <code>step_id</code> 排序，以上位置只是表达“最多替换2张”，不是强制固定索引。</p>
+  </section>
+
+  <section id="cuts">
+    <div class="eyebrow">Rejection summary</div>
+    <h2>从上一版删除的复杂设计</h2>
+    <table>
+      <thead><tr><th>删除项</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr><td>六类 evidence roles</td><td>对 R2R V1 太细，改为入口、转向、完成三类主要事件。</td></tr>
+        <tr><td>集合效用函数</td><td>需要多项权重，难解释和调参；改为固定优先级。</td></tr>
+        <tr><td>动态2–5张关键帧配额</td><td>输入变化过多；固定最多2张更容易消融。</td></tr>
+        <tr><td>边际效用替换</td><td>V1 先保留简单 episode cap；R2R 一般不容易达到64张。</td></tr>
+        <tr><td>Transition Capsule 成对确认</td><td>先只保存转向动作段首帧和阶段完成帧。</td></tr>
+        <tr><td>视觉 embedding / DPP / CLIP top-k</td><td>不是 R2R V1 的必要条件；先用 subgoal ID 和 landmark 关键词。</td></tr>
+        <tr><td>失败负向记忆和 replanning</td><td>继续留到 V2。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <div class="eyebrow">Code references</div>
+    <h2>现有代码落点</h2>
+    <ul>
+      <li><code>src/harness/openclaw/keyframe_gate.py</code> — 已有初始、转向/STOP、coverage gap、5-step cooldown、64张 cap 基础。</li>
+      <li><code>src/harness/openclaw/runtime.py</code> — 已有 stage ID、stage entry 和 stage-aware keyframe 记录。</li>
+      <li><code>src/harness/skills/navigation_policy.py</code> — 后续需要把 memory image 从“追加”改为“替换最多2个中间历史槽位”。</li>
+      <li><code>/ssd/dingmuhe/Embodied-task/JanusVLN/src/evaluation.py</code> — 原始均匀历史采样逻辑。</li>
+    </ul>
+  </section>
+</main>
+<footer>Updated 2026-07-25 by ce-ideate from the simplified R2R V1 refinement.</footer>
+</body>
+</html>

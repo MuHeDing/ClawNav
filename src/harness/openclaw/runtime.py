@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import shutil
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -108,6 +109,14 @@ class OpenClawVLNRuntime:
         self.controller_private_replan_state: Dict[str, Any] = {}
         self.visual_readback_replans_this_episode = 0
         self.visual_readback_action_overrides_this_episode = 0
+        self.visual_readback_stop_overrides_this_episode = 0
+        self.visual_readback_last_executable_action_hint = ""
+        self.visual_readback_action_hint_shadowed_for_instability = False
+        self.instruction_stages: List[Dict[str, Any]] = []
+        self.current_stage_id = 0
+        self.stage_update_source = ""
+        self.stage_update_reason = ""
+        self.stage_alignment_status = "aligned"
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return self.tool_adapter.list_tools()
@@ -1234,6 +1243,7 @@ class OpenClawVLNRuntime:
             "source_image_role": "event_gated_keyframe",
             "memory_namespace": self._episode_memory_namespace(state),
         }
+        metadata.update(self._current_instruction_stage_metadata())
         return {
             "should_write": True,
             "memory_source": self.config.memory_source,
@@ -1358,6 +1368,9 @@ class OpenClawVLNRuntime:
             "used_by_policy": final_policy_payload_has_memory,
             "readback_state_used_by_policy": False,
             "final_policy_payload_has_memory": final_policy_payload_has_memory,
+            "stage_override_allowed": True,
+            "stage_override_block_reason": "",
+            **self._instruction_stage_trace_fields(),
         }
         if not trigger_rule:
             base_trace.update({"read_status": "skipped", "skip_reason": "no_trigger"})
@@ -1402,6 +1415,8 @@ class OpenClawVLNRuntime:
                 "memory_hits": memory_hits,
                 "candidate_action": candidate_action,
                 "trigger_rule": trigger_rule,
+                "instruction_stages": list(self.instruction_stages),
+                "current_stage_id": self.current_stage_id,
             },
             state=state,
         )
@@ -1410,6 +1425,8 @@ class OpenClawVLNRuntime:
         if isinstance(payload, dict):
             trace.update(payload)
         trace.update(candidate_pool_trace)
+        self._apply_stage_progress_from_readback(trace)
+        trace.update(self._instruction_stage_trace_fields())
         return {"trace": trace, "tool_call": tool_call}
 
     def _execute_visual_readback_replan(
@@ -1516,6 +1533,11 @@ class OpenClawVLNRuntime:
         trace.setdefault("action_hint_action_text", "")
         trace.setdefault("action_hint_override_failure_reason", "")
         trace.setdefault("readback_state_used_by_controller", False)
+        trace.setdefault("stop_override_executed_after_visual_read", False)
+        trace.setdefault(
+            "stop_override_budget_used",
+            self.visual_readback_stop_overrides_this_episode,
+        )
         if self.config.visual_readback_mode != "image_read_action_override":
             return current_action
 
@@ -1567,16 +1589,46 @@ class OpenClawVLNRuntime:
             return current_action
         trace["action_hint_action_text"] = hinted_action
 
-        supported_by_label = "route_conflict" in labels
-        if not supported_by_label:
-            trace["action_hint_override_failure_reason"] = "unsupported_verifier_labels"
+        changes_action = hinted_action != original_action
+        if not changes_action:
+            trace["final_action"] = current_action
+            trace["executed_action_changed_after_visual_read"] = False
+            return current_action
+
+        label_supported, label_failure_reason = self._action_override_label_supported(
+            original_action,
+            hinted_action,
+            labels,
+            trace,
+        )
+        if not label_supported:
+            trace["action_hint_override_failure_reason"] = label_failure_reason
+            return current_action
+        if hinted_action == "STOP" and original_action != "STOP":
+            trace["action_hint_override_failure_reason"] = "stop_hint_shadowed"
+            trace["final_action"] = current_action
+            trace["executed_action_changed_after_visual_read"] = False
+            return current_action
+        if not self._trace_has_current_action_override_evidence(trace):
+            trace["action_hint_override_failure_reason"] = (
+                "missing_current_action_evidence"
+            )
+            trace["final_action"] = current_action
+            trace["executed_action_changed_after_visual_read"] = False
             return current_action
         if hinted_action == "STOP" and bool(
             {"goal_not_visible", "insufficient_evidence"} & labels
         ):
             trace["action_hint_override_failure_reason"] = "contradictory_stop_hint"
             return current_action
-        changes_action = hinted_action != original_action
+        stage_allowed, stage_block_reason = self._stage_override_allowed(trace)
+        trace["stage_override_allowed"] = stage_allowed
+        trace["stage_override_block_reason"] = stage_block_reason
+        if not stage_allowed:
+            trace["action_hint_override_failure_reason"] = (
+                f"stage_override_blocked:{stage_block_reason}"
+            )
+            return current_action
         budget_policy, budget_limit = self._visual_readback_action_override_budget(
             trace
         )
@@ -1586,7 +1638,10 @@ class OpenClawVLNRuntime:
             self.visual_readback_action_overrides_this_episode
         )
         trace["action_override_budget_requires_change"] = changes_action
-        if not changes_action:
+        if not self._adaptive_action_hint_debounce_allows(hinted_action, trace):
+            trace["action_hint_override_failure_reason"] = (
+                "unstable_action_hint_shadowed"
+            )
             trace["final_action"] = current_action
             trace["executed_action_changed_after_visual_read"] = False
             return current_action
@@ -1608,7 +1663,83 @@ class OpenClawVLNRuntime:
         trace["final_action"] = hinted_action
         trace["executed_action_changed_after_visual_read"] = True
         self.visual_readback_action_overrides_this_episode += 1
+        self._record_executed_action_hint(hinted_action)
+        if original_action == "STOP":
+            trace["stop_override_executed_after_visual_read"] = True
+            self.visual_readback_stop_overrides_this_episode += 1
         return hinted_action
+
+    def _trace_has_current_action_override_evidence(
+        self,
+        trace: Dict[str, Any],
+    ) -> bool:
+        trace["current_action_evidence_required"] = True
+        return (
+            self._trace_has_current_view_evidence(trace)
+            and self._trace_bool(trace.get("current_view_candidate_invalid"))
+            and self._trace_bool(
+                trace.get("current_view_recommended_action_supported")
+            )
+        )
+
+    def _adaptive_action_hint_debounce_allows(
+        self,
+        hinted_action: str,
+        trace: Dict[str, Any],
+    ) -> bool:
+        trace["action_hint_debounce_policy"] = "same_episode_direction_stability"
+        trace["action_hint_debounce_last_action"] = (
+            self.visual_readback_last_executable_action_hint
+        )
+        trace["action_hint_debounce_shadow_active"] = (
+            self.visual_readback_action_hint_shadowed_for_instability
+        )
+        budget_policy, _ = self._visual_readback_action_override_budget(trace)
+        if budget_policy != "adaptive":
+            return True
+        if self.visual_readback_action_hint_shadowed_for_instability:
+            return False
+        previous = self.visual_readback_last_executable_action_hint
+        if previous and hinted_action != previous:
+            self.visual_readback_action_hint_shadowed_for_instability = True
+            trace["action_hint_debounce_shadow_active"] = True
+            return False
+        return True
+
+    def _record_executed_action_hint(self, hinted_action: str) -> None:
+        if self._visual_readback_action_override_budget({})[0] == "adaptive":
+            self.visual_readback_last_executable_action_hint = hinted_action
+
+    @staticmethod
+    def _trace_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        return normalized in {"1", "true", "yes", "y", "on"}
+
+    def _action_override_label_supported(
+        self,
+        original_action: str,
+        hinted_action: str,
+        labels: set[str],
+        trace: Dict[str, Any],
+    ) -> tuple[bool, str]:
+        if original_action == "STOP":
+            trace["stop_override_budget_used"] = (
+                self.visual_readback_stop_overrides_this_episode
+            )
+            if hinted_action != "MOVE_FORWARD":
+                return False, "stop_override_requires_move_forward"
+            if "goal_not_visible" not in labels:
+                return False, "stop_override_requires_goal_not_visible"
+            if not self._trace_has_current_view_evidence(trace):
+                return False, "stop_override_missing_current_view_evidence"
+            if self.visual_readback_stop_overrides_this_episode >= 1:
+                return False, "max_stop_overrides_per_episode_reached"
+            return True, ""
+        if "route_conflict" in labels:
+            return True, ""
+        return False, "unsupported_verifier_labels"
 
     def _visual_readback_action_override_budget(
         self,
@@ -1619,6 +1750,102 @@ class OpenClawVLNRuntime:
         if str(configured_budget).strip().lower() != "adaptive":
             return "fixed", int(configured_budget)
         return "adaptive", "per_decision"
+
+    def _stage_override_allowed(self, trace: Dict[str, Any]) -> tuple[bool, str]:
+        if not bool(trace.get("stage_gate_applicable", False)):
+            trace.setdefault("stage_override_allowed", True)
+            trace.setdefault("stage_override_block_reason", "")
+            return True, ""
+        if not self._trace_has_current_view_evidence(trace):
+            return False, "missing_current_view_evidence"
+        if (
+            str(trace.get("stage_alignment_status") or "") == "possible_backtrack"
+            and not self._trace_has_current_view_evidence(trace)
+        ):
+            return False, "possible_backtrack_current_view_missing"
+
+        supporting_stage_ids = self._supporting_stage_ids(trace)
+        current_stage = self._trace_current_stage_id(trace)
+        if not supporting_stage_ids:
+            return False, "no_stage_memory_evidence"
+        current_or_next = {current_stage, current_stage + 1}
+        if any(stage_id in current_or_next for stage_id in supporting_stage_ids if isinstance(stage_id, int)):
+            return True, ""
+        if all(
+            stage_id == "unknown"
+            or (isinstance(stage_id, int) and stage_id < current_stage - 1)
+            for stage_id in supporting_stage_ids
+        ):
+            return False, "old_stage_dominant"
+        return False, "missing_current_or_next_stage_evidence"
+
+    def _trace_has_current_view_evidence(self, trace: Dict[str, Any]) -> bool:
+        if int(trace.get("current_only_evidence_count") or 0) > 0:
+            return True
+        sources = trace.get("evidence_sources") or []
+        if not isinstance(sources, list):
+            return False
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            if str(source.get("evidence_source_type") or "") == "current":
+                return True
+        return False
+
+    def _supporting_stage_ids(self, trace: Dict[str, Any]) -> List[Any]:
+        selected_memory_ids = [
+            str(memory_id)
+            for memory_id in trace.get("selected_keyframe_memory_ids") or []
+        ]
+        selected_stage_ids = list(trace.get("selected_keyframe_stage_ids") or [])
+        id_to_stage: Dict[str, Any] = {}
+        for index, memory_id in enumerate(selected_memory_ids):
+            if not memory_id:
+                continue
+            stage_id = selected_stage_ids[index] if index < len(selected_stage_ids) else "unknown"
+            id_to_stage[memory_id] = self._normalize_stage_id_for_trace(stage_id)
+
+        evidence_memory_ids = set()
+        sources = trace.get("evidence_sources") or []
+        if isinstance(sources, list):
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                if str(source.get("evidence_source_type") or "") != "memory":
+                    continue
+                memory_id = str(source.get("memory_id") or "")
+                if memory_id:
+                    evidence_memory_ids.add(memory_id)
+        if not evidence_memory_ids:
+            evidence_memory_ids = {
+                str(memory_id)
+                for memory_id in trace.get("matched_memory_ids") or []
+                if str(memory_id)
+            }
+
+        supporting = [
+            id_to_stage[memory_id]
+            for memory_id in evidence_memory_ids
+            if memory_id in id_to_stage
+        ]
+        if supporting:
+            return supporting
+        return [
+            self._normalize_stage_id_for_trace(stage_id)
+            for stage_id in selected_stage_ids
+        ]
+
+    def _normalize_stage_id_for_trace(self, value: Any) -> Any:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return "unknown"
+
+    def _trace_current_stage_id(self, trace: Dict[str, Any]) -> int:
+        try:
+            return int(trace.get("current_stage_id", self.current_stage_id))
+        except (TypeError, ValueError):
+            return self.current_stage_id
 
     def _apply_visual_readback_controller(
         self,
@@ -1774,7 +2001,9 @@ class OpenClawVLNRuntime:
                 continue
             seen_paths.add(image_path)
             unique_records.append(record)
-        attached_records = unique_records[:requested_count]
+        attached_records, bucket_names, stage_entry_anchor_step = (
+            self._stage_aware_keyframe_records(unique_records, requested_count)
+        )
         metrics = {
             "candidate_pool_source": "local_event_gated_keyframe_ledger",
             "candidate_pool_requested_count": requested_count,
@@ -1782,8 +2011,146 @@ class OpenClawVLNRuntime:
             "candidate_pool_backend_returned_count": backend_returned,
             "candidate_pool_exact_duplicate_drop_count": duplicate_drop_count,
             "candidate_pool_attached_count": len(attached_records),
+            "stage_gate_applicable": True,
+            "selected_keyframe_steps": [
+                self._record_step_id(record) for record in attached_records
+            ],
+            "selected_keyframe_stage_ids": [
+                self._record_stage_id_for_trace(record) for record in attached_records
+            ],
+            "selected_keyframe_stage_texts": [
+                self._record_stage_text(record) for record in attached_records
+            ],
+            "selected_keyframe_save_reasons": [
+                self._record_save_reason(record) for record in attached_records
+            ],
+            "selected_keyframe_bucket_names": list(bucket_names),
+            "selected_keyframe_memory_ids": [
+                str(record.get("memory_id") or "") for record in attached_records
+            ],
+            "stage_entry_anchor_step": stage_entry_anchor_step,
+            **self._instruction_stage_trace_fields(),
         }
         return [self._memory_hit_from_event_gated_record(record) for record in attached_records], metrics
+
+    def _stage_aware_keyframe_records(
+        self,
+        records: List[Dict[str, Any]],
+        requested_count: int,
+    ) -> tuple[List[Dict[str, Any]], List[str], Any]:
+        current_stage = self.current_stage_id
+        selected: List[Dict[str, Any]] = []
+        bucket_names: List[str] = []
+        seen_paths: set[str] = set()
+
+        def add_bucket(candidates: List[Dict[str, Any]], bucket_name: str, limit: int) -> None:
+            for record in candidates:
+                if len(selected) >= requested_count:
+                    return
+                if len([name for name in bucket_names if name == bucket_name]) >= limit:
+                    return
+                image_path = str(record.get("image_path") or "")
+                if not image_path or image_path in seen_paths:
+                    continue
+                seen_paths.add(image_path)
+                selected.append(record)
+                bucket_names.append(bucket_name)
+
+        current_records = [
+            record
+            for record in records
+            if self._record_stage_id(record) == current_stage
+        ]
+        current_recent = sorted(
+            current_records,
+            key=self._record_step_id,
+            reverse=True,
+        )
+        add_bucket(current_recent, "current_recent", 2)
+
+        decision_records = [
+            record
+            for record in records
+            if self._record_stage_id(record) in {current_stage, current_stage + 1}
+            and self._record_is_decision_point(record)
+        ]
+        decision_recent = sorted(
+            decision_records,
+            key=self._record_step_id,
+            reverse=True,
+        )
+        add_bucket(decision_recent, "current_or_next_decision", 2)
+
+        stage_entry_anchor_step: Any = None
+        anchor_candidates: List[Dict[str, Any]] = []
+        if current_stage == 0:
+            anchor_candidates = current_records
+        elif current_records:
+            anchor_candidates = current_records
+        if anchor_candidates:
+            anchor = min(anchor_candidates, key=self._record_step_id)
+            stage_entry_anchor_step = self._record_step_id(anchor)
+            add_bucket([anchor], "stage_entry_anchor", 1)
+
+        fill_records = sorted(
+            records,
+            key=self._stage_fill_sort_key,
+        )
+        add_bucket(fill_records, "fill", requested_count)
+        return selected[:requested_count], bucket_names[:requested_count], stage_entry_anchor_step
+
+    def _stage_fill_sort_key(self, record: Dict[str, Any]) -> tuple[int, int]:
+        stage_id = self._record_stage_id(record)
+        current_stage = self.current_stage_id
+        stage_priority = 1
+        if stage_id is not None and stage_id >= current_stage - 1:
+            stage_priority = 0
+        return (stage_priority, -self._record_step_id(record))
+
+    def _record_stage_id(self, record: Dict[str, Any]) -> Optional[int]:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        value = record.get("stage_id", metadata.get("stage_id"))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _record_stage_id_for_trace(self, record: Dict[str, Any]) -> Any:
+        stage_id = self._record_stage_id(record)
+        return stage_id if stage_id is not None else "unknown"
+
+    def _record_stage_text(self, record: Dict[str, Any]) -> str:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        return str(record.get("stage_text") or metadata.get("stage_text") or "")
+
+    def _record_save_reason(self, record: Dict[str, Any]) -> str:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        gate = metadata.get("keyframe_gate") if isinstance(metadata.get("keyframe_gate"), dict) else {}
+        return str(
+            record.get("save_reason")
+            or metadata.get("save_reason")
+            or gate.get("save_reason")
+            or ""
+        )
+
+    def _record_is_decision_point(self, record: Dict[str, Any]) -> bool:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        gate = metadata.get("keyframe_gate") if isinstance(metadata.get("keyframe_gate"), dict) else {}
+        event_type = str(
+            record.get("candidate_event_type")
+            or metadata.get("candidate_event_type")
+            or gate.get("candidate_event_type")
+            or ""
+        )
+        save_reason = self._record_save_reason(record)
+        return event_type in {"TURN_LEFT", "TURN_RIGHT"} or save_reason == "candidate_decision_point"
+
+    def _record_step_id(self, record: Dict[str, Any]) -> int:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        try:
+            return int(record.get("step_id", metadata.get("step_id")))
+        except (TypeError, ValueError):
+            return -1
 
     def _event_gated_record_is_eligible(
         self,
@@ -1816,6 +2183,24 @@ class OpenClawVLNRuntime:
 
     def _memory_hit_from_event_gated_record(self, record: Dict[str, Any]) -> MemoryHit:
         metadata = dict(record.get("metadata") or {})
+        metadata.update(
+            {
+                "run_id": str(record.get("run_id") or metadata.get("run_id") or ""),
+                "scene_id": str(record.get("scene_id") or metadata.get("scene_id") or ""),
+                "episode_id": str(
+                    record.get("episode_id") or metadata.get("episode_id") or ""
+                ),
+                "step_id": record.get("step_id", metadata.get("step_id")),
+                "image_path": str(
+                    record.get("image_path") or metadata.get("image_path") or ""
+                ),
+                "source_image_role": str(
+                    record.get("source_image_role")
+                    or metadata.get("source_image_role")
+                    or ""
+                ),
+            }
+        )
         return MemoryHit(
             memory_id=str(record.get("memory_id") or ""),
             memory_type=str(record.get("memory_type") or "semantic_frame"),
@@ -1882,6 +2267,110 @@ class OpenClawVLNRuntime:
             ),
         }
 
+    def _reset_instruction_stage_state(self, state: VLNState) -> None:
+        self.instruction_stages = self._split_instruction_stages(state.instruction)
+        self.current_stage_id = 0
+        self.stage_update_source = "initial_instruction_split"
+        self.stage_update_reason = "episode_started"
+        self.stage_alignment_status = "aligned"
+
+    def _split_instruction_stages(self, instruction: str) -> List[Dict[str, Any]]:
+        text = str(instruction or "").strip()
+        if not text:
+            text = "navigation instruction"
+        chunks = [
+            chunk.strip(" ,.;")
+            for chunk in re.split(
+                r"(?:\.|\bthen\b|\bonce\b|\bafter\b|"
+                r"(?=\b(?:go|walk|enter|turn|stop|wait)\b))",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if chunk.strip(" ,.;")
+        ]
+        if not chunks:
+            chunks = [text]
+        stages: List[Dict[str, Any]] = []
+        for index, chunk in enumerate(chunks):
+            stages.append(
+                {
+                    "stage_id": index,
+                    "stage_text": chunk,
+                    "expected_action_type": self._stage_expected_action_type(chunk),
+                    "status": "active" if index == 0 else "pending",
+                }
+            )
+        return stages
+
+    def _stage_expected_action_type(self, stage_text: str) -> str:
+        normalized = stage_text.lower()
+        if any(token in normalized for token in ("stop", "wait", "stand")):
+            return "stop"
+        if "turn" in normalized or "left" in normalized or "right" in normalized:
+            return "turn"
+        return "move"
+
+    def _current_instruction_stage(self) -> Dict[str, Any]:
+        for stage in self.instruction_stages:
+            if int(stage.get("stage_id", -1)) == self.current_stage_id:
+                return dict(stage)
+        if self.instruction_stages:
+            return dict(self.instruction_stages[0])
+        return {
+            "stage_id": 0,
+            "stage_text": "",
+            "expected_action_type": "move",
+            "status": "active",
+        }
+
+    def _current_instruction_stage_metadata(self) -> Dict[str, Any]:
+        stage = self._current_instruction_stage()
+        return {
+            "stage_id": self.current_stage_id,
+            "stage_text": str(stage.get("stage_text") or ""),
+            "stage_status_at_save": str(stage.get("status") or "active"),
+            "stage_confidence": 1.0,
+            "stage_update_source": self.stage_update_source or "runtime",
+        }
+
+    def _instruction_stage_trace_fields(self) -> Dict[str, Any]:
+        stage = self._current_instruction_stage()
+        return {
+            "instruction_stages": [dict(item) for item in self.instruction_stages],
+            "current_stage_id": self.current_stage_id,
+            "current_stage_text": str(stage.get("stage_text") or ""),
+            "stage_update_source": self.stage_update_source,
+            "stage_update_reason": self.stage_update_reason,
+            "stage_alignment_status": self.stage_alignment_status,
+        }
+
+    def _apply_stage_progress_from_readback(self, trace: Dict[str, Any]) -> None:
+        if trace.get("read_status") != "completed":
+            return
+        try:
+            predicted_stage_id = int(trace.get("predicted_current_stage_id"))
+        except (TypeError, ValueError):
+            return
+        if predicted_stage_id != self.current_stage_id + 1:
+            return
+        if predicted_stage_id >= len(self.instruction_stages):
+            return
+        if not self._trace_has_current_view_evidence(trace):
+            return
+        previous_stage_id = self.current_stage_id
+        for stage in self.instruction_stages:
+            stage_id = int(stage.get("stage_id", -1))
+            if stage_id <= previous_stage_id:
+                stage["status"] = "completed"
+            elif stage_id == predicted_stage_id:
+                stage["status"] = "active"
+            elif stage_id > predicted_stage_id:
+                stage["status"] = "pending"
+        self.current_stage_id = predicted_stage_id
+        self.stage_update_source = "visual_memory_readback"
+        self.stage_update_reason = str(trace.get("stage_evidence") or "current_view_evidence")
+        self.stage_alignment_status = "aligned"
+
     def _reset_stop_state_if_episode_changed(self, state: VLNState) -> None:
         episode_key = (str(state.scene_id or ""), str(state.episode_id or ""))
         if episode_key == self._stop_state_episode_key:
@@ -1892,6 +2381,10 @@ class OpenClawVLNRuntime:
         self.controller_private_replan_state = {}
         self.visual_readback_replans_this_episode = 0
         self.visual_readback_action_overrides_this_episode = 0
+        self.visual_readback_stop_overrides_this_episode = 0
+        self.visual_readback_last_executable_action_hint = ""
+        self.visual_readback_action_hint_shadowed_for_instability = False
+        self._reset_instruction_stage_state(state)
 
     def _update_stop_fallback_state(self, action_text: str) -> None:
         action = self._normalize_action_text(action_text)

@@ -94,6 +94,10 @@ class QwenDirectVisualReadbackAdapter:
     def _prompt(self, request: Dict[str, Any], memory_ids: List[str]) -> str:
         memory_id_text = ", ".join(memory_ids) if memory_ids else "<none>"
         expected_memory_ids_json = json.dumps(memory_ids)
+        instruction_stages_json = json.dumps(
+            request.get("instruction_stages") or [],
+            ensure_ascii=True,
+        )
         image_count = 1 + len(memory_ids)
         return (
             "You are a visual memory readback verifier for embodied navigation. "
@@ -103,6 +107,8 @@ class QwenDirectVisualReadbackAdapter:
             f"candidate_action={request.get('candidate_action', '')}\n"
             f"trigger_rule={request.get('trigger_rule', '')}\n"
             f"instruction={request.get('instruction', '')}\n"
+            f"current_stage_id={request.get('current_stage_id', '')}\n"
+            f"instruction_stages={instruction_stages_json}\n"
             f"attached_memory_ids={memory_id_text}\n"
             "Important: matched_memory_ids means memory image IDs that you actually "
             "read/used. It does not mean the visual content matches the current view.\n"
@@ -124,6 +130,12 @@ class QwenDirectVisualReadbackAdapter:
             "evidence shows the candidate is wrong or unsafe. Set should_override "
             "to true only when candidate_action_valid is false and the visual "
             "evidence supports a concrete replacement action from the current view. "
+            "Set current_view_candidate_invalid to true only when the current image "
+            "itself directly proves candidate_action is wrong for the immediate next "
+            "step. Set current_view_recommended_action_supported to true only when "
+            "the current image itself directly supports recommended_action as the "
+            "immediate next step. Memory images may support the explanation but must "
+            "not be the only basis for these two current_view_* fields. "
             "If should_override is true, set recommended_action to exactly one of "
             "TURN_LEFT, TURN_RIGHT, MOVE_FORWARD, STOP, decision_scope to "
             "immediate_next_action, action_confidence from 0.0 to 1.0, and "
@@ -133,11 +145,19 @@ class QwenDirectVisualReadbackAdapter:
             "should_override to false, recommended_action to null, decision_scope "
             "to landmark_relation or route_diagnosis_only, and action_confidence "
             "to 0.0.\n"
+            "Also provide stage progress as conservative evidence only: "
+            "predicted_current_stage_id, completed_stage_ids, next_stage_id, and "
+            "stage_evidence. Only advance by one stage when the current image shows "
+            "the next instruction stage has been reached; otherwise keep "
+            "predicted_current_stage_id equal to current_stage_id or null.\n"
             "Return only compact JSON with keys: verifier_labels, matched_memory_ids, "
             "visual_evidence, audit_action_hint, candidate_action_valid, "
             "should_override, invalid_reason, recommended_action, decision_scope, "
-            "action_confidence, evidence_sources, readback_confidence, "
-            "verifier_confidence, visual_grounding_status."
+            "action_confidence, current_view_candidate_invalid, "
+            "current_view_recommended_action_supported, evidence_sources, "
+            "readback_confidence, "
+            "verifier_confidence, visual_grounding_status, predicted_current_stage_id, "
+            "completed_stage_ids, next_stage_id, stage_evidence."
             )
 
     @staticmethod
@@ -242,6 +262,8 @@ class VisualMemoryReadSkill(Skill):
             "memory_hits": {"type": "array"},
             "candidate_action": {"type": "string"},
             "trigger_rule": {"type": "string"},
+            "instruction_stages": {"type": "array"},
+            "current_stage_id": {"type": "integer"},
         },
         "required": ["current_image_path", "candidate_action", "trigger_rule"],
     }
@@ -260,6 +282,8 @@ class VisualMemoryReadSkill(Skill):
             "recommended_action": {"type": "string"},
             "decision_scope": {"type": "string"},
             "action_confidence": {"type": "number"},
+            "current_view_candidate_invalid": {"type": "boolean"},
+            "current_view_recommended_action_supported": {"type": "boolean"},
             "evidence_sources": {"type": "array"},
             "memory_evidence_used_count": {"type": "integer"},
             "current_only_evidence_count": {"type": "integer"},
@@ -268,6 +292,12 @@ class VisualMemoryReadSkill(Skill):
             "no_evidence_count": {"type": "integer"},
             "readback_confidence": {"type": "number"},
             "verifier_confidence": {"type": "number"},
+            "instruction_stages": {"type": "array"},
+            "current_stage_id": {"type": "integer"},
+            "predicted_current_stage_id": {"type": "integer"},
+            "completed_stage_ids": {"type": "array"},
+            "next_stage_id": {"type": "integer"},
+            "stage_evidence": {"type": "string"},
         },
     }
     oracle_safe = True
@@ -282,6 +312,8 @@ class VisualMemoryReadSkill(Skill):
             candidate_action=str(payload.get("candidate_action") or ""),
             trigger_rule=str(payload.get("trigger_rule") or ""),
             instruction=getattr(state, "instruction", ""),
+            instruction_stages=payload.get("instruction_stages") or [],
+            current_stage_id=payload.get("current_stage_id"),
         )
         missing_reason = validate_readback_images(request)
         if missing_reason:

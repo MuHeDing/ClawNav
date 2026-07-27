@@ -160,6 +160,77 @@ def test_qwen_direct_adapter_reads_attached_images_and_returns_json(tmp_path):
     assert '"matched_memory_ids": ["m1"]' in client.calls[0]["prompt"]
 
 
+def test_visual_memory_read_skill_round_trips_instruction_stage_progress(tmp_path):
+    current = tmp_path / "current.png"
+    memory = tmp_path / "memory.png"
+    current.write_text("current", encoding="utf-8")
+    memory.write_text("memory", encoding="utf-8")
+    adapter = FakeReadbackAdapter(
+        {
+            "verifier_labels": ["route_conflict"],
+            "matched_memory_ids": ["m1"],
+            "visual_evidence": "The current view has reached the hallway.",
+            "candidate_action_valid": False,
+            "should_override": True,
+            "recommended_action": "TURN_LEFT",
+            "decision_scope": "immediate_next_action",
+            "action_confidence": 0.9,
+            "current_view_candidate_invalid": True,
+            "current_view_recommended_action_supported": True,
+            "evidence_sources": [
+                {
+                    "field_name": "visual_evidence",
+                    "item_index": 0,
+                    "evidence_source_type": "current",
+                    "readback_slot_id": 0,
+                }
+            ],
+            "readback_confidence": 0.9,
+            "verifier_confidence": 0.9,
+            "predicted_current_stage_id": 1,
+            "completed_stage_ids": [0],
+            "next_stage_id": 2,
+            "stage_evidence": "current image shows the hallway stage",
+        }
+    )
+    skill = VisualMemoryReadSkill(adapter=adapter)
+    instruction_stages = [
+        {"stage_id": 0, "stage_text": "leave the closet", "status": "active"},
+        {"stage_id": 1, "stage_text": "enter the hallway", "status": "pending"},
+    ]
+
+    result = skill.run(
+        make_state(),
+        {
+            "current_image_path": str(current),
+            "memory_hits": [
+                MemoryHit(
+                    memory_id="m1",
+                    memory_type="semantic_frame",
+                    name="closet",
+                    confidence=1.0,
+                    image_path=str(memory),
+                )
+            ],
+            "candidate_action": "MOVE_FORWARD",
+            "trigger_rule": "motion_consistency_check",
+            "instruction_stages": instruction_stages,
+            "current_stage_id": 0,
+        },
+    )
+
+    assert adapter.calls[0]["instruction_stages"] == instruction_stages
+    assert adapter.calls[0]["current_stage_id"] == 0
+    assert result.payload["instruction_stages"] == instruction_stages
+    assert result.payload["current_stage_id"] == 0
+    assert result.payload["predicted_current_stage_id"] == 1
+    assert result.payload["completed_stage_ids"] == [0]
+    assert result.payload["next_stage_id"] == 2
+    assert result.payload["stage_evidence"] == "current image shows the hallway stage"
+    assert result.payload["current_view_candidate_invalid"] is True
+    assert result.payload["current_view_recommended_action_supported"] is True
+
+
 def test_qwen_direct_adapter_normalizes_grounded_mismatch_status(tmp_path):
     current = tmp_path / "current.png"
     memory = tmp_path / "memory.png"

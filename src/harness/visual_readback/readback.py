@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 
 def normalize_visual_readback_response(
@@ -50,6 +50,14 @@ def normalize_visual_readback_response(
         "recommended_action": str(data.get("recommended_action") or ""),
         "decision_scope": str(data.get("decision_scope") or ""),
         "action_confidence": _float(data.get("action_confidence"), 0.0),
+        "current_view_candidate_invalid": _bool(
+            data.get("current_view_candidate_invalid"),
+            False,
+        ),
+        "current_view_recommended_action_supported": _bool(
+            data.get("current_view_recommended_action_supported"),
+            False,
+        ),
         "audit_relative_direction_hint": str(
             data.get("audit_relative_direction_hint") or ""
         ),
@@ -60,6 +68,18 @@ def normalize_visual_readback_response(
             data.get("visual_grounding_status")
         ),
         "grounding_eval_protocol": data.get("grounding_eval_protocol") or {},
+        "instruction_stages": list(request.get("instruction_stages") or []),
+        "current_stage_id": request.get("current_stage_id"),
+        "predicted_current_stage_id": _optional_int(
+            data.get("predicted_current_stage_id")
+        ),
+        "completed_stage_ids": [
+            stage_id
+            for stage_id in (_optional_int(item) for item in _list(data.get("completed_stage_ids")))
+            if stage_id is not None
+        ],
+        "next_stage_id": _optional_int(data.get("next_stage_id")),
+        "stage_evidence": str(data.get("stage_evidence") or ""),
         **evidence_audit,
     }
 
@@ -70,6 +90,8 @@ def build_readback_request(
     candidate_action: str,
     trigger_rule: str,
     instruction: str,
+    instruction_stages: Optional[List[Dict[str, Any]]] = None,
+    current_stage_id: Any = None,
 ) -> Dict[str, Any]:
     attached_memory_ids: List[str] = []
     retrieved_image_paths: List[str] = []
@@ -93,6 +115,8 @@ def build_readback_request(
         "candidate_action": str(candidate_action or ""),
         "trigger_rule": str(trigger_rule or ""),
         "instruction": str(instruction or ""),
+        "instruction_stages": list(instruction_stages or []),
+        "current_stage_id": current_stage_id,
     }
 
 
@@ -175,10 +199,18 @@ def _failed_payload(
         "recommended_action": "",
         "decision_scope": "",
         "action_confidence": 0.0,
+        "current_view_candidate_invalid": False,
+        "current_view_recommended_action_supported": False,
         "readback_confidence": 0.0,
         "retrieval_confidence": _float(request.get("retrieval_confidence"), 0.0),
         "verifier_confidence": 0.0,
         "visual_grounding_status": "unverified",
+        "instruction_stages": list(request.get("instruction_stages") or []),
+        "current_stage_id": request.get("current_stage_id"),
+        "predicted_current_stage_id": None,
+        "completed_stage_ids": [],
+        "next_stage_id": None,
+        "stage_evidence": "",
         "evidence_sources": [],
         "memory_evidence_used_count": 0,
         "current_only_evidence_count": 0,
@@ -300,6 +332,17 @@ def _string_list(value: Any) -> List[str]:
     if isinstance(value, str) and value:
         return [value]
     return []
+
+
+def _list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _float(value: Any, default: float) -> float:

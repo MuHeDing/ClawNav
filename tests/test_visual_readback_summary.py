@@ -239,6 +239,46 @@ def test_visual_readback_summary_counts_primary_offline_and_readback_metrics(tmp
     }
 
 
+def test_visual_readback_summary_counts_action_override_shadow_reasons(tmp_path):
+    run_dir = tmp_path / "run"
+    write_jsonl(
+        run_dir / "harness_traces" / "harness_trace_rank0.jsonl",
+        [
+            row(
+                "A",
+                "image_read_action_override",
+                action_hint_override_failure_reason="missing_current_action_evidence",
+            ),
+            row(
+                "B",
+                "image_read_action_override",
+                action_hint_override_failure_reason="stop_hint_shadowed",
+            ),
+            row(
+                "C",
+                "image_read_action_override",
+                action_hint_override_failure_reason="unstable_action_hint_shadowed",
+            ),
+            row(
+                "D",
+                "image_read_action_override",
+                action_hint_override_failure_reason="unstable_action_hint_shadowed",
+            ),
+        ],
+    )
+
+    summary = summarize_visual_readback_run(run_dir)
+
+    assert summary["action_hint_override_failure_reason_counts"] == {
+        "missing_current_action_evidence": 1,
+        "stop_hint_shadowed": 1,
+        "unstable_action_hint_shadowed": 2,
+    }
+    assert summary["missing_current_action_evidence_count"] == 1
+    assert summary["stop_hint_shadowed_count"] == 1
+    assert summary["unstable_action_hint_shadowed_count"] == 2
+
+
 def test_visual_readback_summary_reports_interval_exact_dedupe_metrics(tmp_path):
     run_dir = tmp_path / "run"
     write_jsonl(

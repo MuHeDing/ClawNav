@@ -134,6 +134,11 @@ def summarize_visual_readback_run(
     interval_cleanup = _interval_cleanup_attachment_metrics(blocks)
     keyframe_gate = _keyframe_gate_summary(blocks)
     candidate_pool = _candidate_pool_summary(blocks)
+    action_hint_failure_counts = Counter(
+        str(block.get("action_hint_override_failure_reason") or "")
+        for block in blocks
+        if str(block.get("action_hint_override_failure_reason") or "")
+    )
     summary = {
         "run_dir": str(run_path),
         "trace_rows": len(loaded_rows),
@@ -183,6 +188,21 @@ def summarize_visual_readback_run(
         ),
         "action_hint_executed_after_visual_read_count": sum(
             1 for block in blocks if bool(block.get("action_hint_executed_after_visual_read"))
+        ),
+        "action_hint_override_failure_reason_counts": dict(
+            sorted(action_hint_failure_counts.items())
+        ),
+        "missing_current_action_evidence_count": action_hint_failure_counts.get(
+            "missing_current_action_evidence",
+            0,
+        ),
+        "stop_hint_shadowed_count": action_hint_failure_counts.get(
+            "stop_hint_shadowed",
+            0,
+        ),
+        "unstable_action_hint_shadowed_count": action_hint_failure_counts.get(
+            "unstable_action_hint_shadowed",
+            0,
         ),
         "candidate_action_valid_counts": dict(
             sorted(Counter(_bool_status(block, "candidate_action_valid") for block in blocks).items())
